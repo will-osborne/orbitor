@@ -43,12 +43,13 @@ type Session struct {
 	interruptMu     sync.Mutex
 	interruptCancel context.CancelFunc // set while a prompt is in flight
 
-	summaryMu   sync.RWMutex
-	lastMessage string // last agent text snippet
-	currentTool string // current tool being used
-	isRunning   bool   // true while a prompt is being processed
-	title       string // LLM-generated session title (set after run completes)
-	summary     string // LLM-generated one-sentence summary
+	summaryMu     sync.RWMutex
+	lastMessage   string // last agent text snippet
+	currentTool   string // current tool being used
+	currentPrompt string // text of the prompt currently being processed
+	isRunning     bool   // true while a prompt is being processed
+	title         string // LLM-generated session title (set after run completes)
+	summary       string // LLM-generated one-sentence summary
 
 	// agentTextCh batches frequent agent_text chunks to reduce broadcast frequency
 	agentTextCh    chan string
@@ -135,16 +136,14 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					summarizer:      summarizer,
 				}
 
+				// Seed hub history from DB before starting Run to avoid race conditions.
+				// Only load up to maxHistory recent messages to avoid reading huge datasets.
+				if msgs, err := store.LoadRecentMessages(s.ID, s.hub.maxHistory); err == nil && len(msgs) > 0 {
+					s.hub.SeedHistory(msgs)
+				}
+
 				// Start the hub for WS clients immediately.
 				go s.hub.Run()
-
-				// Seed hub with persisted message history so reconnecting
-				// clients see previous conversation.
-				if msgs, err := store.LoadMessages(s.ID); err == nil && len(msgs) > 0 {
-					for _, m := range msgs {
-						s.hub.Broadcast(m.Type, json.RawMessage(m.Data))
-					}
-				}
 
 				sm.sessions[s.ID] = s
 			}
@@ -202,6 +201,7 @@ func (sm *SessionManager) List() []WSSessionInfo {
 		s.summaryMu.RLock()
 		lastMsg := s.lastMessage
 		curTool := s.currentTool
+		curPrompt := s.currentPrompt
 		running := s.isRunning
 		title := s.title
 		summary := s.summary
@@ -221,6 +221,7 @@ func (sm *SessionManager) List() []WSSessionInfo {
 			SkipPermissions:   s.SkipPermissions,
 			LastMessage:       lastMsg,
 			CurrentTool:       curTool,
+			CurrentPrompt:     curPrompt,
 			IsRunning:         running,
 			PendingPermission: hasPerm,
 			CreatedAt:         s.CreatedAt,
@@ -615,6 +616,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.summaryMu.Lock()
 		s.lastMessage = ""
 		s.currentTool = ""
+		s.currentPrompt = item.Text
 		s.isRunning = true
 		s.summaryMu.Unlock()
 		s.persistSession()

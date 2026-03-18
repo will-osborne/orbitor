@@ -20,6 +20,7 @@ class _SessionsScreenState extends State<SessionsScreen>
   String? _missionTitle;
   String? _missionSummary;
   bool _updating = false;
+  bool _releasing = false;
   String? _error;
   Timer? _pollTimer;
   late AnimationController _scanlineCtrl;
@@ -222,6 +223,23 @@ class _SessionsScreenState extends State<SessionsScreen>
     }
   }
 
+  Future<void> _releaseApk() async {
+    setState(() => _releasing = true);
+    try {
+      await context.read<ApiService>().releaseApk();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('APK release triggered')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _releasing = false);
+    }
+  }
+
   Future<void> _triggerUpdate() async {
     setState(() => _updating = true);
     try {
@@ -286,7 +304,7 @@ class _SessionsScreenState extends State<SessionsScreen>
               ),
               const SizedBox(height: 8),
               const Text(
-                'Enter your copilot-bridge server address.',
+                'Enter your Orbitor server address.',
                 style: TextStyle(color: CB.textSecondary, fontSize: 14),
               ),
               const SizedBox(height: 24),
@@ -340,7 +358,7 @@ class _SessionsScreenState extends State<SessionsScreen>
             flexibleSpace: FlexibleSpaceBar(
               titlePadding: const EdgeInsets.only(left: 20, bottom: 16),
               title: const GradientText(
-                'mission control',
+                'orbitor',
                 style: TextStyle(
                     fontSize: 22,
                     fontWeight: FontWeight.w900,
@@ -348,6 +366,23 @@ class _SessionsScreenState extends State<SessionsScreen>
               ),
             ),
             actions: [
+              if (_releasing)
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12),
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Color(0xFFFF8C00)),
+                  ),
+                )
+              else
+                IconButton(
+                  icon: const Icon(Icons.send_to_mobile_rounded, size: 22),
+                  onPressed: _releaseApk,
+                  color: CB.textSecondary,
+                  tooltip: 'Release APK',
+                ),
               if (_updating)
                 const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 12),
@@ -525,24 +560,11 @@ class _SessionsScreenState extends State<SessionsScreen>
       );
     }
 
-    // Sort: waiting for input first, then working, then idle, then others.
-    // Within each state group, newest sessions appear first.
+    // Sort by creation time only (newest first) so sessions don't jump
+    // around when their state changes. Visual state indicators on each
+    // card convey urgency without reordering.
     final sorted = List<Session>.from(_sessions)
-      ..sort((a, b) {
-        const order = {
-          AgentState.waitingForInput: 0,
-          AgentState.working: 1,
-          AgentState.starting: 2,
-          AgentState.idle: 3,
-          AgentState.error: 4,
-          AgentState.offline: 5,
-        };
-        final stateCompare = (order[a.agentState] ?? 9)
-            .compareTo(order[b.agentState] ?? 9);
-        if (stateCompare != 0) return stateCompare;
-        // Same state — newest first.
-        return b.createdAt.compareTo(a.createdAt);
-      });
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -717,6 +739,19 @@ class _SessionsScreenState extends State<SessionsScreen>
                 // Activity detail
                 _agentActivityLine(s, state, stateColor),
                 const SizedBox(height: 6),
+                // Project directory path
+                const SizedBox(height: 2),
+                Text(
+                  s.workingDir,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: CB.textTertiary,
+                    fontFamily: 'monospace',
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                ),
+                const SizedBox(height: 4),
                 // Meta row: backend, model, id
                 Row(
                   children: [
@@ -775,17 +810,51 @@ class _SessionsScreenState extends State<SessionsScreen>
     switch (state) {
       case AgentState.working:
         if (s.currentTool.isNotEmpty) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  _ToolSpinner(color: CB.cyan),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      s.currentTool,
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: CB.cyan.withValues(alpha: 0.85),
+                          fontFamily: 'monospace'),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              if (s.currentPrompt.isNotEmpty) ...[
+                const SizedBox(height: 3),
+                Text(
+                  s.currentPrompt.replaceAll('\n', ' '),
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.white.withValues(alpha: 0.35)),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ],
+          );
+        }
+        if (s.currentPrompt.isNotEmpty) {
           return Row(
             children: [
               _ToolSpinner(color: CB.cyan),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
-                  s.currentTool,
+                  s.currentPrompt.replaceAll('\n', ' '),
                   style: TextStyle(
                       fontSize: 12,
-                      color: CB.cyan.withValues(alpha: 0.85),
-                      fontFamily: 'monospace'),
+                      color: Colors.white.withValues(alpha: 0.5)),
+                  maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -833,6 +902,16 @@ class _SessionsScreenState extends State<SessionsScreen>
         if (s.summary.isNotEmpty) {
           return Text(
             s.summary,
+            style: TextStyle(
+                fontSize: 12,
+                color: Colors.white.withValues(alpha: 0.4)),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          );
+        }
+        if (s.currentPrompt.isNotEmpty) {
+          return Text(
+            s.currentPrompt.replaceAll('\n', ' '),
             style: TextStyle(
                 fontSize: 12,
                 color: Colors.white.withValues(alpha: 0.4)),

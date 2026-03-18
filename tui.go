@@ -328,7 +328,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		historyPos:        0,
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("↑/↓ navigate (or j/k empty input)  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("↑/↓ or j/k navigate sessions  ·  Tab/Shift+Tab cycle sessions  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -623,11 +623,25 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sessionStateStart[s.ID] = time.Now()
 			}
 		}
-			m.sessions = msg.sessions
+		// Preserve selection by ID so the cursor doesn't jump when sessions
+		// are added, removed, or reordered during a refresh.
+		prevID := m.selectedSessionID()
+		m.sessions = msg.sessions
 		m.missionTitle = msg.missionTitle
 		m.missionSummary = msg.missionSummary
-		if m.selected >= len(m.sessions) {
-			m.selected = max(0, len(m.sessions)-1)
+		// Find the new index for the previously selected session.
+		found := false
+		for i, s := range m.sessions {
+			if s.ID == prevID {
+				m.selected = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			if m.selected >= len(m.sessions) {
+				m.selected = max(0, len(m.sessions)-1)
+			}
 		}
 		return m, nil
 
@@ -692,6 +706,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitExternalCmd(m.extCh)
 
 	case tea.KeyMsg:
+		// When wizard is open, route all key events to it.
+		if m.wizardActive {
+			return m.updateWizard(msg)
+		}
+
 		// While in delete-confirm mode, only y/n/esc are meaningful.
 		if m.deleteConfirmID != "" {
 			switch msg.String() {
@@ -724,8 +743,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "up":
-			if m.historyPos > 0 || m.input.Value() != "" {
-				// Browse history backwards.
+			// When input has text and there is history to browse, cycle backwards.
+			if m.input.Value() != "" && len(m.inputHistory) > 0 {
 				if m.historyPos == 0 {
 					m.historyLive = m.input.Value()
 				}
@@ -736,6 +755,16 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			// When already browsing history, continue backwards.
+			if m.historyPos > 0 {
+				if m.historyPos < len(m.inputHistory) {
+					m.historyPos++
+					m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
+					m.input.CursorEnd()
+				}
+				return m, nil
+			}
+			// Otherwise navigate session list.
 			if m.selected > 0 {
 				m.selected--
 			}
@@ -774,6 +803,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "tab":
+			// Tab cycles sessions even when input has content.
+			if len(m.sessions) > 0 {
+				m.selected = (m.selected + 1) % len(m.sessions)
+			}
+			return m, nil
+
+		case "shift+tab":
+			// Shift+Tab cycles sessions backwards even when input has content.
+			if len(m.sessions) > 0 {
+				m.selected = (m.selected + len(m.sessions) - 1) % len(m.sessions)
+			}
+			return m, nil
+
 		case "pgup":
 			m.viewport.HalfPageUp()
 			return m, nil
@@ -798,10 +841,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, refreshSessionsCmd(m.api)
 
 		case "n":
-			if m.input.Value() == "" && len(m.sessions) > 0 {
-				wd := m.sessions[m.selected].WorkingDir
-				m.input.SetValue("/new " + wd + " ")
-				m.input.CursorEnd()
+			if m.input.Value() == "" {
+				m.openWizard()
 				return m, nil
 			}
 
@@ -847,6 +888,10 @@ func (m *tuiModel) View() string {
 		return "Starting TUI..."
 	}
 
+	if m.wizardActive {
+		return m.renderWizard()
+	}
+
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
 	panelStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -863,7 +908,7 @@ func (m *tuiModel) View() string {
 
 	// ── top bar ───────────────────────────────────────────────────────────────
 	topBar := panelStyle.Width(m.width - 2).Height(3).Render(
-		titleStyle.Render(" Copilot Bridge  Mission Control ") +
+		titleStyle.Render(" Orbitor  Mission Control ") +
 			"\n" +
 			styleMuted.Render(fmt.Sprintf(
 				"sessions=%d  selected=%s  connected=%s",
@@ -912,7 +957,7 @@ func (m *tuiModel) View() string {
 
 	// ── status bar ────────────────────────────────────────────────────────────
 	statusBar := styleMuted.Render(fmt.Sprintf(
-		"  server: %s  ·  sessions: %d  ·  n=new  ctrl+d=delete  ctrl+l=clear  ctrl+c=quit",
+		"  server: %s  ·  sessions: %d  ·  n=new  tab=cycle  ctrl+d=delete  ctrl+l=clear  ctrl+c=quit",
 		m.api.baseURL, len(m.sessions),
 	))
 	statusBarH := 1
@@ -1037,8 +1082,11 @@ func (m *tuiModel) renderDetails() string {
 		lbl("backend: ") + backendStr + lbl("  model: ") + modelStr,
 		lbl("skip:    ") + skipStr + lbl("  pending: ") + permStr + lbl("  running: ") + runStr,
 		lbl("tool:    ") + toolStr,
-		lbl("msg:     ") + styleText.Render(trimForLine(defaultString(s.LastMessage, "-"), 120)),
 		lbl("dir:     ") + styleText.Render(s.WorkingDir),
+		lbl("msg:     ") + styleText.Render(trimForLine(defaultString(s.LastMessage, "-"), 120)),
+	}
+	if s.CurrentPrompt != "" {
+		lines = append(lines, lbl("task:    ")+styleText.Render(trimForLine(s.CurrentPrompt, 100)))
 	}
 	if s.Title != "" {
 		lines = append(lines, lbl("title:   ")+styleText.Render(trimForLine(s.Title, 80)))
@@ -1067,7 +1115,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /skip [true|false] [id]")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  ctrl+d=delete  ctrl+l=clear feed  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  ctrl+d=delete  ctrl+l=clear  PgUp/PgDn=scroll  g/G=top/bottom")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -1495,7 +1543,7 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			backendModel += ":" + trimForLine(s.Model, 16)
 		}
 
-		subtitle := trimForLine(defaultString(s.Title, defaultString(s.LastMessage, "—")), 48)
+		subtitle := trimForLine(defaultString(s.Title, defaultString(s.CurrentPrompt, defaultString(s.LastMessage, "—"))), 48)
 
 		if isSelected {
 			topLine := selectedStyle.Render(" " + prefix + s.ID + "  " + state + "  " + backendModel + " ")

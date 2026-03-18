@@ -123,6 +123,16 @@ func (h *Hub) DisconnectClients() {
 	}
 }
 
+// SeedHistory directly populates the hub's history buffer with pre-loaded messages.
+// Call this before starting Run() to avoid race conditions during startup.
+func (h *Hub) SeedHistory(msgs []WSMessage) {
+	if len(msgs) > h.maxHistory {
+		msgs = msgs[len(msgs)-h.maxHistory:]
+	}
+	h.history = make([]WSMessage, len(msgs))
+	copy(h.history, msgs)
+}
+
 func (h *Hub) Broadcast(msgType string, data any) {
 	raw, err := json.Marshal(data)
 	if err != nil {

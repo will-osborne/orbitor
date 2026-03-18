@@ -1,4 +1,4 @@
-module copilot-bridge
+module orbitor
 
 go 1.25.0
 

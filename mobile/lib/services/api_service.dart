@@ -157,6 +157,18 @@ class ApiService extends ChangeNotifier {
     return Session.fromJson(jsonDecode(resp.body));
   }
 
+  Future<void> releaseApk() async {
+    final resp = await http.post(
+      Uri.parse('$_baseUrl/api/release-apk'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({}),
+    );
+    if (resp.statusCode != 200) {
+      final body = jsonDecode(resp.body) as Map<String, dynamic>;
+      throw Exception(body['error'] ?? 'Release APK failed (${resp.statusCode})');
+    }
+  }
+
   Future<Map<String, String>> getMissionSummary() async {
     final resp = await http.get(Uri.parse('$_baseUrl/api/mission-summary'));
     if (resp.statusCode != 200) {

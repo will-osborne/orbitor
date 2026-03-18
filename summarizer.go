@@ -57,7 +57,7 @@ type Summarizer struct {
 func NewSummarizer(cfg SummarizerConfig) *Summarizer {
 	if cfg.CacheDir == "" {
 		home, _ := os.UserHomeDir()
-		cfg.CacheDir = filepath.Join(home, ".cache", "copilot-bridge")
+		cfg.CacheDir = filepath.Join(home, ".cache", "orbitor")
 	}
 	if cfg.ModelURL == "" {
 		cfg.ModelURL = defaultModelURL

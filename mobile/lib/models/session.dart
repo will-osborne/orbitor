@@ -8,6 +8,7 @@ class Session {
   final bool skipPermissions;
   final String lastMessage;
   final String currentTool;
+  final String currentPrompt;
   final bool isRunning;
   final bool pendingPermission;
   final String title;
@@ -24,6 +25,7 @@ class Session {
     this.skipPermissions = false,
     this.lastMessage = '',
     this.currentTool = '',
+    this.currentPrompt = '',
     this.isRunning = false,
     this.pendingPermission = false,
     this.title = '',
@@ -52,6 +54,7 @@ class Session {
       skipPermissions: json['skipPermissions'] ?? false,
       lastMessage: json['lastMessage'] ?? '',
       currentTool: json['currentTool'] ?? '',
+      currentPrompt: json['currentPrompt'] ?? '',
       isRunning: json['isRunning'] ?? false,
       pendingPermission: json['pendingPermission'] ?? false,
       title: json['title'] ?? '',

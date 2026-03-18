@@ -1,5 +1,5 @@
-name: copilot_bridge
-description: Mobile client for copilot-bridge
+name: orbitor
+description: Mobile client for orbitor
 publish_to: 'none'
 version: 0.1.0
 

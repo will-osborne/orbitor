@@ -337,6 +337,32 @@ func (st *Store) LoadMessages(sessionID string) ([]WSMessage, error) {
 	return out, nil
 }
 
+// LoadRecentMessages returns up to limit of the most recent messages for a session,
+// in chronological order. Use this instead of LoadMessages to avoid reading huge datasets.
+func (st *Store) LoadRecentMessages(sessionID string, limit int) ([]WSMessage, error) {
+	rows, err := st.db.Query(
+		`SELECT type, data FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?`,
+		sessionID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WSMessage
+	for rows.Next() {
+		var typ, data string
+		if err := rows.Scan(&typ, &data); err != nil {
+			return nil, err
+		}
+		out = append(out, WSMessage{Type: typ, Data: json.RawMessage(data)})
+	}
+	// Reverse to get chronological order (we queried DESC).
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // SaveMessage appends a message row for a session (used for history persistence).
 // data must be a valid JSON string matching the broadcast format the client expects.
 func (st *Store) SaveMessage(sessionID, typ, data string) error {

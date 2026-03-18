@@ -45,7 +45,7 @@ func main() {
 		return
 	}
 
-	store, err := NewStore("copilot-bridge.db")
+	store, err := NewStore("orbitor.db")
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
@@ -171,12 +171,14 @@ func main() {
 	// Serve Flutter web build as fallback
 	webDir := "mobile/build/web"
 	if info, err := os.Stat(webDir); err == nil && info.IsDir() {
-		mux.Handle("GET /", http.FileServer(http.Dir(webDir)))
+		// Register root file server using path-only pattern to avoid conflicts
+		mux.Handle("/", http.FileServer(http.Dir(webDir)))
 	} else {
-		mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		// Fallback HTML page for when web build is not present
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			w.Write([]byte(`<!DOCTYPE html><html><body style="background:#1a1a2e;color:#eee;font-family:monospace;padding:2em">
-<h1>copilot-bridge</h1><p>Server running. Build the Flutter app with <code>cd mobile && flutter build web</code> to serve the UI here.</p>
+<h1>orbitor</h1><p>Server running. Build the Flutter app with <code>cd mobile && flutter build web</code> to serve the UI here.</p>
 <p>API: <a href="/api/sessions" style="color:#0ff">/api/sessions</a></p></body></html>`))
 		})
 	}
@@ -184,7 +186,7 @@ func main() {
 	srv := &http.Server{Handler: corsMiddleware(mux)}
 
 	go func() {
-		log.Printf("copilot-bridge listening on %s (pid %d)", *addr, os.Getpid())
+		log.Printf("orbitor listening on %s (pid %d)", *addr, os.Getpid())
 		if err := srv.Serve(ln); err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
