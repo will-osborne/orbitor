@@ -1228,14 +1228,14 @@ class _NewSessionSheetState extends State<_NewSessionSheet> {
     'gpt-5.3-codex',
     'gpt-5.1',
     'gpt-4.1',
-    'claude-sonnet-4.6',
-    'claude-opus-4.6',
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
   ];
 
   static const _claudeModels = [
-    'claude-sonnet-4.6',
-    'claude-opus-4.6',
-    'claude-haiku-4.5',
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
+    'claude-haiku-4-5',
   ];
 
   List<String> get _availableModels =>

@@ -848,12 +848,8 @@ func (s *Session) teardown() {
 
 	// Gracefully close the ACP session so the agent can persist state
 	// for resumption. This is critical for --resume to work after reload.
-	if s.acp != nil && s.ACPSession != "" {
-		_ = s.acp.Notify("session/close", map[string]string{"sessionId": s.ACPSession})
-		// Give the agent a moment to process the close notification
-		// before we tear down the transport.
-		time.Sleep(200 * time.Millisecond)
-	}
+	// Note: session/close is not a supported ACP notification, so we just
+	// close the transport directly.
 	if s.acp != nil {
 		s.acp.Close()
 	}
