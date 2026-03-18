@@ -1,0 +1,42 @@
+# Compiled binaries
+copilot-bridge
+/dist/
+
+# Go build cache
+*.test
+*.out
+
+# SQLite databases (contain session data / WhatsApp credentials)
+*.db
+*.db-wal
+*.db-shm
+
+# Log files
+*.log
+
+# Local config with personal values — use config/config.yaml.example as template
+config/config.yaml
+
+# Claude local settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Flutter build output
+mobile/build/
+
+# Flutter tool-generated files
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/pubspec.lock
+
+# Android local build properties (contains SDK paths)
+mobile/android/local.properties
+
+# Android signing keys
+*.keystore
+*.jks
+key.properties
+
+# macOS
+.DS_Store

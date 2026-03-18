@@ -1,0 +1,26 @@
+name: copilot_bridge
+description: Mobile client for copilot-bridge
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.1
+  http: ^1.2.2
+  provider: ^6.1.2
+  flutter_markdown: ^0.7.6
+  flutter_local_notifications: ^19.0.0
+  shared_preferences: ^2.5.3
+  workmanager: ^0.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
