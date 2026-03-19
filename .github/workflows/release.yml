@@ -15,12 +15,13 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-latest   # ARM runner — native arm64
+          - runner: macos-latest
             goos: darwin
             goarch: arm64
-          - runner: macos-13       # Intel runner — native amd64
+          - runner: macos-latest   # ARM runner, cross-compile to amd64 via clang -arch x86_64
             goos: darwin
             goarch: amd64
+            cc: clang -arch x86_64
           - runner: ubuntu-latest
             goos: linux
             goarch: amd64
