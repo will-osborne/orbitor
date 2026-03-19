@@ -15,10 +15,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-latest
+          - runner: macos-latest   # ARM runner — native arm64
             goos: darwin
             goarch: arm64
-          - runner: macos-latest
+          - runner: macos-13       # Intel runner — native amd64
             goos: darwin
             goarch: amd64
           - runner: ubuntu-latest
@@ -27,6 +27,7 @@ jobs:
           - runner: ubuntu-latest
             goos: linux
             goarch: arm64
+            cc: aarch64-linux-gnu-gcc
 
     steps:
       - uses: actions/checkout@v4
@@ -36,11 +37,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install cross-compiler (Linux ARM64 only)
+        if: matrix.cc != ''
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
+          CC: ${{ matrix.cc }}
         run: |
           go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
             -o orbitor-${{ matrix.goos }}-${{ matrix.goarch }} .
