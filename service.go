@@ -133,6 +133,13 @@ func serviceInstallDarwin() {
 	plistPath := filepath.Join(plistDir, "io.orbitor.server.plist")
 	logPath := filepath.Join(home, ".orbitor", "server.log")
 
+	// Capture PATH at install time so the service can find claude-agent-acp,
+	// copilot, and other tools that live outside the default launchd PATH.
+	currentPath := os.Getenv("PATH")
+	if currentPath == "" {
+		currentPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	}
+
 	plistContent := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -145,6 +152,10 @@ func serviceInstallDarwin() {
     <key>StandardOutPath</key><string>` + logPath + `</string>
     <key>StandardErrorPath</key><string>` + logPath + `</string>
     <key>WorkingDirectory</key><string>` + home + `</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>` + currentPath + `</string>
+    </dict>
 </dict>
 </plist>
 `
