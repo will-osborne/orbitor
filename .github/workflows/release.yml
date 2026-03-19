@@ -78,3 +78,35 @@ jobs:
             dist/checksums.txt
           generate_release_notes: true
           draft: false
+
+      - name: Update Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Extract SHA256s from checksums.txt
+          SHA_DARWIN_ARM64=$(grep 'orbitor-darwin-arm64' dist/checksums.txt | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(grep 'orbitor-darwin-amd64' dist/checksums.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep 'orbitor-linux-arm64'  dist/checksums.txt | awk '{print $1}')
+          SHA_LINUX_AMD64=$(grep 'orbitor-linux-amd64'  dist/checksums.txt | awk '{print $1}')
+
+          # Strip leading 'v' from tag for the formula version field
+          SEMVER="${VERSION#v}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/will-osborne/homebrew-orbitor.git /tmp/tap
+
+          sed \
+            -e "s|version \".*\"|version \"${SEMVER}\"|" \
+            -e "s|PLACEHOLDER_DARWIN_ARM64_SHA256|${SHA_DARWIN_ARM64}|" \
+            -e "s|PLACEHOLDER_DARWIN_AMD64_SHA256|${SHA_DARWIN_AMD64}|" \
+            -e "s|PLACEHOLDER_LINUX_ARM64_SHA256|${SHA_LINUX_ARM64}|" \
+            -e "s|PLACEHOLDER_LINUX_AMD64_SHA256|${SHA_LINUX_AMD64}|" \
+            Formula/orbitor.rb > /tmp/tap/Formula/orbitor.rb
+
+          cd /tmp/tap
+          git add Formula/orbitor.rb
+          git commit -m "orbitor ${VERSION}"
+          git push
