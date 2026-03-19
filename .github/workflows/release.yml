@@ -39,7 +39,7 @@ jobs:
           cache: true
 
       - name: Install cross-compiler (Linux ARM64 only)
-        if: matrix.cc != ''
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
