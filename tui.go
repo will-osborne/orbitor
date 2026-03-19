@@ -148,6 +148,15 @@ func init() {
 	applyTheme(tuiThemes[0])
 }
 
+const (
+	tuiStateDirName  = ".orbitor"
+	tuiStateFileName = "tui_state.json"
+)
+
+type tuiStateFile struct {
+	Theme string `json:"theme"`
+}
+
 func applyTheme(th tuiTheme) {
 	colGreen = th.Green
 	colOrange = th.Orange
@@ -176,6 +185,49 @@ func applyTheme(th tuiTheme) {
 	styleSep = lipgloss.NewStyle().Foreground(colSep)
 	styleLabel = lipgloss.NewStyle().Foreground(colMuted)
 	styleAccent = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+}
+
+func themeIndexByName(name string) int {
+	for i, th := range tuiThemes {
+		if strings.EqualFold(th.Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+func readThemePreference() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(home, tuiStateDirName, tuiStateFileName)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var st tuiStateFile
+	if err := json.Unmarshal(b, &st); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(st.Theme), nil
+}
+
+func writeThemePreference(theme string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(home, tuiStateDirName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, tuiStateFileName)
+	b, err := json.MarshalIndent(tuiStateFile{Theme: theme}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
 }
 
 func currentThemeName(idx int) string {
@@ -507,8 +559,14 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		compactBlocks:     true,
 		thinkingLines:     []string{"idle"},
 	}
+	if pref, err := readThemePreference(); err == nil && pref != "" {
+		if idx := themeIndexByName(pref); idx >= 0 {
+			m.themeIdx = idx
+			applyTheme(tuiThemes[idx])
+		}
+	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("↑/↓ or j/k navigate sessions  ·  Tab/Shift+Tab cycle sessions  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓/j/k scroll chat  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -707,7 +765,7 @@ func (m *tuiModel) renderHelp() string {
 		titleStyle.Render("  Keyboard Shortcuts"),
 		"",
 		head.Render("  Navigation"),
-		row("↑/↓  j/k", "navigate session list"),
+		row("↑/↓  j/k", "scroll chat feed"),
 		row("Tab/Shift+Tab", "cycle sessions"),
 		row("Enter (empty input)", "connect to selected session"),
 		row("n", "new session wizard"),
@@ -727,7 +785,7 @@ func (m *tuiModel) renderHelp() string {
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
-		row("↑/↓ (with text)", "cycle prompt history"),
+		row("Ctrl+↑/↓", "cycle prompt history"),
 		row("Ctrl+I", "interrupt running session"),
 		row("Ctrl+R / F5", "refresh sessions"),
 		"",
@@ -1046,66 +1104,40 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.deleteConfirmID = m.sessions[m.selected].ID
 			return m, nil
 
-		case "up":
-			// When input has text and there is history to browse, cycle backwards.
-			if m.input.Value() != "" && len(m.inputHistory) > 0 {
-				if m.historyPos == 0 {
-					m.historyLive = m.input.Value()
-				}
-				if m.historyPos < len(m.inputHistory) {
-					m.historyPos++
-					m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
-					m.input.CursorEnd()
-				}
-				return m, nil
-			}
-			// When already browsing history, continue backwards.
-			if m.historyPos > 0 {
-				if m.historyPos < len(m.inputHistory) {
-					m.historyPos++
-					m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
-					m.input.CursorEnd()
-				}
-				return m, nil
-			}
-			// Otherwise navigate session list.
-			if m.selected > 0 {
-				m.selected--
-			}
+		case "up", "k":
+			m.viewport.ScrollUp(3)
 			return m, nil
 
-		case "down":
-			if m.historyPos > 0 {
-				// Browse history forwards.
-				m.historyPos--
-				if m.historyPos == 0 {
-					m.input.SetValue(m.historyLive)
-				} else {
-					m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
-				}
+		case "down", "j":
+			m.viewport.ScrollDown(3)
+			return m, nil
+
+		case "ctrl+up":
+			if len(m.inputHistory) == 0 {
+				return m, nil
+			}
+			if m.historyPos == 0 {
+				m.historyLive = m.input.Value()
+			}
+			if m.historyPos < len(m.inputHistory) {
+				m.historyPos++
+				m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
 				m.input.CursorEnd()
-				return m, nil
-			}
-			if m.selected < len(m.sessions)-1 {
-				m.selected++
 			}
 			return m, nil
 
-		case "k":
-			if m.input.Value() == "" {
-				if m.selected > 0 {
-					m.selected--
-				}
+		case "ctrl+down":
+			if m.historyPos == 0 {
 				return m, nil
 			}
-
-		case "j":
-			if m.input.Value() == "" {
-				if m.selected < len(m.sessions)-1 {
-					m.selected++
-				}
-				return m, nil
+			m.historyPos--
+			if m.historyPos == 0 {
+				m.input.SetValue(m.historyLive)
+			} else {
+				m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
 			}
+			m.input.CursorEnd()
+			return m, nil
 
 		case "tab":
 			// Tab cycles sessions even when input has content.
@@ -1208,6 +1240,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+t":
 			m.themeIdx = (m.themeIdx + 1) % len(tuiThemes)
 			applyTheme(tuiThemes[m.themeIdx])
+			if err := writeThemePreference(tuiThemes[m.themeIdx].Name); err != nil {
+				m.logSystem("theme persistence warning: " + err.Error())
+			}
 			m.logSystem("Theme: " + tuiThemes[m.themeIdx].Name)
 			m.rebuildViewport()
 			return m, nil
@@ -1431,10 +1466,10 @@ func (m *tuiModel) View() string {
 	var hint string
 	if m.activeSessionID != "" {
 		promptPrefix = styleAccent.Render(" ❯ ")
-		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  Alt+←/→ word-move  ·  ?=help"
+		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  ↑/↓ scroll  ·  Ctrl+↑/↓ history  ·  Alt+←/→ word-move"
 	} else {
 		promptPrefix = styleMuted.Render(" ❯ ")
-		hint = "Enter=connect  ·  n=new  ·  ↑/↓=navigate  ·  Alt+←/→ word-move  ·  ?=help"
+		hint = "Enter=connect  ·  Tab cycle sessions  ·  ↑/↓ scroll  ·  Alt+←/→ word-move"
 	}
 	if m.isThinking {
 		hint += "  ·  agent running"
@@ -1561,7 +1596,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /themes")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+i=abort  ctrl+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  up/down/j/k=scroll chat  ctrl+up/down=prompt history  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+i=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -1722,6 +1757,9 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 			if strings.EqualFold(th.Name, want) {
 				m.themeIdx = i
 				applyTheme(th)
+				if err := writeThemePreference(th.Name); err != nil {
+					m.logSystem("theme persistence warning: " + err.Error())
+				}
 				m.logSystem("Theme: " + th.Name)
 				m.rebuildViewport()
 				return nil
@@ -1801,9 +1839,17 @@ func (m *tuiModel) chatWidth() int {
 //
 //	── role  ·  14:23 ──────────────────────────────
 func (m *tuiModel) turnHeader(role string, roleStyle lipgloss.Style, ts string) string {
-	_ = roleStyle
-	_ = m.chatWidth()
-	return styleMuted.Render("  " + role + "  " + ts)
+	w := m.chatWidth()
+	left := " " + role + " "
+	leftW := max(12, w-len(ts)-3)
+	if leftW < len(left) {
+		leftW = len(left)
+	}
+	bar := left
+	if lipgloss.Width(bar) < leftW {
+		bar += strings.Repeat("─", leftW-lipgloss.Width(bar))
+	}
+	return roleStyle.Render(bar) + styleMuted.Render(" "+ts)
 }
 
 // ── renderMessage ─────────────────────────────────────────────────────────────
@@ -1821,14 +1867,16 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 		if m.agentBlockIdx >= 0 && m.agentBlockIdx < len(m.logs) {
 			m.agentBlockText += d.Text
+			hdr := m.turnHeader("assistant", styleAccent, m.agentBlockTime.Format("15:04"))
 			body := m.renderRichTextBlock(m.agentBlockText, w, false)
-			m.logs[m.agentBlockIdx] = body
+			m.logs[m.agentBlockIdx] = hdr + "\n" + body
 		} else {
 			m.agentBlockIdx = len(m.logs)
 			m.agentBlockTime = time.Now()
 			m.agentBlockText = d.Text
+			hdr := m.turnHeader("assistant", styleAccent, tsStr)
 			body := m.renderRichTextBlock(d.Text, w, false)
-			m.logs = append(m.logs, body)
+			m.logs = append(m.logs, hdr+"\n"+body)
 			if len(m.logs) > 4000 {
 				m.logs = m.logs[len(m.logs)-4000:]
 				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
@@ -1880,7 +1928,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 
 			titleStr := trimForLine(d.Title, w-14)
 			kindLabel := styleMuted.Render("  " + d.Kind)
-			titleLine := "  " + sigilSty.Render(sigil) + " " + styleText.Render(titleStr) + kindLabel
+			titleLine := "  " + sigilSty.Render(sigil) + " " + styleText.Render(titleStr) + kindLabel + styleMuted.Render("  ["+d.Status+"]")
 
 			if d.Content == "" {
 				// Inline tool — single compact line.
@@ -1960,7 +2008,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Status string `json:"status"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil && d.Status != "" {
-			m.log(styleMuted.Render("   status: " + d.Status))
+			m.log(styleMuted.Render("  · status: " + d.Status))
 			m.pushThinking("status: " + d.Status)
 			switch strings.ToLower(d.Status) {
 			case "working", "running", "thinking", "starting", "respawning":
@@ -1979,6 +2027,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 	case "interrupted":
 		m.isThinking = false
+		m.log(styleMuted.Render("  · interrupted"))
 	}
 }
 
@@ -2089,7 +2138,12 @@ func (m *tuiModel) renderMarkdownBlock(text string, width int, toolOutput bool) 
 		if strings.HasPrefix(trim, "- ") || strings.HasPrefix(trim, "* ") {
 			item := strings.TrimSpace(trim[2:])
 			item = m.applyInlineMarkdown(item)
-			out = append(out, styleMuted.Render("• ")+styleText.Render(wrapWords(item, max(12, width-2), "")))
+			out = append(out, styleMuted.Render("  • ")+styleText.Render(wrapWords(item, max(12, width-4), "")))
+			continue
+		}
+
+		if strings.HasPrefix(trim, "1. ") || strings.HasPrefix(trim, "2. ") || strings.HasPrefix(trim, "3. ") || strings.HasPrefix(trim, "4. ") || strings.HasPrefix(trim, "5. ") {
+			out = append(out, styleMuted.Render("  "+trim[:2])+styleText.Render(wrapWords(strings.TrimSpace(trim[2:]), max(12, width-4), "")))
 			continue
 		}
 
@@ -2101,7 +2155,7 @@ func (m *tuiModel) renderMarkdownBlock(text string, width int, toolOutput bool) 
 			out = append(out, "")
 			continue
 		}
-		out = append(out, styleText.Render(wrapWords(rendered, max(12, width), "")))
+		out = append(out, styleText.Render("  "+wrapWords(rendered, max(12, width-2), "")))
 	}
 
 	if maxLines < len(lines) {
@@ -2142,7 +2196,7 @@ func (m *tuiModel) renderDiffBlock(diff string, width int) string {
 		l := lines[i]
 		switch {
 		case strings.HasPrefix(l, "diff --git"):
-			out = append(out, styleAccent.Render("▌ "+trimForLine(l, max(12, width-2))))
+			out = append(out, styleAccent.Render("▌ file "+trimForLine(strings.TrimPrefix(l, "diff --git "), max(12, width-7))))
 		case strings.HasPrefix(l, "index "):
 			out = append(out, styleMuted.Render("  "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "@@"):
@@ -2150,11 +2204,11 @@ func (m *tuiModel) renderDiffBlock(diff string, width int) string {
 		case strings.HasPrefix(l, "+++"), strings.HasPrefix(l, "---"):
 			out = append(out, styleViolet.Render("│ "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "+"):
-			out = append(out, styleGreen.Render("+ "+trimForLine(strings.TrimPrefix(l, "+"), max(12, width-2))))
+			out = append(out, styleGreen.Render("┃ + "+trimForLine(strings.TrimPrefix(l, "+"), max(12, width-4))))
 		case strings.HasPrefix(l, "-"):
-			out = append(out, styleRed.Render("- "+trimForLine(strings.TrimPrefix(l, "-"), max(12, width-2))))
+			out = append(out, styleRed.Render("┃ - "+trimForLine(strings.TrimPrefix(l, "-"), max(12, width-4))))
 		default:
-			out = append(out, styleText.Render("  "+trimForLine(l, max(12, width-2))))
+			out = append(out, styleText.Render("┃   "+trimForLine(l, max(12, width-4))))
 		}
 	}
 	if maxLines < len(lines) {
