@@ -27,9 +27,12 @@ class _ChatScreenState extends State<ChatScreen>
   final List<ChatMessage> _messages = [];
   SessionConnection? _connection;
   StreamSubscription? _sub;
+  StreamSubscription? _historySub;
   bool _connected = false;
   bool _isAgentRunning = false;
+  bool _isKilled = false;
   bool _sessionReady = false;
+  int _queueDepth = 0;
   bool _showDebug = false;
   bool _searchOpen = false;
   String _searchQuery = '';
@@ -37,6 +40,7 @@ class _ChatScreenState extends State<ChatScreen>
   String? _currentToolTitle;
   String? _currentToolKind;
   late bool _skipPermissions;
+  late bool _planMode;
 
   // Incoming message buffering to reduce UI rebuild frequency
   final List<ChatMessage> _incomingBuffer = [];
@@ -47,7 +51,9 @@ class _ChatScreenState extends State<ChatScreen>
   void initState() {
     super.initState();
     _sessionReady = widget.session.status == 'ready';
+    _isKilled = widget.session.status == 'killed';
     _skipPermissions = widget.session.skipPermissions;
+    _planMode = widget.session.planMode;
     WidgetsBinding.instance.addObserver(this);
     _connect();
   }
@@ -71,6 +77,18 @@ class _ChatScreenState extends State<ChatScreen>
     final api = context.read<ApiService>();
     _connection = api.connectToSession(widget.session.id);
     setState(() => _connected = true);
+    _historySub = _connection!.historyResetStream.listen((_) {
+      if (!mounted) return;
+      _flushTimer?.cancel();
+      _flushTimer = null;
+      setState(() {
+        _messages.clear();
+        _incomingBuffer.clear();
+        _isAgentRunning = false;
+        _currentToolTitle = null;
+        _currentToolKind = null;
+      });
+    });
     _sub = _connection!.messageStream.listen(
       (msg) {
         if (!mounted) return;
@@ -148,6 +166,13 @@ class _ChatScreenState extends State<ChatScreen>
     );
 
     for (final msg in toAdd) {
+      // Handle queue_update sentinel (not displayed as message).
+      if (msg.type == MessageType.status &&
+          msg.text.startsWith('__queue_depth:')) {
+        final depthStr = msg.text.substring('__queue_depth:'.length);
+        _queueDepth = int.tryParse(depthStr) ?? 0;
+        continue;
+      }
       // Detect session becoming ready from status broadcast
       if (msg.type == MessageType.status && msg.text == 'ready') {
         _sessionReady = true;
@@ -167,14 +192,21 @@ class _ChatScreenState extends State<ChatScreen>
         // Don't add the resolved message itself — the card handles it.
         continue;
       }
-      if (msg.type == MessageType.agentText &&
-          _messages.isNotEmpty &&
-          _messages.last.type == MessageType.agentText) {
-        _messages[_messages.length - 1] = ChatMessage(
-          type: MessageType.agentText,
-          text: _messages.last.text + msg.text,
-          timestamp: _messages.last.timestamp,
+      if (msg.type == MessageType.agentText) {
+        // Coalesce with the previous agent text block even when invisible status
+        // messages (e.g. acp_update) interleave — they don't break the flow.
+        final prevIdx = _messages.lastIndexWhere(
+          (m) => m.type != MessageType.status,
         );
+        if (prevIdx >= 0 && _messages[prevIdx].type == MessageType.agentText) {
+          _messages[prevIdx] = ChatMessage(
+            type: MessageType.agentText,
+            text: _messages[prevIdx].text + msg.text,
+            timestamp: _messages[prevIdx].timestamp,
+          );
+        } else {
+          _messages.add(msg);
+        }
       } else if (msg.type == MessageType.toolCall && msg.toolCallId != null) {
         // Update existing tool call in-place instead of adding a duplicate.
         final idx = _messages.lastIndexWhere(
@@ -216,6 +248,16 @@ class _ChatScreenState extends State<ChatScreen>
         _isAgentRunning = false;
         _currentToolTitle = null;
         _currentToolKind = null;
+        if (_queueDepth > 0) _queueDepth--;
+      }
+      if (msg.type == MessageType.status) {
+        if (msg.text == 'killed') {
+          _isKilled = true;
+          _isAgentRunning = false;
+          _sessionReady = false;
+        } else if (msg.text == 'starting' || msg.text == 'ready') {
+          _isKilled = false;
+        }
       }
     }
     // Cap message list to prevent unbounded memory growth
@@ -245,10 +287,66 @@ class _ChatScreenState extends State<ChatScreen>
     _connection!.sendPrompt(text);
     _inputController.clear();
     _scrollToBottom(animate: true);
+    // Optimistically track queue depth if agent is already running.
+    if (_isAgentRunning) {
+      setState(() => _queueDepth++);
+    }
   }
 
   void _interruptSession() {
     _connection?.sendInterrupt();
+  }
+
+  Future<void> _killSession() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: CB.surface,
+        title: const Row(
+          children: [
+            Icon(Icons.electric_bolt_rounded, color: Colors.deepOrange),
+            SizedBox(width: 8),
+            Text('Emergency stop', style: TextStyle(fontSize: 18)),
+          ],
+        ),
+        content: const Text(
+          'This will SIGKILL the agent process immediately. You can revive it later.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.deepOrange),
+            child: const Text('Kill it'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      final api = context.read<ApiService>();
+      await api.killSession(widget.session.id);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messages.add(ChatMessage(type: MessageType.error, text: 'Kill failed: $e'));
+      });
+    }
+  }
+
+  Future<void> _reviveSession() async {
+    try {
+      final api = context.read<ApiService>();
+      await api.reviveSession(widget.session.id);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messages.add(ChatMessage(type: MessageType.error, text: 'Revive failed: $e'));
+      });
+    }
   }
 
   void _respondToPermission(String requestId, String optionId) {
@@ -259,7 +357,8 @@ class _ChatScreenState extends State<ChatScreen>
     final newValue = !_skipPermissions;
     try {
       final api = context.read<ApiService>();
-      await api.updateSession(widget.session.id, skipPermissions: newValue);
+      await api.updateSession(widget.session.id,
+          skipPermissions: newValue, planMode: _planMode);
       if (!mounted) return;
       setState(() {
         _skipPermissions = newValue;
@@ -272,6 +371,30 @@ class _ChatScreenState extends State<ChatScreen>
           ChatMessage(
             type: MessageType.error,
             text: 'Failed to toggle YOLO mode: $e',
+          ),
+        );
+      });
+    }
+  }
+
+  void _togglePlanMode() async {
+    final newValue = !_planMode;
+    try {
+      final api = context.read<ApiService>();
+      await api.updateSession(widget.session.id,
+          skipPermissions: _skipPermissions, planMode: newValue);
+      if (!mounted) return;
+      setState(() {
+        _planMode = newValue;
+        _sessionReady = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            type: MessageType.error,
+            text: 'Failed to toggle plan mode: $e',
           ),
         );
       });
@@ -387,6 +510,7 @@ class _ChatScreenState extends State<ChatScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _sub?.cancel();
+    _historySub?.cancel();
     _flushTimer?.cancel();
     if (_incomingBuffer.isNotEmpty) {
       _flushIncoming(callSetState: false);
@@ -511,6 +635,17 @@ class _ChatScreenState extends State<ChatScreen>
                             onPressed: _toggleSkipPermissions,
                           ),
                           IconButton(
+                            icon: Icon(
+                              _planMode
+                                  ? Icons.edit_note_rounded
+                                  : Icons.edit_note_outlined,
+                              size: 20,
+                              color: _planMode ? CB.cyan : CB.textTertiary,
+                            ),
+                            tooltip: _planMode ? 'Plan mode on' : 'Plan mode off',
+                            onPressed: _togglePlanMode,
+                          ),
+                          IconButton(
                             icon: const Icon(Icons.search_rounded, size: 20),
                             onPressed: () => setState(() {
                               _searchOpen = !_searchOpen;
@@ -529,6 +664,20 @@ class _ChatScreenState extends State<ChatScreen>
                             ),
                             onPressed: () =>
                                 setState(() => _showDebug = !_showDebug),
+                          ),
+                          // Emergency kill / revive
+                          IconButton(
+                            icon: Icon(
+                              _isKilled
+                                  ? Icons.restart_alt_rounded
+                                  : Icons.electric_bolt_rounded,
+                              size: 20,
+                              color: _isKilled
+                                  ? CB.neonGreen
+                                  : Colors.deepOrange.withValues(alpha: 0.8),
+                            ),
+                            tooltip: _isKilled ? 'Revive agent' : 'Emergency stop',
+                            onPressed: _isKilled ? _reviveSession : _killSession,
                           ),
                           // Delete session from inside the chat view
                           IconButton(
@@ -915,7 +1064,28 @@ class _ChatScreenState extends State<ChatScreen>
               top: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
             ),
           ),
-          child: Row(
+          child: _isKilled
+              ? SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: ElevatedButton.icon(
+                    onPressed: _reviveSession,
+                    icon: const Icon(Icons.restart_alt_rounded, size: 20),
+                    label: const Text(
+                      'Revive Agent',
+                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: CB.neonGreen.withValues(alpha: 0.15),
+                      foregroundColor: CB.neonGreen,
+                      side: BorderSide(color: CB.neonGreen.withValues(alpha: 0.5)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                  ),
+                )
+              : Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               Expanded(
@@ -970,49 +1140,87 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Widget _buildSendButton() {
-    if (_isAgentRunning) {
-      return GestureDetector(
-        onTap: _interruptSession,
-        child: Container(
-          width: 44,
-          height: 44,
-          decoration: BoxDecoration(
-            color: CB.hotPink.withValues(alpha: 0.15),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: CB.hotPink.withValues(alpha: 0.5)),
+    final enabled = _connected && _sessionReady;
+
+    // Send button — always shown (queues prompt if agent is running).
+    final sendBtn = GestureDetector(
+      onTap: enabled ? _sendMessage : null,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              gradient: enabled ? CB.accentGradient : null,
+              color: enabled ? null : CB.textTertiary.withValues(alpha: 0.3),
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: enabled
+                  ? [
+                      BoxShadow(
+                        color: CB.cyan.withValues(alpha: 0.3),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ]
+                  : null,
+            ),
+            child: Icon(
+              Icons.arrow_upward_rounded,
+              color: enabled ? CB.black : CB.textTertiary,
+              size: 22,
+            ),
           ),
-          child: const Icon(Icons.stop_rounded, color: CB.hotPink, size: 22),
-        ),
+          // Queue depth badge.
+          if (_queueDepth > 0)
+            Positioned(
+              top: -4,
+              right: -4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: CB.amber,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '$_queueDepth',
+                  style: const TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.black,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+
+    if (_isAgentRunning) {
+      // Show interrupt button alongside send button when agent is running.
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            onTap: _interruptSession,
+            child: Container(
+              width: 36,
+              height: 44,
+              decoration: BoxDecoration(
+                color: CB.hotPink.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: CB.hotPink.withValues(alpha: 0.4)),
+              ),
+              child: const Icon(Icons.stop_rounded, color: CB.hotPink, size: 18),
+            ),
+          ),
+          const SizedBox(width: 6),
+          sendBtn,
+        ],
       );
     }
 
-    final enabled = _connected && _sessionReady;
-    return GestureDetector(
-      onTap: enabled ? _sendMessage : null,
-      child: Container(
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          gradient: enabled ? CB.accentGradient : null,
-          color: enabled ? null : CB.textTertiary.withValues(alpha: 0.3),
-          borderRadius: BorderRadius.circular(14),
-          boxShadow: enabled
-              ? [
-                  BoxShadow(
-                    color: CB.cyan.withValues(alpha: 0.3),
-                    blurRadius: 12,
-                    offset: const Offset(0, 4),
-                  ),
-                ]
-              : null,
-        ),
-        child: Icon(
-          Icons.arrow_upward_rounded,
-          color: enabled ? CB.black : CB.textTertiary,
-          size: 22,
-        ),
-      ),
-    );
+    return sendBtn;
   }
 }
 

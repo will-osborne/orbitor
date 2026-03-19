@@ -274,10 +274,12 @@ type WSSessionInfo struct {
 	Backend           string    `json:"backend"`
 	Model             string    `json:"model,omitempty"`
 	SkipPermissions   bool      `json:"skipPermissions"`
+	PlanMode          bool      `json:"planMode"`
 	LastMessage       string    `json:"lastMessage,omitempty"`
 	CurrentTool       string    `json:"currentTool,omitempty"`
 	CurrentPrompt     string    `json:"currentPrompt,omitempty"`
 	IsRunning         bool      `json:"isRunning"`
+	QueueDepth        int       `json:"queueDepth"`
 	PendingPermission bool      `json:"pendingPermission"`
 	Title             string    `json:"title,omitempty"`
 	Summary           string    `json:"summary,omitempty"`

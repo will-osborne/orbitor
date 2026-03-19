@@ -5,6 +5,7 @@ import '../models/session.dart';
 import '../services/api_service.dart';
 import '../theme.dart';
 import 'chat_screen.dart';
+import 'zoo_screen.dart';
 
 class SessionsScreen extends StatefulWidget {
   const SessionsScreen({super.key});
@@ -83,7 +84,7 @@ class _SessionsScreenState extends State<SessionsScreen>
 
   Future<void> _createSession() async {
     final result = await showModalBottomSheet<
-        ({String dir, String backend, String model, bool skipPermissions})>(
+        ({String dir, String backend, String model, bool skipPermissions, bool planMode})>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -95,7 +96,8 @@ class _SessionsScreenState extends State<SessionsScreen>
       final session = await context.read<ApiService>().createSession(result.dir,
           backend: result.backend,
           model: result.model,
-          skipPermissions: result.skipPermissions);
+          skipPermissions: result.skipPermissions,
+          planMode: result.planMode);
       if (!mounted) return;
       _refresh();
       _openSession(session);
@@ -402,6 +404,21 @@ class _SessionsScreenState extends State<SessionsScreen>
                   tooltip: 'Update server',
                 ),
               IconButton(
+                icon: const Text('🤖', style: TextStyle(fontSize: 18)),
+                onPressed: () => Navigator.push(
+                  context,
+                  PageRouteBuilder(
+                    pageBuilder: (_, __, ___) => const ZooScreen(),
+                    transitionsBuilder: (_, anim, __, child) => FadeTransition(
+                      opacity: anim.drive(CurveTween(curve: Curves.easeInOut)),
+                      child: child,
+                    ),
+                    transitionDuration: const Duration(milliseconds: 350),
+                  ),
+                ),
+                tooltip: 'Agent Zoo',
+              ),
+              IconButton(
                 icon: const Icon(Icons.dns_outlined, size: 22),
                 onPressed: _showSettings,
                 color: CB.textSecondary,
@@ -564,7 +581,14 @@ class _SessionsScreenState extends State<SessionsScreen>
     // around when their state changes. Visual state indicators on each
     // card convey urgency without reordering.
     final sorted = List<Session>.from(_sessions)
-      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      ..sort((a, b) {
+        // Primary: newest createdAt first. If timestamps are equal, fall back
+        // to a deterministic secondary key (id) so the ordering is stable
+        // and sessions don't jump around when other fields change.
+        final cmp = b.createdAt.compareTo(a.createdAt);
+        if (cmp != 0) return cmp;
+        return a.id.compareTo(b.id);
+      });
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1221,6 +1245,7 @@ class _NewSessionSheetState extends State<_NewSessionSheet> {
   String _backend = 'copilot';
   String _model = 'gpt-5-mini';
   bool _skipPermissions = false;
+  bool _planMode = false;
 
   static const _copilotModels = [
     'gpt-5-mini',
@@ -1252,7 +1277,8 @@ class _NewSessionSheetState extends State<_NewSessionSheet> {
       dir: _dirController.text,
       backend: _backend,
       model: _model,
-      skipPermissions: _skipPermissions
+      skipPermissions: _skipPermissions,
+      planMode: _planMode,
     ));
   }
 
@@ -1425,6 +1451,51 @@ class _NewSessionSheetState extends State<_NewSessionSheet> {
                     onChanged: (v) =>
                         setState(() => _skipPermissions = v),
                     activeThumbColor: CB.amber,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            // Plan mode toggle
+            Container(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.04),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.08)),
+              ),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: Row(
+                children: [
+                  const Icon(Icons.edit_note_rounded,
+                      size: 18, color: CB.cyan),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Plan mode',
+                          style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              color: CB.textPrimary),
+                        ),
+                        Text(
+                          'plan only, no tool execution',
+                          style: TextStyle(
+                              fontSize: 11,
+                              fontFamily: 'monospace',
+                              color: CB.textTertiary),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: _planMode,
+                    onChanged: (v) => setState(() => _planMode = v),
+                    activeThumbColor: CB.cyan,
                   ),
                 ],
               ),

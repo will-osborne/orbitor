@@ -25,6 +25,7 @@ type Session struct {
 	Backend         string    // "copilot" or "claude"
 	Model           string    // model to use (e.g. "claude-sonnet-4.5", "gpt-5")
 	SkipPermissions bool      // pass --yolo (copilot) or --dangerously-skip-permissions (claude)
+	PlanMode        bool      // enable plan mode (mode=plan via ACP)
 	ACPSession      string    // ACP session ID returned by agent
 	Status          string    // "starting", "ready", "error", "closed"
 	CreatedAt       time.Time // when the session was first created
@@ -60,6 +61,7 @@ type Session struct {
 	allocPort  func() int  // returns a fresh port number (from SessionManager)
 	eventHub   *Hub        // global event hub for cross-session notifications
 	summarizer *Summarizer // optional LLM summarizer (nil = disabled)
+	fcm        *FCMSender  // optional FCM push sender (nil = disabled)
 }
 
 func (s *Session) persistSession() {
@@ -77,6 +79,7 @@ type SessionManager struct {
 	// connected /ws/events clients.
 	EventHub   *Hub
 	summarizer *Summarizer // optional LLM summarizer for session titles/summaries
+	fcm        *FCMSender  // optional FCM push notification sender (nil = disabled)
 }
 
 // AllocPort finds a free TCP port by briefly listening on :0 and returning
@@ -118,6 +121,7 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					Backend:         r.Backend,
 					Model:           r.Model,
 					SkipPermissions: r.SkipPermissions,
+					PlanMode:        r.PlanMode,
 					ACPSession:      r.ACPSession,
 					Status:          r.Status,
 					CreatedAt:       r.CreatedAt,
@@ -161,6 +165,10 @@ func (sm *SessionManager) RespawnSessions() {
 	for _, s := range sm.sessions {
 		if s.Status != "closed" {
 			toSpawn = append(toSpawn, s)
+		}
+		// Wire in FCM sender now that sm.fcm may have been set after construction.
+		if s.fcm == nil && sm.fcm != nil {
+			s.fcm = sm.fcm
 		}
 	}
 	sm.mu.RUnlock()
@@ -211,6 +219,11 @@ func (sm *SessionManager) List() []WSSessionInfo {
 		hasPerm := len(s.permPending) > 0
 		s.permMu.Unlock()
 
+		queueDepth := 0
+		if s.queue != nil {
+			queueDepth = s.queue.QueueDepth()
+		}
+
 		out = append(out, WSSessionInfo{
 			ID:                s.ID,
 			WorkingDir:        s.WorkingDir,
@@ -219,10 +232,12 @@ func (sm *SessionManager) List() []WSSessionInfo {
 			Backend:           s.Backend,
 			Model:             s.Model,
 			SkipPermissions:   s.SkipPermissions,
+			PlanMode:          s.PlanMode,
 			LastMessage:       lastMsg,
 			CurrentTool:       curTool,
 			CurrentPrompt:     curPrompt,
 			IsRunning:         running,
+			QueueDepth:        queueDepth,
 			PendingPermission: hasPerm,
 			CreatedAt:         s.CreatedAt,
 			Title:             title,
@@ -230,6 +245,12 @@ func (sm *SessionManager) List() []WSSessionInfo {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
+		// Order primarily by creation time (newest first). If two sessions
+		// have the same CreatedAt timestamp fall back to a deterministic
+		// secondary key (ID) so the ordering is stable across calls.
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out
@@ -241,7 +262,7 @@ func (sm *SessionManager) Get(id string) *Session {
 	return sm.sessions[id]
 }
 
-func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissions bool) (*Session, error) {
+func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissions, planMode bool) (*Session, error) {
 	if backend == "" {
 		backend = "copilot"
 	}
@@ -259,6 +280,7 @@ func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissi
 		Backend:         backend,
 		Model:           model,
 		SkipPermissions: skipPermissions,
+		PlanMode:        planMode,
 		Status:          "starting",
 		CreatedAt:       time.Now(),
 		port:            port,
@@ -269,6 +291,7 @@ func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissi
 		allocPort:       sm.AllocPort,
 		eventHub:        sm.EventHub,
 		summarizer:      sm.summarizer,
+		fcm:             sm.fcm,
 	}
 
 	go s.hub.Run()
@@ -592,14 +615,19 @@ func (s *Session) finishACPSetup(workingDir string) {
 		}
 	}
 
-	// Set bypass permissions mode via ACP protocol if requested.
-	// The --dangerously-skip-permissions CLI flag is not processed by claude-agent-acp;
-	// it must be set through the ACP session/set_config_option call.
+	// Set mode via ACP protocol:
+	// bypassPermissions takes precedence over plan mode (they are mutually exclusive).
 	if s.SkipPermissions {
 		if err := s.acp.SessionSetConfigOption(acpSessionID, "mode", "bypassPermissions"); err != nil {
 			log.Printf("session %s: set bypassPermissions failed: %v", s.ID, err)
 		} else {
 			log.Printf("session %s: configured mode=bypassPermissions", s.ID)
+		}
+	} else if s.PlanMode {
+		if err := s.acp.SessionSetConfigOption(acpSessionID, "mode", "plan"); err != nil {
+			log.Printf("session %s: set plan mode failed: %v", s.ID, err)
+		} else {
+			log.Printf("session %s: configured mode=plan", s.ID)
 		}
 	}
 
@@ -622,6 +650,8 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.persistSession()
 		promptPayload := map[string]string{"text": item.Text}
 		s.hub.Broadcast("prompt_sent", promptPayload)
+		// Broadcast updated queue depth (decremented since this item just dequeued).
+		s.hub.Broadcast("queue_update", map[string]int{"depth": s.queue.QueueDepth()})
 		var promptID int64
 		if s.store != nil {
 			id, err := s.store.InsertPrompt(s.ID, item.Text)
@@ -693,6 +723,10 @@ func (s *Session) finishACPSetup(workingDir string) {
 				"sessionSummary": s.summary,
 				"createdAt":      createdAt,
 			})
+			go s.fcm.Send(title, body, map[string]string{
+				"eventType": "run_complete",
+				"sessionId": s.ID,
+			})
 		}
 		if s.store != nil {
 			_ = s.store.SaveMessageJSON(s.ID, "run_complete", completePayload)
@@ -726,8 +760,8 @@ func (s *Session) finishACPSetup(workingDir string) {
 	// attempt to respawn automatically so the session self-heals.
 	go func() {
 		<-s.acp.Done()
-		// If session was intentionally closed/suspended, don't respawn.
-		if s.Status == "closed" || s.Status == "suspended" {
+		// If session was intentionally closed/suspended/killed, don't respawn.
+		if s.Status == "closed" || s.Status == "suspended" || s.Status == "killed" {
 			return
 		}
 		log.Printf("session %s: agent connection lost, attempting respawn...", s.ID)
@@ -787,9 +821,30 @@ func (sm *SessionManager) Delete(id string) error {
 	return nil
 }
 
+func (sm *SessionManager) KillSession(id string) error {
+	sm.mu.RLock()
+	s, ok := sm.sessions[id]
+	sm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("session %s not found", id)
+	}
+	s.KillProcess()
+	return nil
+}
+
+func (sm *SessionManager) ReviveSession(id string) error {
+	sm.mu.RLock()
+	s, ok := sm.sessions[id]
+	sm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("session %s not found", id)
+	}
+	return s.Revive()
+}
+
 // UpdateSession updates mutable session properties and respawns the backend
 // process so the new settings take effect.
-func (sm *SessionManager) UpdateSession(id string, skipPermissions bool) (*Session, error) {
+func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode bool) (*Session, error) {
 	sm.mu.RLock()
 	s, ok := sm.sessions[id]
 	sm.mu.RUnlock()
@@ -798,6 +853,7 @@ func (sm *SessionManager) UpdateSession(id string, skipPermissions bool) (*Sessi
 	}
 
 	s.SkipPermissions = skipPermissions
+	s.PlanMode = planMode
 	if sm.store != nil {
 		_ = sm.store.UpsertSession(s)
 	}
@@ -1154,6 +1210,11 @@ func (s *Session) handlePermissionRequest(id *json.RawMessage, params json.RawMe
 			"requestId":   requestID,
 			"createdAt":   createdAt,
 		})
+		go s.fcm.Send(title, body, map[string]string{
+			"eventType": "permission_request",
+			"sessionId": s.ID,
+			"requestId": requestID,
+		})
 	}
 
 	go func() {
@@ -1201,12 +1262,86 @@ func (s *Session) Interrupt() {
 	if cancel == nil {
 		return
 	}
+	// Cancel the in-flight context first so SessionPromptContext unblocks
+	// immediately, then send the graceful ACP notification.
+	cancel()
+	if s.queue != nil {
+		s.queue.Clear()
+	}
 	if s.acp != nil && s.ACPSession != "" {
 		_ = s.acp.Notify("session/interrupt", map[string]string{"sessionId": s.ACPSession})
 	}
-	cancel()
 	s.flushAgentText()
 	s.hub.Broadcast("interrupted", map[string]string{})
+}
+
+// KillProcess forcefully kills the agent process (SIGKILL) without waiting
+// for a graceful shutdown. The session remains in memory so it can be
+// revived later via Revive().
+func (s *Session) KillProcess() {
+	// Unblock any in-flight prompt immediately.
+	s.interruptMu.Lock()
+	cancel := s.interruptCancel
+	s.interruptMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	// Drain the queue so nothing starts after the kill.
+	if s.queue != nil {
+		s.queue.Clear()
+		s.queue.Close()
+		s.queue = nil
+	}
+
+	// Mark as killed BEFORE killing the process so the respawn monitor
+	// goroutine (watching acp.Done) sees the status and does not respawn.
+	s.Status = "killed"
+	if s.store != nil {
+		_ = s.store.UpsertSession(s)
+	}
+
+	if s.acp != nil {
+		s.acp.Close()
+	}
+
+	if s.process != nil && s.process.Process != nil {
+		_ = s.process.Process.Kill()
+		s.process = nil
+	}
+
+	s.hub.Broadcast("status", map[string]string{"status": "killed"})
+}
+
+// Revive restarts the agent process for a session that was previously killed.
+func (s *Session) Revive() error {
+	if s.Status != "killed" {
+		return fmt.Errorf("session is not in killed state (status: %s)", s.Status)
+	}
+
+	// Clean up any stale ACP reference from before the kill.
+	if s.acp != nil {
+		s.acp.Close()
+		s.acp = nil
+	}
+
+	if s.Backend == "copilot" && s.allocPort != nil {
+		s.port = s.allocPort()
+	}
+
+	s.Status = "starting"
+	s.hub.Broadcast("status", map[string]string{"status": "starting"})
+
+	switch s.Backend {
+	case "copilot":
+		s.startCopilot(s.WorkingDir, s.port)
+	case "claude":
+		s.startClaude(s.WorkingDir)
+	default:
+		return fmt.Errorf("unknown backend: %s", s.Backend)
+	}
+
+	return nil
 }
 
 func (s *Session) SendPrompt(text string) {
@@ -1215,6 +1350,12 @@ func (s *Session) SendPrompt(text string) {
 		return
 	}
 	s.queue.Enqueue(text)
+	// Broadcast queue depth so connected clients can show a pending count.
+	// This runs after Enqueue so the depth reflects the newly added item.
+	depth := s.queue.QueueDepth()
+	if depth > 0 {
+		s.hub.Broadcast("queue_update", map[string]int{"depth": depth})
+	}
 }
 
 // flushAgentText synchronously drains any buffered agent text so that

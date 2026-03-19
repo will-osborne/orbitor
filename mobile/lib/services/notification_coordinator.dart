@@ -1,11 +1,20 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 import 'api_service.dart';
 import 'notification_service.dart';
 import 'notification_worker.dart';
+
+// Top-level FCM background message handler (must be a top-level function).
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // When the app is in background/terminated, FCM delivers here.
+  // The notification is shown automatically by FCM on Android if the message
+  // has a notification payload. This handler runs for data-only messages.
+}
 
 class NotificationCoordinator {
   final ApiService _api;
@@ -32,9 +41,77 @@ class NotificationCoordinator {
     await _loadLastSeen();
     _api.onGlobalNotification = _handleRealtimeEvent;
     _api.startEventListener();
-    await _syncMissedNotifications();
+    await _advanceLastSeen();
     _startForegroundPolling();
     await _initBackgroundWorkerIfSupported();
+    await _initFCM();
+  }
+
+  Future<void> _initFCM() async {
+    if (kIsWeb) return;
+    try {
+      FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+      // Request permission (required on iOS, harmless on Android).
+      await FirebaseMessaging.instance.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+
+      // Register FCM token with server.
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token != null) {
+        await _registerFCMToken(token);
+      }
+
+      // Re-register if token refreshes.
+      FirebaseMessaging.instance.onTokenRefresh.listen(_registerFCMToken);
+
+      // Handle FCM messages when app is in foreground.
+      FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+        final data = message.data;
+        final eventType = data['eventType'] as String? ?? '';
+        final sessionId = data['sessionId'] as String? ?? '';
+        if (eventType.isEmpty || sessionId.isEmpty) return;
+
+        final notification = message.notification;
+        final title = notification?.title ?? data['title'] ?? '';
+        final body = notification?.body ?? data['body'] ?? '';
+
+        final event = GlobalNotificationEvent(
+          id: 0,
+          eventType: eventType,
+          sessionId: sessionId,
+          sessionName: title,
+          title: title,
+          body: body,
+        );
+        unawaited(_showAndTrack(event));
+      });
+
+      // Handle notification tap when app was in background (not terminated).
+      FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+        final sessionId = message.data['sessionId'] as String? ?? '';
+        _handleNotificationTap(sessionId);
+      });
+
+      // Handle notification tap when app was terminated.
+      final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+      if (initialMessage != null) {
+        final sessionId = initialMessage.data['sessionId'] as String? ?? '';
+        _handleNotificationTap(sessionId);
+      }
+    } catch (e) {
+      // FCM init is best-effort; don't block the app if Firebase isn't configured.
+    }
+  }
+
+  Future<void> _registerFCMToken(String token) async {
+    try {
+      final platform = Platform.isIOS ? 'ios' : 'android';
+      await _api.registerDeviceToken(token, platform: platform);
+    } catch (_) {}
   }
 
   Future<void> onBackground() async {
@@ -43,13 +120,13 @@ class NotificationCoordinator {
 
   Future<void> onResume() async {
     _api.onResume();
-    await _syncMissedNotifications();
+    await _advanceLastSeen();
   }
 
   Future<void> onBaseUrlChanged(String baseUrl) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(notificationBaseUrlKey, baseUrl);
-    await _syncMissedNotifications();
+    await _advanceLastSeen();
   }
 
   void dispose() {
@@ -60,7 +137,7 @@ class NotificationCoordinator {
   void _startForegroundPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
-      await _syncMissedNotifications();
+      await _advanceLastSeen();
     });
   }
 
@@ -145,14 +222,23 @@ class NotificationCoordinator {
     }
   }
 
-  Future<void> _syncMissedNotifications() async {
+  // Silently advance _lastSeenId to the current max without showing OS
+  // notifications. Used on startup and resume so FCM/workmanager duplicates
+  // are not created.
+  Future<void> _advanceLastSeen() async {
     try {
       final events = await _api.fetchNotifications(
         after: _lastSeenId,
         limit: 100,
       );
+      if (events.isEmpty) return;
+      int maxId = _lastSeenId;
       for (final event in events) {
-        await _showAndTrack(event);
+        if (event.id > maxId) maxId = event.id;
+      }
+      if (maxId > _lastSeenId) {
+        _lastSeenId = maxId;
+        await _persistLastSeen();
       }
     } catch (_) {}
   }

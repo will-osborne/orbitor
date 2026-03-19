@@ -21,6 +21,7 @@ type SessionRecord struct {
 	Backend         string
 	Model           string
 	SkipPermissions bool
+	PlanMode        bool
 	ACPSession      string
 	Status          string
 	Port            int
@@ -108,6 +109,13 @@ func NewStore(path string) (*Store, error) {
 			meta TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`,
+
+		`CREATE TABLE IF NOT EXISTS device_tokens (
+			token TEXT PRIMARY KEY,
+			platform TEXT NOT NULL DEFAULT 'android',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 
 	for _, s := range stmts {
@@ -125,6 +133,7 @@ func NewStore(path string) (*Store, error) {
 		hasSkipPerms := false
 		hasTitle := false
 		hasSummary := false
+		hasPlanMode := false
 		for rows.Next() {
 			var cid int
 			var name string
@@ -145,6 +154,9 @@ func NewStore(path string) (*Store, error) {
 				if name == "summary" {
 					hasSummary = true
 				}
+				if name == "plan_mode" {
+					hasPlanMode = true
+				}
 			}
 		}
 		if !hasProcID {
@@ -158,6 +170,9 @@ func NewStore(path string) (*Store, error) {
 		}
 		if !hasSummary {
 			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN summary TEXT;`)
+		}
+		if !hasPlanMode {
+			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN plan_mode INTEGER DEFAULT 0;`)
 		}
 	}
 
@@ -217,14 +232,19 @@ func (st *Store) UpsertSession(s *Session) error {
 	if s.SkipPermissions {
 		skipPerms = 1
 	}
+	planMode := 0
+	if s.PlanMode {
+		planMode = 1
+	}
 	_, err := st.db.Exec(
-		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, acp_session, status, port, proc_id, last_message, current_tool, title, summary, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(id) DO UPDATE SET
 		   working_dir=excluded.working_dir,
 		   backend=excluded.backend,
 		   model=excluded.model,
 		   skip_permissions=excluded.skip_permissions,
+		   plan_mode=excluded.plan_mode,
 		   acp_session=excluded.acp_session,
 		   status=excluded.status,
 		   port=excluded.port,
@@ -234,7 +254,7 @@ func (st *Store) UpsertSession(s *Session) error {
 		   title=excluded.title,
 		   summary=excluded.summary,
 		   updated_at=CURRENT_TIMESTAMP;`,
-		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, s.ACPSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary,
+		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, planMode, s.ACPSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary,
 	)
 	return err
 }
@@ -269,7 +289,7 @@ func (st *Store) DeleteSession(sessionID string) error {
 
 // LoadSessions returns all persisted sessions.
 func (st *Store) LoadSessions() ([]SessionRecord, error) {
-	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, acp_session, status, port, proc_id, last_message, current_tool, title, summary, created_at FROM sessions ORDER BY created_at DESC`)
+	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, created_at FROM sessions ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -279,6 +299,7 @@ func (st *Store) LoadSessions() ([]SessionRecord, error) {
 	for rows.Next() {
 		var r SessionRecord
 		var skipPerms sql.NullInt64
+		var planModeInt sql.NullInt64
 		var port sql.NullInt64
 		var proc sql.NullInt64
 		var lastMsg sql.NullString
@@ -286,10 +307,11 @@ func (st *Store) LoadSessions() ([]SessionRecord, error) {
 		var title sql.NullString
 		var summary sql.NullString
 		var createdAt sql.NullString
-		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &r.ACPSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &createdAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &planModeInt, &r.ACPSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &createdAt); err != nil {
 			return nil, err
 		}
 		r.SkipPermissions = skipPerms.Valid && skipPerms.Int64 != 0
+		r.PlanMode = planModeInt.Valid && planModeInt.Int64 != 0
 		if port.Valid {
 			r.Port = int(port.Int64)
 		}
@@ -459,6 +481,41 @@ func (st *Store) InsertNotification(eventType, sessionID, sessionName, title, bo
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// UpsertDeviceToken registers or refreshes a device FCM token.
+func (st *Store) UpsertDeviceToken(token, platform string) error {
+	_, err := st.db.Exec(
+		`INSERT INTO device_tokens (token, platform, updated_at)
+		 VALUES (?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(token) DO UPDATE SET platform=excluded.platform, updated_at=CURRENT_TIMESTAMP`,
+		token, platform,
+	)
+	return err
+}
+
+// ListDeviceTokens returns all registered device FCM tokens.
+func (st *Store) ListDeviceTokens() ([]string, error) {
+	rows, err := st.db.Query(`SELECT token FROM device_tokens ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var token string
+		if err := rows.Scan(&token); err != nil {
+			return nil, err
+		}
+		out = append(out, token)
+	}
+	return out, nil
+}
+
+// DeleteDeviceToken removes a device token (e.g. after FCM reports it invalid).
+func (st *Store) DeleteDeviceToken(token string) error {
+	_, err := st.db.Exec(`DELETE FROM device_tokens WHERE token = ?`, token)
+	return err
 }
 
 // ListNotificationsAfter returns global notifications with id > afterID.

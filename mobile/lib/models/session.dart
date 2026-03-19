@@ -6,6 +6,7 @@ class Session {
   final String backend;
   final String model;
   final bool skipPermissions;
+  final bool planMode;
   final String lastMessage;
   final String currentTool;
   final String currentPrompt;
@@ -23,6 +24,7 @@ class Session {
     this.backend = 'copilot',
     this.model = '',
     this.skipPermissions = false,
+    this.planMode = false,
     this.lastMessage = '',
     this.currentTool = '',
     this.currentPrompt = '',
@@ -52,6 +54,7 @@ class Session {
       backend: json['backend'] ?? 'copilot',
       model: json['model'] ?? '',
       skipPermissions: json['skipPermissions'] ?? false,
+      planMode: json['planMode'] ?? false,
       lastMessage: json['lastMessage'] ?? '',
       currentTool: json['currentTool'] ?? '',
       currentPrompt: json['currentPrompt'] ?? '',

@@ -100,11 +100,13 @@ class ApiService extends ChangeNotifier {
     String backend = 'copilot',
     String model = '',
     bool skipPermissions = false,
+    bool planMode = false,
   }) async {
     final body = <String, dynamic>{
       'workingDir': workingDir,
       'backend': backend,
       'skipPermissions': skipPermissions,
+      'planMode': planMode,
     };
     if (model.isNotEmpty) {
       body['model'] = model;
@@ -145,16 +147,31 @@ class ApiService extends ChangeNotifier {
   Future<Session> updateSession(
     String id, {
     required bool skipPermissions,
+    required bool planMode,
   }) async {
     final resp = await http.patch(
       Uri.parse('$_baseUrl/api/sessions/$id'),
       headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'skipPermissions': skipPermissions}),
+      body: jsonEncode({'skipPermissions': skipPermissions, 'planMode': planMode}),
     );
     if (resp.statusCode != 200) {
       throw Exception('Failed to update session: ${resp.body}');
     }
     return Session.fromJson(jsonDecode(resp.body));
+  }
+
+  Future<void> killSession(String id) async {
+    final resp = await http.post(Uri.parse('$_baseUrl/api/sessions/$id/kill'));
+    if (resp.statusCode != 204) {
+      throw Exception('Failed to kill session: ${resp.statusCode}');
+    }
+  }
+
+  Future<void> reviveSession(String id) async {
+    final resp = await http.post(Uri.parse('$_baseUrl/api/sessions/$id/revive'));
+    if (resp.statusCode != 204) {
+      throw Exception('Failed to revive session: ${resp.body}');
+    }
   }
 
   Future<void> releaseApk() async {
@@ -163,7 +180,10 @@ class ApiService extends ChangeNotifier {
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({}),
     );
-    if (resp.statusCode != 200) {
+    // Server responds with 202 Accepted when the build is queued and run
+    // asynchronously. Treat 200 and 202 as success here so the client
+    // doesn't throw on an expected async response.
+    if (resp.statusCode != 200 && resp.statusCode != 202) {
       final body = jsonDecode(resp.body) as Map<String, dynamic>;
       throw Exception(body['error'] ?? 'Release APK failed (${resp.statusCode})');
     }
@@ -190,6 +210,17 @@ class ApiService extends ChangeNotifier {
       throw Exception('Browse failed: ${resp.statusCode}');
     }
     return BrowseResult.fromJson(jsonDecode(resp.body));
+  }
+
+  Future<void> registerDeviceToken(String token, {String platform = 'android'}) async {
+    final resp = await http.post(
+      Uri.parse('$_baseUrl/api/device-token'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'token': token, 'platform': platform}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('Failed to register device token: ${resp.statusCode}');
+    }
   }
 
   Future<List<GlobalNotificationEvent>> fetchNotifications({
@@ -379,6 +410,9 @@ class SessionConnection {
   WebSocketChannel? _channel;
   final StreamController<ChatMessage> _messageController =
       StreamController.broadcast();
+  final StreamController<void> _historyResetController =
+      StreamController.broadcast();
+  Stream<void> get historyResetStream => _historyResetController.stream;
   final List<ChatMessage> messages = [];
   static const int _maxMessages = 2000;
   bool _closed = false;
@@ -416,6 +450,12 @@ class SessionConnection {
             final historyMsgs = (json['messages'] as List)
                 .map((m) => ChatMessage.fromWS(m as Map<String, dynamic>))
                 .toList();
+            // Clear existing messages and signal the UI to reset before
+            // re-rendering. This handles reconnects without showing duplicates.
+            messages.clear();
+            if (!_historyResetController.isClosed) {
+              _historyResetController.add(null);
+            }
             messages.addAll(historyMsgs);
             _trimMessages();
             for (final msg in historyMsgs) {
@@ -544,6 +584,9 @@ class SessionConnection {
     _channel?.sink.close();
     if (!_messageController.isClosed) {
       _messageController.close();
+    }
+    if (!_historyResetController.isClosed) {
+      _historyResetController.close();
     }
   }
 }

@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,15 +22,42 @@ import (
 type Handlers struct {
 	sm       *SessionManager
 	upgrader websocket.Upgrader
+	fcm      *FCMSender // may be nil if not configured
 }
 
-func NewHandlers(sm *SessionManager) *Handlers {
+func NewHandlers(sm *SessionManager, fcm *FCMSender) *Handlers {
 	return &Handlers{
-		sm: sm,
+		sm:  sm,
+		fcm: fcm,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+}
+
+func (h *Handlers) RegisterDeviceToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token    string `json:"token"`
+		Platform string `json:"platform"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, `{"error":"token required"}`, http.StatusBadRequest)
+		return
+	}
+	platform := req.Platform
+	if platform == "" {
+		platform = "android"
+	}
+	if h.sm.store == nil {
+		http.Error(w, `{"error":"store unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if err := h.sm.store.UpsertDeviceToken(req.Token, platform); err != nil {
+		http.Error(w, `{"error":"failed to register token"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
 }
 
 func (h *Handlers) ListSessions(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +75,7 @@ func (h *Handlers) CreateSession(w http.ResponseWriter, r *http.Request) {
 		Backend         string `json:"backend"`
 		Model           string `json:"model"`
 		SkipPermissions bool   `json:"skipPermissions"`
+		PlanMode        bool   `json:"planMode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
@@ -57,7 +86,7 @@ func (h *Handlers) CreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := h.sm.Create(req.WorkingDir, req.Backend, req.Model, req.SkipPermissions)
+	session, err := h.sm.Create(req.WorkingDir, req.Backend, req.Model, req.SkipPermissions, req.PlanMode)
 	if err != nil {
 		log.Printf("create session error: %v", err)
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
@@ -73,6 +102,7 @@ func (h *Handlers) CreateSession(w http.ResponseWriter, r *http.Request) {
 		Backend:         session.Backend,
 		Model:           session.Model,
 		SkipPermissions: session.SkipPermissions,
+		PlanMode:        session.PlanMode,
 	})
 }
 
@@ -89,12 +119,13 @@ func (h *Handlers) UpdateSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
 		SkipPermissions bool `json:"skipPermissions"`
+		PlanMode        bool `json:"planMode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	session, err := h.sm.UpdateSession(id, req.SkipPermissions)
+	session, err := h.sm.UpdateSession(id, req.SkipPermissions, req.PlanMode)
 	if err != nil {
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
 		return
@@ -108,7 +139,26 @@ func (h *Handlers) UpdateSession(w http.ResponseWriter, r *http.Request) {
 		Backend:         session.Backend,
 		Model:           session.Model,
 		SkipPermissions: session.SkipPermissions,
+		PlanMode:        session.PlanMode,
 	})
+}
+
+func (h *Handlers) KillSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.sm.KillSession(id); err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) ReviveSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.sm.ReviveSession(id); err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) PollNotifications(w http.ResponseWriter, r *http.Request) {
@@ -302,46 +352,78 @@ func (h *Handlers) SendAPK(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send a heads-up message before building.
-	if err := waClient.SendText(r.Context(), to, "🔨 New build preparing..."); err != nil {
-		log.Printf("send build notification: %v", err)
-		// Non-fatal — continue with the build anyway.
-	}
-
-	// Build a fresh APK.
-	mobileDir := filepath.Join("mobile")
-	buildCmd := exec.Command("flutter", "build", "apk", "--release")
-	buildCmd.Dir = mobileDir
-	var buildOut bytes.Buffer
-	buildCmd.Stdout = &buildOut
-	buildCmd.Stderr = &buildOut
-	if err := buildCmd.Run(); err != nil {
-		log.Printf("flutter build apk failed: %v\n%s", err, buildOut.String())
-		_ = waClient.SendText(r.Context(), to, "❌ Build failed: "+err.Error())
-		http.Error(w, `{"error":"build failed: `+err.Error()+`"}`, http.StatusInternalServerError)
-		return
-	}
-
-	apkPath := filepath.Join(mobileDir, "build", "app", "outputs", "flutter-apk", "app-release.apk")
-	info, err := os.Stat(apkPath)
-	if err != nil || info.IsDir() {
-		http.Error(w, `{"error":"apk not found after build"}`, http.StatusInternalServerError)
-		return
-	}
-
-	caption := req.Message
-	if caption == "" {
-		caption = "Fresh build — " + time.Now().Format("2006-01-02 15:04")
-	}
-
-	if err := waClient.SendDocument(r.Context(), to, apkPath, caption); err != nil {
-		log.Printf("send document error: %v", err)
-		_ = waClient.SendText(r.Context(), to, "❌ Send failed: "+err.Error())
-		http.Error(w, `{"error":"send failed: `+err.Error()+`"}`, http.StatusInternalServerError)
-		return
-	}
+	// Respond immediately so the caller doesn't block on the build.
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+
+	// Run the build and WhatsApp notifications in the background. Use a background
+	// context because r.Context() will be cancelled once the response completes.
+	go func(to, caption string) {
+		ctx := context.Background()
+
+		// Notify that the build has started.
+		if err := waClient.SendText(ctx, to, "🔨 Build started..."); err != nil {
+			log.Printf("send build started notification: %v", err)
+		}
+
+		mobileDir := filepath.Join("mobile")
+		buildCmd := exec.Command("flutter", "build", "apk", "--release")
+		buildCmd.Dir = mobileDir
+		var buildOut bytes.Buffer
+		buildCmd.Stdout = &buildOut
+		buildCmd.Stderr = &buildOut
+
+		// Start the build so we can send periodic heartbeats while it runs.
+		if err := buildCmd.Start(); err != nil {
+			log.Printf("failed to start build: %v", err)
+			_ = waClient.SendText(ctx, to, "❌ Build start failed: "+err.Error())
+			return
+		}
+
+		start := time.Now()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		done := make(chan error, 1)
+		go func() { done <- buildCmd.Wait() }()
+
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					log.Printf("flutter build apk failed: %v\n%s", err, buildOut.String())
+					_ = waClient.SendText(ctx, to, "❌ Build failed: "+err.Error())
+					return
+				}
+
+				// Build succeeded — verify APK exists and send it.
+				apkPath := filepath.Join(mobileDir, "build", "app", "outputs", "flutter-apk", "app-release.apk")
+				info, statErr := os.Stat(apkPath)
+				if statErr != nil || info.IsDir() {
+					log.Printf("apk not found after build: %v", statErr)
+					_ = waClient.SendText(ctx, to, "❌ APK not found after build")
+					return
+				}
+
+				if sendErr := waClient.SendDocument(ctx, to, apkPath, caption); sendErr != nil {
+					log.Printf("send document error: %v", sendErr)
+					_ = waClient.SendText(ctx, to, "❌ Send failed: "+sendErr.Error())
+					return
+				}
+				_ = waClient.SendText(ctx, to, "✅ Build and send complete (took "+time.Since(start).Truncate(time.Second).String()+")")
+				return
+			case <-ticker.C:
+				// Periodic heartbeat so the user knows the build is still running.
+				elapsed := time.Since(start).Truncate(time.Second)
+				_ = waClient.SendText(ctx, to, fmt.Sprintf("⏳ Building... elapsed %s", elapsed))
+			}
+		}
+	}(to, func() string {
+		if req.Message != "" {
+			return req.Message
+		}
+		return "Fresh build — " + time.Now().Format("2006-01-02 15:04")
+	}())
 }
 
 func (h *Handlers) WhatsAppStatus(w http.ResponseWriter, r *http.Request) {
@@ -486,10 +568,25 @@ func (h *Handlers) SessionWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Load complete history from DB and send it as the first message.
+	// This ensures clients always receive full history regardless of the hub's
+	// in-memory cache (capped at 500 and lost on server restart for live sessions).
+	// We write directly to conn here — WritePump has not started yet so there is
+	// no concurrent writer, making this safe.
+	var historyMsgs []WSMessage
+	if session.store != nil {
+		historyMsgs, _ = session.store.LoadMessages(session.ID)
+	}
+	envelope := WSHistoryMessage{Type: "history", Messages: historyMsgs}
+	if data, err := json.Marshal(envelope); err == nil {
+		_ = conn.WriteMessage(websocket.TextMessage, data)
+	}
+
 	client := &Client{
-		hub:  session.hub,
-		conn: conn,
-		send: make(chan []byte, 256),
+		hub:             session.hub,
+		conn:            conn,
+		send:            make(chan []byte, 256),
+		skipHistorySeed: true, // history already sent from DB above
 	}
 
 	session.hub.register <- client

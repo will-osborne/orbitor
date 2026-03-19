@@ -77,6 +77,12 @@ class ChatMessage {
         return ChatMessage(type: MessageType.status, text: data['status'] ?? '');
       case 'prompt_sent':
         return ChatMessage(type: MessageType.userPrompt, text: data['text'] ?? '');
+      case 'queue_update':
+        // Not rendered as a message; depth is extracted by the chat screen.
+        return ChatMessage(
+          type: MessageType.status,
+          text: '__queue_depth:${data['depth'] ?? 0}',
+        );
       default:
         return ChatMessage(type: MessageType.status, text: '[$type] ${data.toString()}');
     }

@@ -112,6 +112,17 @@ func main() {
 		sumCfg.ModelURL = AppConfig.LLM.ModelURL
 	}
 	summarizer := NewSummarizer(sumCfg)
+	// Pre-warm summarizer (best-effort) so the first notification is faster.
+	go func() {
+		if summarizer == nil {
+			return
+		}
+		if api, model, err := summarizer.ensureServer(); err != nil {
+			log.Printf("summarizer prewarm failed: %v", err)
+		} else {
+			log.Printf("summarizer prewarm ready: %s model=%s", api, model)
+		}
+	}()
 
 	// Load persisted sessions (hubs start immediately for WS history).
 	// Backend processes are NOT spawned yet — we need the old process to
@@ -138,7 +149,14 @@ func main() {
 		}
 	}
 
-	h := NewHandlers(sm)
+	// Initialize FCM sender for push notifications (requires Firebase service account).
+	var fcmSender *FCMSender
+	if AppConfig != nil && AppConfig.Firebase.ServiceAccountPath != "" {
+		fcmSender = NewFCMSender(AppConfig.Firebase.ServiceAccountPath, store, summarizer)
+	}
+
+	h := NewHandlers(sm, fcmSender)
+	sm.fcm = fcmSender
 	mux := http.NewServeMux()
 
 	// API routes
@@ -146,9 +164,12 @@ func main() {
 	mux.HandleFunc("POST /api/sessions", h.CreateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.DeleteSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", h.UpdateSession)
+	mux.HandleFunc("POST /api/sessions/{id}/kill", h.KillSession)
+	mux.HandleFunc("POST /api/sessions/{id}/revive", h.ReviveSession)
 	mux.HandleFunc("GET /ws/sessions/{id}", h.SessionWebSocket)
 	mux.HandleFunc("GET /ws/events", h.EventsWebSocket)
 	mux.HandleFunc("GET /api/notifications", h.PollNotifications)
+	mux.HandleFunc("POST /api/device-token", h.RegisterDeviceToken)
 	mux.HandleFunc("GET /api/browse", h.BrowseDir)
 	mux.HandleFunc("GET /api/mission-summary", h.MissionSummary)
 	mux.HandleFunc("POST /api/self-update", h.SelfUpdate)

@@ -74,6 +74,10 @@ var (
 		"no  –  ask for each permission",
 		"yes  –  skip all  (dangerous!)",
 	}
+	wizardModeOptions = []string{
+		"agent  –  standard execution mode",
+		"plan   –  plan only, no tool execution",
+	}
 )
 
 func stateStyle(state string) lipgloss.Style {
@@ -162,11 +166,12 @@ func (c *tuiAPIClient) missionSummary() (map[string]string, error) {
 	return out, nil
 }
 
-func (c *tuiAPIClient) createSession(workingDir, backend, model string, skipPermissions bool) (WSSessionInfo, error) {
+func (c *tuiAPIClient) createSession(workingDir, backend, model string, skipPermissions, planMode bool) (WSSessionInfo, error) {
 	payload := map[string]any{
 		"workingDir":      workingDir,
 		"backend":         backend,
 		"skipPermissions": skipPermissions,
+		"planMode":        planMode,
 	}
 	if strings.TrimSpace(model) != "" {
 		payload["model"] = strings.TrimSpace(model)
@@ -202,8 +207,8 @@ func (c *tuiAPIClient) deleteSession(id string) error {
 	return nil
 }
 
-func (c *tuiAPIClient) updateSessionSkipPermissions(id string, skip bool) (WSSessionInfo, error) {
-	body, _ := json.Marshal(map[string]any{"skipPermissions": skip})
+func (c *tuiAPIClient) updateSession(id string, skip, plan bool) (WSSessionInfo, error) {
+	body, _ := json.Marshal(map[string]any{"skipPermissions": skip, "planMode": plan})
 	req, _ := http.NewRequest(http.MethodPatch, c.baseURL+"/api/sessions/"+id, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
@@ -294,16 +299,26 @@ type tuiModel struct {
 	missionTitle   string
 	missionSummary string
 
+	// agent text coalescing — consecutive agent_text messages are merged into
+	// a single growing log entry so the feed reads as flowing prose, not fragments.
+	agentBlockIdx  int       // index into m.logs of the current block; -1 = none
+	agentBlockTime time.Time // timestamp captured at block start
+	agentBlockText string    // raw accumulated text (unstyled) for the block
+
 	// reconnect state
 	wsReconnecting   bool
 	wsReconnectSince time.Time
 
+	// help overlay
+	showHelp bool
+
 	// new-session wizard
 	wizardActive   bool
-	wizardFocus    int // 0=dir, 1=backend, 2=model, 3=skip
+	wizardFocus    int // 0=dir, 1=backend, 2=model, 3=skip, 4=mode
 	wizardBackend  int
 	wizardModel    int
 	wizardSkip     int
+	wizardMode     int
 	wizardDirInput textinput.Model
 }
 
@@ -326,6 +341,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		sessionStateStart: make(map[string]time.Time),
 		sessionLastState:  make(map[string]string),
 		historyPos:        0,
+		agentBlockIdx:     -1,
 	}
 	m.logSystem("Connected to " + api.baseURL)
 	m.logSystem("↑/↓ or j/k navigate sessions  ·  Tab/Shift+Tab cycle sessions  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
@@ -337,7 +353,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		if err != nil {
 			m.logSystem("failed to get cwd: " + err.Error())
 		} else {
-			created, err := api.createSession(wd, backend, model, skip)
+			created, err := api.createSession(wd, backend, model, skip, false)
 			if err != nil {
 				m.logSystem("Create session failed: " + err.Error())
 			} else {
@@ -370,7 +386,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		}
 	}
 
-	p := tea.NewProgram(m, tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = p.Run()
 	return err
 }
@@ -393,6 +409,7 @@ func (m *tuiModel) openWizard() {
 	m.wizardBackend = 0
 	m.wizardModel = 0
 	m.wizardSkip = 0
+	m.wizardMode = 0
 	m.wizardActive = true
 }
 
@@ -412,7 +429,7 @@ func (m *tuiModel) updateWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.wizardActive = false
 		return m, nil
 	case "tab":
-		m.wizardFocus = (m.wizardFocus + 1) % 4
+		m.wizardFocus = (m.wizardFocus + 1) % 5
 		if m.wizardFocus == 0 {
 			m.wizardDirInput.Focus()
 		} else {
@@ -420,7 +437,7 @@ func (m *tuiModel) updateWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "shift+tab":
-		m.wizardFocus = (m.wizardFocus + 3) % 4
+		m.wizardFocus = (m.wizardFocus + 4) % 5
 		if m.wizardFocus == 0 {
 			m.wizardDirInput.Focus()
 		} else {
@@ -442,6 +459,10 @@ func (m *tuiModel) updateWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.wizardSkip > 0 {
 				m.wizardSkip--
 			}
+		case 4:
+			if m.wizardMode > 0 {
+				m.wizardMode--
+			}
 		}
 		return m, nil
 	case "down":
@@ -459,6 +480,10 @@ func (m *tuiModel) updateWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case 3:
 			if m.wizardSkip < len(wizardSkipOptions)-1 {
 				m.wizardSkip++
+			}
+		case 4:
+			if m.wizardMode < len(wizardModeOptions)-1 {
+				m.wizardMode++
 			}
 		}
 		return m, nil
@@ -499,8 +524,65 @@ func (m *tuiModel) wizardCreate() (tea.Model, tea.Cmd) {
 		model = ""
 	}
 	skip := m.wizardSkip == 1
+	plan := m.wizardMode == 1
 	m.wizardActive = false
-	return m, createSessionCmd(m.api, wd, backend, model, skip)
+	return m, createSessionCmd(m.api, wd, backend, model, skip, plan)
+}
+
+func (m *tuiModel) renderHelp() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	head := lipgloss.NewStyle().Foreground(colCyan).Bold(true)
+	key := lipgloss.NewStyle().Foreground(colText).Bold(true)
+	desc := lipgloss.NewStyle().Foreground(colMuted)
+
+	row := func(k, d string) string {
+		return "  " + key.Render(fmt.Sprintf("%-18s", k)) + desc.Render(d)
+	}
+
+	lines := []string{
+		titleStyle.Render("  Keyboard Shortcuts"),
+		"",
+		head.Render("  Navigation"),
+		row("↑/↓  j/k", "navigate session list"),
+		row("Tab/Shift+Tab", "cycle sessions"),
+		row("Enter (empty input)", "connect to selected session"),
+		row("n", "new session wizard"),
+		row("Ctrl+D", "delete selected session"),
+		"",
+		head.Render("  Feed"),
+		row("PgUp/PgDn", "scroll feed"),
+		row("g / G", "scroll to top / bottom"),
+		row("Ctrl+L", "clear feed"),
+		row("Mouse wheel", "scroll feed"),
+		"",
+		head.Render("  Session"),
+		row("Enter (with text)", "send prompt to session"),
+		row("↑/↓ (with text)", "cycle prompt history"),
+		row("Ctrl+I", "interrupt running session"),
+		row("Ctrl+R / F5", "refresh sessions"),
+		"",
+		head.Render("  Commands"),
+		row("/help", "show commands in feed"),
+		row("/use <id>", "connect to session by ID"),
+		row("/new <dir> [backend]", "create session"),
+		row("/interrupt", "interrupt current session"),
+		row("/allow <req> <opt>", "approve permission request"),
+		row("/skip [true|false]", "toggle skip-permissions"),
+		row("/plan [true|false]", "toggle plan mode"),
+		row("/delete [id]", "delete a session"),
+		row("/quit", "exit"),
+		"",
+		desc.Render("  Press ? to close"),
+	}
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colCyan).
+		Padding(0, 1).
+		Width(56).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 }
 
 func (m *tuiModel) renderWizard() string {
@@ -555,6 +637,17 @@ func (m *tuiModel) renderWizard() string {
 	lines = append(lines, label(3, "  Skip Permissions"))
 	for i, opt := range wizardSkipOptions {
 		if i == m.wizardSkip {
+			lines = append(lines, "    "+selOpt.Render("◉ "+opt))
+		} else {
+			lines = append(lines, "    "+dimOpt.Render("○ "+opt))
+		}
+	}
+	lines = append(lines, "")
+
+	// Mode
+	lines = append(lines, label(4, "  Mode"))
+	for i, opt := range wizardModeOptions {
+		if i == m.wizardMode {
 			lines = append(lines, "    "+selOpt.Render("◉ "+opt))
 		} else {
 			lines = append(lines, "    "+dimOpt.Render("○ "+opt))
@@ -643,6 +736,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = max(0, len(m.sessions)-1)
 			}
 		}
+		m.updatePlaceholder()
 		return m, nil
 
 	case attachMsg:
@@ -654,6 +748,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.activeSessionID = msg.sessionID
 		m.wsReconnecting = false
 		m.logSystem("Connected to session " + msg.sessionID)
+		m.updatePlaceholder()
 		return m, nil
 
 	case createSessionMsg:
@@ -684,7 +779,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logSystem("Session update failed: " + msg.err.Error())
 			return m, nil
 		}
-		m.logSystem(fmt.Sprintf("Updated session %s (skipPermissions=%v)", msg.session.ID, msg.session.SkipPermissions))
+		m.logSystem(fmt.Sprintf("Updated session %s (skipPermissions=%v, planMode=%v)", msg.session.ID, msg.session.SkipPermissions, msg.session.PlanMode))
 		return m, refreshSessionsCmd(m.api)
 
 	case wsPayloadMsg:
@@ -709,6 +804,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// When wizard is open, route all key events to it.
 		if m.wizardActive {
 			return m.updateWizard(msg)
+		}
+
+		// Toggle help overlay with ? only when input is empty.
+		if msg.String() == "?" && m.input.Value() == "" {
+			m.showHelp = !m.showHelp
+			return m, nil
+		}
+		// Any key closes the help overlay.
+		if m.showHelp {
+			m.showHelp = false
+			return m, nil
 		}
 
 		// While in delete-confirm mode, only y/n/esc are meaningful.
@@ -837,6 +943,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "ctrl+i":
+			if m.activeSessionID != "" {
+				return m, sendWSCmd(m, map[string]any{"type": "interrupt"})
+			}
+			return m, nil
+
 		case "ctrl+r", "f5":
 			return m, refreshSessionsCmd(m.api)
 
@@ -890,6 +1002,10 @@ func (m *tuiModel) View() string {
 
 	if m.wizardActive {
 		return m.renderWizard()
+	}
+
+	if m.showHelp {
+		return m.renderHelp()
 	}
 
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
@@ -956,14 +1072,18 @@ func (m *tuiModel) View() string {
 	}
 
 	// ── status bar ────────────────────────────────────────────────────────────
-	statusBar := styleMuted.Render(fmt.Sprintf(
-		"  server: %s  ·  sessions: %d  ·  n=new  tab=cycle  ctrl+d=delete  ctrl+l=clear  ctrl+c=quit",
-		m.api.baseURL, len(m.sessions),
-	))
+	statusLeft := fmt.Sprintf("  server: %s  ·  sessions: %d  ·  n=new  tab=cycle  ctrl+d=delete  ?=help  ctrl+c=quit", m.api.baseURL, len(m.sessions))
+	statusRight := time.Now().Format("15:04:05  ")
+	statusPad := m.width - lipgloss.Width(statusLeft) - lipgloss.Width(statusRight)
+	if statusPad < 0 {
+		statusPad = 0
+	}
+	statusBar := styleMuted.Render(statusLeft + strings.Repeat(" ", statusPad) + statusRight)
 	statusBarH := 1
 
 	// ── body layout ───────────────────────────────────────────────────────────
-	bodyH := max(10, m.height-topBarH-bannerH-statusBarH)
+	// Subtract 6 for the 3 bordered right-column panels (each border adds 2 lines).
+	bodyH := max(10, m.height-topBarH-bannerH-statusBarH-6)
 	detailsH := 9
 	if bodyH < 20 {
 		detailsH = 7
@@ -983,31 +1103,51 @@ func (m *tuiModel) View() string {
 		}
 		missionBlock = mb + "\n"
 	}
+	// Calculate how many lines the sessions list can use inside the left panel:
+	// bodyH (inner) minus 1 for the " Sessions " header minus the mission block.
+	missionBlockH := 0
+	if missionBlock != "" {
+		missionBlockH = lipgloss.Height(missionBlock)
+	}
+	sessionsAvailH := max(3, bodyH-1-missionBlockH)
 	left := panelStyle.Width(leftW - 2).Height(bodyH).Render(
-		titleStyle.Render(" Sessions ") + "\n" + missionBlock + m.renderMissionControl(selectedStyle, activeStyle),
+		clampLines(titleStyle.Render(" Sessions ")+"\n"+missionBlock+m.renderMissionControl(selectedStyle, activeStyle, sessionsAvailH), bodyH),
 	)
 
+	// Content width inside the right panel: frame (rightW-2) minus padding (1 each side).
+	detailContentW := max(20, rightW-4)
 	detailBox := panelStyle.Width(rightW - 2).Height(detailsH).Render(
-		titleStyle.Render(" Session Details ") + "\n" + m.renderDetails(),
+		clampLines(titleStyle.Render(" Session Details ")+"\n"+m.renderDetails(detailContentW), detailsH),
 	)
 
-	// Feed header with connected session, scroll indicator, and reconnect state.
+	// Sync viewport height to the actual feedH (which accounts for current banner
+	// heights). resize() doesn't know about banners so we must do it here.
+	m.viewport.Height = max(4, feedH-3)
+
+	// Feed header with connected session, live/scroll indicator, and reconnect state.
 	feedHeader := titleStyle.Render(" Session Feed ")
 	if m.wsReconnecting {
 		elapsed := time.Since(m.wsReconnectSince).Round(time.Second)
 		feedHeader += styleYellow.Render("  ⟳ reconnecting… " + elapsed.String())
 	} else if m.activeSessionID != "" {
-		feedHeader += styleMuted.Render("  connected: " + m.activeSessionID)
+		feedHeader += styleMuted.Render("  " + m.activeSessionID)
 	} else {
 		feedHeader += styleMuted.Render("  not connected")
 	}
-	if !m.viewport.AtBottom() {
+	if m.viewport.AtBottom() {
+		feedHeader += styleGreen.Render("  ● LIVE")
+	} else {
 		feedHeader += styleMuted.Render("  ↑ scrolled · PgUp/PgDn · G=bottom")
 	}
 	feedBox := panelStyle.Width(rightW - 2).Height(feedH).Render(feedHeader + "\n" + m.viewport.View())
 
 	// Input box hint line reflects current context.
-	hint := "Enter=send  ·  Enter(empty)=connect  ·  ↑/↓=history/navigate  ·  Ctrl+R=refresh"
+	var hint string
+	if m.activeSessionID != "" {
+		hint = "Enter=send  ·  Ctrl+I=interrupt  ·  ↑/↓=history  ·  ?=help"
+	} else {
+		hint = "Enter=connect  ·  n=new session  ·  ↑/↓=navigate  ·  ?=help"
+	}
 	inputBox := panelStyle.Width(rightW - 2).Height(inputH).Render(
 		styleCyan.Render(" ❯ ") + m.input.View() + "\n" +
 			styleMuted.Render("  "+hint),
@@ -1035,9 +1175,9 @@ func (m *tuiModel) pendingPermissionSessions() []WSSessionInfo {
 
 // ── renderDetails ─────────────────────────────────────────────────────────────
 
-func (m *tuiModel) renderDetails() string {
+func (m *tuiModel) renderDetails(contentWidth int) string {
 	if len(m.sessions) == 0 {
-		return styleMuted.Render("No sessions")
+		return styleMuted.Render("No session selected")
 	}
 	s := m.sessions[m.selected]
 	state := sessionStateLabel(s)
@@ -1054,7 +1194,6 @@ func (m *tuiModel) renderDetails() string {
 	}
 
 	backendStr := styleCyan.Render(s.Backend)
-	modelStr := styleText.Render(defaultString(s.Model, "(default)"))
 
 	runStr := styleText.Render("false")
 	if s.IsRunning {
@@ -1068,6 +1207,10 @@ func (m *tuiModel) renderDetails() string {
 	if s.SkipPermissions {
 		skipStr = styleRed.Render("true")
 	}
+	planStr := styleText.Render("false")
+	if s.PlanMode {
+		planStr = styleCyan.Render("true")
+	}
 	tool := defaultString(s.CurrentTool, "-")
 	toolStr := styleText.Render(tool)
 	if tool != "-" {
@@ -1075,24 +1218,31 @@ func (m *tuiModel) renderDetails() string {
 	}
 
 	lbl := func(s string) string { return styleLabel.Render(s) }
+	// Each detail line has a 9-char label prefix; the value gets the rest.
+	valW := max(10, contentWidth-9)
 
 	lines := []string{
-		lbl("id:      ") + styleText.Render(s.ID),
-		lbl("state:   ") + stateStr + lbl("  status: ") + styleText.Render(s.Status),
-		lbl("backend: ") + backendStr + lbl("  model: ") + modelStr,
-		lbl("skip:    ") + skipStr + lbl("  pending: ") + permStr + lbl("  running: ") + runStr,
+		lbl("id:      ") + styleText.Render(trimForLine(s.ID, valW)),
+		lbl("state:   ") + stateStr + lbl("  status: ") + styleText.Render(trimForLine(s.Status, valW/2)),
+		lbl("backend: ") + backendStr + lbl("  model: ") + styleText.Render(trimForLine(defaultString(s.Model, "(default)"), valW/2)),
+		lbl("skip:    ") + skipStr + lbl("  plan: ") + planStr + lbl("  pending: ") + permStr + lbl("  running: ") + runStr + func() string {
+			if s.QueueDepth > 0 {
+				return lbl("  queued: ") + styleYellow.Render(strconv.Itoa(s.QueueDepth))
+			}
+			return ""
+		}(),
 		lbl("tool:    ") + toolStr,
-		lbl("dir:     ") + styleText.Render(s.WorkingDir),
-		lbl("msg:     ") + styleText.Render(trimForLine(defaultString(s.LastMessage, "-"), 120)),
+		lbl("dir:     ") + styleText.Render(trimForLine(s.WorkingDir, valW)),
+		lbl("msg:     ") + styleText.Render(trimForLine(defaultString(s.LastMessage, "-"), valW)),
 	}
 	if s.CurrentPrompt != "" {
-		lines = append(lines, lbl("task:    ")+styleText.Render(trimForLine(s.CurrentPrompt, 100)))
+		lines = append(lines, lbl("task:    ")+styleText.Render(trimForLine(s.CurrentPrompt, valW)))
 	}
 	if s.Title != "" {
-		lines = append(lines, lbl("title:   ")+styleText.Render(trimForLine(s.Title, 80)))
+		lines = append(lines, lbl("title:   ")+styleText.Render(trimForLine(s.Title, valW)))
 	}
 	if s.Summary != "" {
-		lines = append(lines, lbl("summary: ")+styleText.Render(trimForLine(s.Summary, 80)))
+		lines = append(lines, lbl("summary: ")+styleText.Render(trimForLine(s.Summary, valW)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1113,6 +1263,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /interrupt")
 		m.logSystem("  /allow <requestId> <optionId>")
 		m.logSystem("  /skip [true|false] [id]")
+		m.logSystem("  /plan [true|false] [id]")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
 		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  ctrl+d=delete  ctrl+l=clear  PgUp/PgDn=scroll  g/G=top/bottom")
@@ -1151,6 +1302,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		backend := "copilot"
 		model := ""
 		skip := false
+		plan := false
 		if len(fields) >= 3 {
 			backend = fields[2]
 		}
@@ -1162,7 +1314,12 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 				skip = v
 			}
 		}
-		return createSessionCmd(m.api, wd, backend, model, skip)
+		if len(fields) >= 6 {
+			if v, err := strconv.ParseBool(fields[5]); err == nil {
+				plan = v
+			}
+		}
+		return createSessionCmd(m.api, wd, backend, model, skip, plan)
 	case "/interrupt":
 		return sendWSCmd(m, map[string]any{"type": "interrupt"})
 	case "/allow":
@@ -1195,7 +1352,28 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 				return nil
 			}
 		}
-		return updateSessionCmd(m.api, target.ID, next)
+		return updateSessionCmd(m.api, target.ID, next, target.PlanMode)
+	case "/plan":
+		if len(m.sessions) == 0 {
+			m.logSystem("No sessions available")
+			return nil
+		}
+		target := m.sessions[m.selected]
+		nextPlan := !target.PlanMode
+		if len(fields) >= 2 {
+			if v, err := strconv.ParseBool(fields[1]); err == nil {
+				nextPlan = v
+			}
+		}
+		if len(fields) >= 3 {
+			if s, ok := m.findSessionByID(fields[2]); ok {
+				target = s
+			} else {
+				m.logSystem("Session not found: " + fields[2])
+				return nil
+			}
+		}
+		return updateSessionCmd(m.api, target.ID, target.SkipPermissions, nextPlan)
 	case "/delete":
 		if len(m.sessions) == 0 {
 			m.logSystem("No sessions available")
@@ -1229,9 +1407,14 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 		if err := json.Unmarshal(payload, &h); err != nil {
 			return
 		}
+		// Clear the feed and rebuild from the authoritative DB history.
+		// This handles both initial connect and reconnect cleanly.
+		m.logs = nil
+		m.agentBlockIdx = -1
 		for _, it := range h.Messages {
 			m.renderMessage(it)
 		}
+		m.rebuildViewport()
 		return
 	}
 	var msg WSMessage
@@ -1246,6 +1429,40 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 func (m *tuiModel) renderMessage(msg WSMessage) {
 	ts := styleMuted.Render(time.Now().Format("15:04") + " ")
 
+	// Agent text is coalesced into a single growing log entry so the feed reads
+	// as flowing prose rather than one line per network chunk.
+	if msg.Type == "agent_text" {
+		var d WSAgentText
+		if json.Unmarshal(msg.Data, &d) != nil || d.Text == "" {
+			return
+		}
+		if m.agentBlockIdx >= 0 && m.agentBlockIdx < len(m.logs) {
+			m.agentBlockText += d.Text
+			blockTS := styleMuted.Render(m.agentBlockTime.Format("15:04") + " ")
+			m.logs[m.agentBlockIdx] = blockTS + styleText.Render(m.agentBlockText)
+		} else {
+			m.agentBlockIdx = len(m.logs)
+			m.agentBlockTime = time.Now()
+			m.agentBlockText = d.Text
+			m.logs = append(m.logs, ts+styleText.Render(d.Text))
+			if len(m.logs) > 4000 {
+				m.logs = m.logs[len(m.logs)-4000:]
+				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
+			}
+		}
+		m.rebuildViewport()
+		return
+	}
+
+	// Internal protocol messages with no visible representation — don't break
+	// an active agent text block (e.g. acp_update can interleave with text chunks).
+	if msg.Type == "acp_update" || msg.Type == "session_ended" {
+		return
+	}
+
+	// Every other message type ends the current agent text block.
+	m.agentBlockIdx = -1
+
 	switch msg.Type {
 	case "prompt_sent":
 		var d struct {
@@ -1254,12 +1471,6 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		if json.Unmarshal(msg.Data, &d) == nil {
 			m.log("")
 			m.log(ts + styleCyan.Render("❯ ") + styleText.Render(d.Text))
-		}
-
-	case "agent_text":
-		var d WSAgentText
-		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log(ts + styleText.Render(d.Text))
 		}
 
 	case "tool_call":
@@ -1356,16 +1567,8 @@ func (m *tuiModel) resize() {
 	leftW := max(46, m.width*42/100)
 	rightW := max(50, m.width-leftW)
 	vw := max(24, rightW-8)
-	bodyH := max(10, m.height-8)
-	detailsH := 9
-	if bodyH < 20 {
-		detailsH = 7
-	}
-	inputH := 4
-	feedH := max(6, bodyH-detailsH-inputH)
-	vh := max(4, feedH-3)
 	m.viewport.Width = vw
-	m.viewport.Height = vh
+	// Viewport height is set in View() where the actual banner height is known.
 	m.rebuildViewport()
 }
 
@@ -1429,9 +1632,9 @@ func refreshSessionsCmd(api *tuiAPIClient) tea.Cmd {
 	}
 }
 
-func createSessionCmd(api *tuiAPIClient, wd, backend, model string, skip bool) tea.Cmd {
+func createSessionCmd(api *tuiAPIClient, wd, backend, model string, skip, plan bool) tea.Cmd {
 	return func() tea.Msg {
-		created, err := api.createSession(wd, backend, model, skip)
+		created, err := api.createSession(wd, backend, model, skip, plan)
 		return createSessionMsg{session: created, err: err}
 	}
 }
@@ -1443,9 +1646,9 @@ func deleteSessionCmd(api *tuiAPIClient, id string) tea.Cmd {
 	}
 }
 
-func updateSessionCmd(api *tuiAPIClient, id string, skip bool) tea.Cmd {
+func updateSessionCmd(api *tuiAPIClient, id string, skip, plan bool) tea.Cmd {
 	return func() tea.Msg {
-		updated, err := api.updateSessionSkipPermissions(id, skip)
+		updated, err := api.updateSession(id, skip, plan)
 		return updateSessionMsg{session: updated, err: err}
 	}
 }
@@ -1510,14 +1713,15 @@ func spinnerTickCmd() tea.Cmd {
 
 // ── renderMissionControl ──────────────────────────────────────────────────────
 
-func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style) string {
+func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style, availH int) string {
 	if len(m.sessions) == 0 {
-		return styleMuted.Render("No sessions")
+		return styleMuted.Render("  No sessions yet\n\n") +
+			styleText.Render("  Press ") + styleCyan.Render("n") + styleText.Render(" to start a new session\n") +
+			styleText.Render("  Press ") + styleCyan.Render("?") + styleText.Render(" for help")
 	}
 
 	linesPerSession := 3 // 2 content lines + 1 separator
-	availableRows := max(3, max(10, m.height-8)-3)
-	maxSessions := max(1, availableRows/linesPerSession)
+	maxSessions := max(1, availH/linesPerSession)
 	start := 0
 	if m.selected >= maxSessions {
 		start = m.selected - maxSessions + 1
@@ -1559,6 +1763,9 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 				if elapsed := m.sessionStateStart[s.ID]; !elapsed.IsZero() {
 					stateTag += styleMuted.Render(" " + formatElapsed(time.Since(elapsed)))
 				}
+				if s.QueueDepth > 0 {
+					stateTag += styleYellow.Render(fmt.Sprintf(" +%d queued", s.QueueDepth))
+				}
 			case "starting":
 				stateTag = styleCyan.Render(spinnerFrames[m.spinnerFrame] + " starting")
 			case "waiting-input":
@@ -1584,6 +1791,20 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		out = append(out, styleMuted.Render("  ↓ more"))
 	}
 	return strings.Join(out, "\n")
+}
+
+// clampLines truncates s to at most n lines (splitting on \n).
+// Each line produced by lipgloss Render() is self-contained (ANSI reset at end),
+// so splitting and rejoining is safe.
+func clampLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 // ── small helpers ─────────────────────────────────────────────────────────────
@@ -1656,4 +1877,28 @@ func (m *tuiModel) selectedSessionID() string {
 		return "none"
 	}
 	return m.sessions[m.selected].ID
+}
+
+func (m *tuiModel) updatePlaceholder() {
+	if len(m.sessions) == 0 {
+		m.input.Placeholder = "Press n to create a new session..."
+		return
+	}
+	if m.activeSessionID == "" {
+		m.input.Placeholder = "Press Enter to connect, or type a command..."
+		return
+	}
+	if s, ok := m.findSessionByID(m.activeSessionID); ok {
+		state := sessionStateLabel(s)
+		switch state {
+		case "working":
+			m.input.Placeholder = "Session is busy — Ctrl+I to interrupt..."
+		case "waiting-input":
+			m.input.Placeholder = "Session needs permission — /allow <requestId> <optionId>"
+		default:
+			m.input.Placeholder = "Type a prompt and press Enter..."
+		}
+		return
+	}
+	m.input.Placeholder = "Type a prompt and press Enter..."
 }

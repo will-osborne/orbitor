@@ -41,6 +41,21 @@ func (q *PromptQueue) Close() {
 	q.cond.Signal()
 }
 
+// QueueDepth returns the number of prompts waiting to be executed (not counting
+// the one currently running, if any).
+func (q *PromptQueue) QueueDepth() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
+// Clear discards all queued prompts that have not yet started executing.
+func (q *PromptQueue) Clear() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.items = q.items[:0]
+}
+
 func (q *PromptQueue) run() {
 	for {
 		q.mu.Lock()

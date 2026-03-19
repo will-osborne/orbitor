@@ -21,9 +21,10 @@ type Hub struct {
 }
 
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
+	hub             *Hub
+	conn            *websocket.Conn
+	send            chan []byte
+	skipHistorySeed bool
 }
 
 func NewHub() *Hub {
@@ -55,7 +56,9 @@ func (h *Hub) Run() {
 
 		case client := <-h.register:
 			h.clients[client] = true
-			h.sendHistory(client)
+			if !client.skipHistorySeed {
+				h.sendHistory(client)
+			}
 
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {

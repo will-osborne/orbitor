@@ -23,6 +23,12 @@ type Config struct {
 		CacheDir string `yaml:"cache_dir"` // default: ~/.cache/copilot-bridge
 		ModelURL string `yaml:"model_url"` // override model download URL
 	} `yaml:"llm"`
+	// Firebase: set service_account_path to enable FCM push notifications.
+	// Download a service account JSON from Firebase Console →
+	// Project Settings → Service Accounts → Generate New Private Key.
+	Firebase struct {
+		ServiceAccountPath string `yaml:"service_account_path"` // path to service account JSON
+	} `yaml:"firebase"`
 }
 
 // AppConfig is the global configuration instance (may be nil)

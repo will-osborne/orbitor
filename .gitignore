@@ -1,5 +1,6 @@
 # Compiled binaries
 copilot-bridge
+orbitor
 /dist/
 
 # Go build cache
@@ -17,8 +18,11 @@ copilot-bridge
 # Local config with personal values — use config/config.yaml.example as template
 config/config.yaml
 
-# Claude local settings (machine-specific permissions)
-.claude/settings.local.json
+# Claude Code local directory (machine-specific settings, worktrees, memory)
+.claude/
+
+# Firebase service account key (private credential — never commit)
+config/firebase-service-account.json
 
 # Flutter build output
 mobile/build/
