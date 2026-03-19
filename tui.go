@@ -477,6 +477,10 @@ type tuiModel struct {
 	renderMarkdown bool
 	compactBlocks  bool
 	themeIdx       int
+
+	// non-scrolling thinking pane
+	thinkingLines []string
+	isThinking    bool
 }
 
 func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
@@ -501,6 +505,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		agentBlockIdx:     -1,
 		renderMarkdown:    true,
 		compactBlocks:     true,
+		thinkingLines:     []string{"idle"},
 	}
 	m.logSystem("Connected to " + api.baseURL)
 	m.logSystem("↑/↓ or j/k navigate sessions  ·  Tab/Shift+Tab cycle sessions  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
@@ -984,6 +989,15 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizardActive {
 			return m.updateWizard(msg)
 		}
+		// Robust fallback for terminals that encode word-nav as Alt+arrow.
+		if msg.Type == tea.KeyLeft && msg.Alt {
+			m.moveCursorWordLeft()
+			return m, nil
+		}
+		if msg.Type == tea.KeyRight && msg.Alt {
+			m.moveCursorWordRight()
+			return m, nil
+		}
 
 		// Toggle help overlay with ? only when input is empty.
 		if msg.String() == "?" && m.input.Value() == "" {
@@ -1139,6 +1153,38 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+right", "alt+f":
 			m.moveCursorWordRight()
+			return m, nil
+
+		case "alt+left":
+			m.moveCursorWordLeft()
+			return m, nil
+
+		case "alt+right":
+			m.moveCursorWordRight()
+			return m, nil
+
+		case "ctrl+a":
+			m.input.CursorStart()
+			return m, nil
+
+		case "ctrl+e":
+			m.input.CursorEnd()
+			return m, nil
+
+		case "ctrl+w":
+			m.deleteWordBackward()
+			return m, nil
+
+		case "alt+d":
+			m.deleteWordForward()
+			return m, nil
+
+		case "ctrl+u":
+			m.deleteToLineStart()
+			return m, nil
+
+		case "ctrl+k":
+			m.deleteToLineEnd()
 			return m, nil
 
 		case "ctrl+r", "f5":
@@ -1322,8 +1368,12 @@ func (m *tuiModel) View() string {
 	if bodyH < 20 {
 		detailsH = 6
 	}
+	thinkingH := 4
+	if bodyH < 18 {
+		thinkingH = 3
+	}
 	inputH := 3
-	feedH := max(6, bodyH-detailsH-inputH)
+	feedH := max(6, bodyH-detailsH-thinkingH-inputH)
 
 	// ── left panel (sessions) ─────────────────────────────────────────────────
 	sessionsAvailH := max(3, bodyH-1)
@@ -1367,20 +1417,33 @@ func (m *tuiModel) View() string {
 	}
 	feedBox := panelStyle.Width(rightW - 2).Height(feedH).Render(feedHeader + "\n" + m.viewport.View())
 
+	thinkingLabel := " idle"
+	if m.isThinking {
+		thinkingLabel = " thinking " + spinnerFrames[m.spinnerFrame]
+	}
+	thinkingHeader := styleMuted.Render(" thinking") + styleCyan.Render(thinkingLabel)
+	thinkingBody := strings.Join(clampSliceTail(m.thinkingLines, max(1, thinkingH-1)), "\n")
+	thinkingBox := panelStyle.Width(rightW - 2).Height(thinkingH).Render(
+		thinkingHeader + "\n" + clampLines(thinkingBody, max(1, thinkingH-1)),
+	)
+
 	var promptPrefix string
 	var hint string
 	if m.activeSessionID != "" {
 		promptPrefix = styleAccent.Render(" ❯ ")
-		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  Ctrl+←/→ word-move  ·  ?=help"
+		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  Alt+←/→ word-move  ·  ?=help"
 	} else {
 		promptPrefix = styleMuted.Render(" ❯ ")
-		hint = "Enter=connect  ·  n=new  ·  ↑/↓=navigate  ·  Ctrl+←/→ word-move  ·  ?=help"
+		hint = "Enter=connect  ·  n=new  ·  ↑/↓=navigate  ·  Alt+←/→ word-move  ·  ?=help"
+	}
+	if m.isThinking {
+		hint += "  ·  agent running"
 	}
 	inputBox := panelStyle.Width(rightW - 2).Height(inputH).Render(
 		promptPrefix + m.input.View() + "\n" + styleMuted.Render("  "+hint),
 	)
 
-	right := lipgloss.JoinVertical(lipgloss.Left, detailBox, feedBox, inputBox)
+	right := lipgloss.JoinVertical(lipgloss.Left, detailBox, feedBox, thinkingBox, inputBox)
 	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
 	parts := []string{topBar}
@@ -1793,6 +1856,8 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			hdr := m.turnHeader("you", styleCyan, tsStr)
 			body := styleCyan.Render(wrapWords(d.Text, w, ""))
 			m.log(hdr + "\n" + body)
+			m.isThinking = true
+			m.pushThinking("prompt sent")
 		}
 
 	case "tool_call":
@@ -1825,12 +1890,15 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 				m.log(titleLine)
 				m.log(m.renderRichTextBlock(d.Content, w, true))
 			}
+			m.isThinking = true
+			m.pushThinking("tool: " + trimForLine(defaultString(d.Title, d.Kind), 70))
 		}
 
 	case "tool_result":
 		var d WSToolResult
 		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
 			m.log(m.renderRichTextBlock(d.Content, w, true))
+			m.pushThinking("tool result")
 		}
 
 	case "permission_request":
@@ -1848,6 +1916,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			if !m.replayingHistory {
 				go sendNotification("Permission needed", m.sessionDisplayName()+" is waiting for approval")
 			}
+			m.isThinking = true
 		}
 
 	case "permission_resolved":
@@ -1857,6 +1926,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
 			m.log("  " + styleGreen.Render("approved") + styleMuted.Render("  "+d.OptionID))
+			m.isThinking = false
 		}
 
 	case "run_complete":
@@ -1881,6 +1951,8 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			if !m.replayingHistory {
 				go sendNotification("Agent finished", notifBody)
 			}
+			m.isThinking = false
+			m.pushThinking("run complete")
 		}
 
 	case "status":
@@ -1889,13 +1961,24 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 		if json.Unmarshal(msg.Data, &d) == nil && d.Status != "" {
 			m.log(styleMuted.Render("   status: " + d.Status))
+			m.pushThinking("status: " + d.Status)
+			switch strings.ToLower(d.Status) {
+			case "working", "running", "thinking", "starting", "respawning":
+				m.isThinking = true
+			case "ready", "idle", "killed":
+				m.isThinking = false
+			}
 		}
 
 	case "error":
 		var d WSError
 		if json.Unmarshal(msg.Data, &d) == nil {
 			m.log("  " + styleRed.Render("error") + styleMuted.Render("  "+d.Message))
+			m.isThinking = false
+			m.pushThinking("error: " + trimForLine(d.Message, 70))
 		}
+	case "interrupted":
+		m.isThinking = false
 	}
 }
 
@@ -2058,18 +2141,20 @@ func (m *tuiModel) renderDiffBlock(diff string, width int) string {
 	for i := 0; i < maxLines; i++ {
 		l := lines[i]
 		switch {
-		case strings.HasPrefix(l, "diff --git"), strings.HasPrefix(l, "index "):
-			out = append(out, styleMuted.Render(trimForLine(l, max(12, width))))
+		case strings.HasPrefix(l, "diff --git"):
+			out = append(out, styleAccent.Render("▌ "+trimForLine(l, max(12, width-2))))
+		case strings.HasPrefix(l, "index "):
+			out = append(out, styleMuted.Render("  "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "@@"):
-			out = append(out, styleCyan.Render(trimForLine(l, max(12, width))))
+			out = append(out, styleCyan.Render("┃ "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "+++"), strings.HasPrefix(l, "---"):
-			out = append(out, styleAccent.Render(trimForLine(l, max(12, width))))
+			out = append(out, styleViolet.Render("│ "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "+"):
-			out = append(out, styleGreen.Render(trimForLine(l, max(12, width))))
+			out = append(out, styleGreen.Render("+ "+trimForLine(strings.TrimPrefix(l, "+"), max(12, width-2))))
 		case strings.HasPrefix(l, "-"):
-			out = append(out, styleRed.Render(trimForLine(l, max(12, width))))
+			out = append(out, styleRed.Render("- "+trimForLine(strings.TrimPrefix(l, "-"), max(12, width-2))))
 		default:
-			out = append(out, styleText.Render(trimForLine(l, max(12, width))))
+			out = append(out, styleText.Render("  "+trimForLine(l, max(12, width-2))))
 		}
 	}
 	if maxLines < len(lines) {
@@ -2140,11 +2225,12 @@ func (m *tuiModel) rebuildViewport() {
 
 func (m *tuiModel) renderViewportContent() string {
 	w := m.chatWidth()
-	bg := lipgloss.NewStyle().Background(colPanel)
+	bg := lipgloss.NewStyle().Background(colPanel).Foreground(colText)
 	var out []string
 	for _, entry := range m.logs {
 		lines := strings.Split(entry, "\n")
 		for _, line := range lines {
+			line = stripANSI(line)
 			out = append(out, bg.Render(padToWidth(line, w)))
 		}
 	}
@@ -2162,12 +2248,39 @@ func padToWidth(s string, w int) string {
 	return s + strings.Repeat(" ", w-lw)
 }
 
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+func clampSliceTail(in []string, n int) []string {
+	if n <= 0 || len(in) == 0 {
+		return []string{}
+	}
+	if len(in) <= n {
+		return in
+	}
+	return in[len(in)-n:]
+}
+
 func (m *tuiModel) log(s string) {
 	m.logs = append(m.logs, s)
 	if len(m.logs) > 4000 {
 		m.logs = m.logs[len(m.logs)-4000:]
 	}
 	m.rebuildViewport()
+}
+
+func (m *tuiModel) pushThinking(s string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return
+	}
+	m.thinkingLines = append(m.thinkingLines, styleMuted.Render("• ")+styleText.Render(trimForLine(s, 90)))
+	if len(m.thinkingLines) > 80 {
+		m.thinkingLines = m.thinkingLines[len(m.thinkingLines)-80:]
+	}
 }
 
 // logSystem renders a muted system/info line (no timestamp prefix).
@@ -2454,6 +2567,62 @@ func (m *tuiModel) moveCursorWordRight() {
 	for pos < n && !isWordBoundaryRune(runes[pos]) {
 		pos++
 	}
+	m.input.SetCursor(pos)
+}
+
+func (m *tuiModel) deleteWordBackward() {
+	v := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos <= 0 || len(v) == 0 {
+		return
+	}
+	start := pos
+	for start > 0 && isWordBoundaryRune(v[start-1]) {
+		start--
+	}
+	for start > 0 && !isWordBoundaryRune(v[start-1]) {
+		start--
+	}
+	newVal := string(append(v[:start], v[pos:]...))
+	m.input.SetValue(newVal)
+	m.input.SetCursor(start)
+}
+
+func (m *tuiModel) deleteWordForward() {
+	v := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos >= len(v) {
+		return
+	}
+	end := pos
+	for end < len(v) && isWordBoundaryRune(v[end]) {
+		end++
+	}
+	for end < len(v) && !isWordBoundaryRune(v[end]) {
+		end++
+	}
+	newVal := string(append(v[:pos], v[end:]...))
+	m.input.SetValue(newVal)
+	m.input.SetCursor(pos)
+}
+
+func (m *tuiModel) deleteToLineStart() {
+	v := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos <= 0 {
+		return
+	}
+	m.input.SetValue(string(v[pos:]))
+	m.input.SetCursor(0)
+}
+
+func (m *tuiModel) deleteToLineEnd() {
+	v := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos >= len(v) {
+		return
+	}
+	m.input.SetValue(string(v[:pos]))
 	m.input.SetCursor(pos)
 }
 
