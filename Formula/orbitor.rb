@@ -1,33 +1,26 @@
-# Formula for the orbitor Homebrew tap.
-# To publish: create a repo named homebrew-orbitor and put this file in Formula/orbitor.rb
-# Then users can: brew tap OWNER/orbitor && brew install orbitor
-#
-# After each release, update the version and sha256 values below.
-# Get SHA256 values from the release's checksums.txt file.
-
 class Orbitor < Formula
   desc "AI coding assistant bridge — TUI + mobile interface for Claude Code and GitHub Copilot"
-  homepage "https://github.com/OWNER/orbitor"
+  homepage "https://github.com/will-osborne/orbitor"
   version "0.1.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/OWNER/orbitor/releases/download/v#{version}/orbitor-darwin-arm64"
+      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-darwin-arm64"
       sha256 "PLACEHOLDER_DARWIN_ARM64_SHA256"
     end
     on_intel do
-      url "https://github.com/OWNER/orbitor/releases/download/v#{version}/orbitor-darwin-amd64"
+      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-darwin-amd64"
       sha256 "PLACEHOLDER_DARWIN_AMD64_SHA256"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/OWNER/orbitor/releases/download/v#{version}/orbitor-linux-arm64"
+      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-linux-arm64"
       sha256 "PLACEHOLDER_LINUX_ARM64_SHA256"
     end
     on_intel do
-      url "https://github.com/OWNER/orbitor/releases/download/v#{version}/orbitor-linux-amd64"
+      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-linux-amd64"
       sha256 "PLACEHOLDER_LINUX_AMD64_SHA256"
     end
   end

@@ -1,0 +1,41 @@
+name: Sync Homebrew Formula
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Formula/orbitor.rb
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout orbitor
+        uses: actions/checkout@v4
+
+      - name: Push formula to homebrew-orbitor tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/will-osborne/homebrew-orbitor.git /tmp/homebrew-orbitor
+
+          mkdir -p /tmp/homebrew-orbitor/Formula
+          cp Formula/orbitor.rb /tmp/homebrew-orbitor/Formula/orbitor.rb
+
+          cd /tmp/homebrew-orbitor
+          git add Formula/orbitor.rb
+
+          if git diff --cached --quiet; then
+            echo "Formula unchanged, nothing to sync."
+            exit 0
+          fi
+
+          SOURCE_SHA="${{ github.sha }}"
+          git commit -m "Sync formula from orbitor@${SOURCE_SHA:0:7}"
+          git push
