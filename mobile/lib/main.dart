@@ -7,6 +7,7 @@ import 'models/session.dart';
 import 'screens/chat_screen.dart';
 import 'services/api_service.dart';
 import 'services/notification_coordinator.dart';
+import 'screens/onboarding_screen.dart';
 import 'screens/sessions_screen.dart';
 import 'theme.dart';
 
@@ -21,7 +22,7 @@ void main() async {
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
-  final api = ApiService();
+  final api = await ApiService.create();
   final notificationCoordinator = NotificationCoordinator(api);
   await notificationCoordinator.init();
   runApp(
@@ -81,10 +82,13 @@ class _CopilotBridgeAppState extends State<CopilotBridgeApp>
   Widget build(BuildContext context) {
     return MaterialApp(
       navigatorKey: _navigatorKey,
-      title: 'Copilot Bridge',
+      title: 'Orbitor',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
-      home: const SessionsScreen(),
+      home: Consumer<ApiService>(
+        builder: (context, api, _) =>
+            api.isConfigured ? const SessionsScreen() : const OnboardingScreen(),
+      ),
     );
   }
 

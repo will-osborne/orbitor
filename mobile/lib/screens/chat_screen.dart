@@ -304,17 +304,14 @@ class _ChatScreenState extends State<ChatScreen>
       final cloned = await api.cloneSessionAndPrompt(widget.session.id, text);
       if (!mounted) return;
       _inputController.clear();
-      Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => ChatScreen(session: cloned)),
-      );
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => ChatScreen(session: cloned)));
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _messages.add(
-          ChatMessage(
-            type: MessageType.error,
-            text: 'Clone-send failed: $e',
-          ),
+          ChatMessage(type: MessageType.error, text: 'Clone-send failed: $e'),
         );
       });
     }
@@ -359,7 +356,9 @@ class _ChatScreenState extends State<ChatScreen>
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _messages.add(ChatMessage(type: MessageType.error, text: 'Kill failed: $e'));
+        _messages.add(
+          ChatMessage(type: MessageType.error, text: 'Kill failed: $e'),
+        );
       });
     }
   }
@@ -371,7 +370,9 @@ class _ChatScreenState extends State<ChatScreen>
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _messages.add(ChatMessage(type: MessageType.error, text: 'Revive failed: $e'));
+        _messages.add(
+          ChatMessage(type: MessageType.error, text: 'Revive failed: $e'),
+        );
       });
     }
   }
@@ -384,8 +385,11 @@ class _ChatScreenState extends State<ChatScreen>
     final newValue = !_skipPermissions;
     try {
       final api = context.read<ApiService>();
-      await api.updateSession(widget.session.id,
-          skipPermissions: newValue, planMode: _planMode);
+      await api.updateSession(
+        widget.session.id,
+        skipPermissions: newValue,
+        planMode: _planMode,
+      );
       if (!mounted) return;
       setState(() {
         _skipPermissions = newValue;
@@ -408,8 +412,11 @@ class _ChatScreenState extends State<ChatScreen>
     final newValue = !_planMode;
     try {
       final api = context.read<ApiService>();
-      await api.updateSession(widget.session.id,
-          skipPermissions: _skipPermissions, planMode: newValue);
+      await api.updateSession(
+        widget.session.id,
+        skipPermissions: _skipPermissions,
+        planMode: newValue,
+      );
       if (!mounted) return;
       setState(() {
         _planMode = newValue;
@@ -433,7 +440,9 @@ class _ChatScreenState extends State<ChatScreen>
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Delete session'),
-        content: const Text('Are you sure you want to delete this session? This will stop the agent and remove it from the list.'),
+        content: const Text(
+          'Are you sure you want to delete this session? This will stop the agent and remove it from the list.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -472,7 +481,10 @@ class _ChatScreenState extends State<ChatScreen>
       // Show error in chat stream
       setState(() {
         _messages.add(
-          ChatMessage(type: MessageType.error, text: 'Failed to delete session: $e'),
+          ChatMessage(
+            type: MessageType.error,
+            text: 'Failed to delete session: $e',
+          ),
         );
       });
     }
@@ -672,7 +684,9 @@ class _ChatScreenState extends State<ChatScreen>
                               color: _planMode ? CB.cyan : CB.textTertiary,
                             ),
                             visualDensity: VisualDensity.compact,
-                            tooltip: _planMode ? 'Plan mode on' : 'Plan mode off',
+                            tooltip: _planMode
+                                ? 'Plan mode on'
+                                : 'Plan mode off',
                             onPressed: _togglePlanMode,
                           ),
                           IconButton(
@@ -699,8 +713,12 @@ class _ChatScreenState extends State<ChatScreen>
                                   : Colors.deepOrange.withValues(alpha: 0.8),
                             ),
                             visualDensity: VisualDensity.compact,
-                            tooltip: _isKilled ? 'Revive agent' : 'Emergency stop',
-                            onPressed: _isKilled ? _reviveSession : _killSession,
+                            tooltip: _isKilled
+                                ? 'Revive agent'
+                                : 'Emergency stop',
+                            onPressed: _isKilled
+                                ? _reviveSession
+                                : _killSession,
                           ),
                           // Overflow menu for less-frequent actions
                           PopupMenuButton<String>(
@@ -732,7 +750,9 @@ class _ChatScreenState extends State<ChatScreen>
                                     Icon(
                                       Icons.bug_report_rounded,
                                       size: 18,
-                                      color: _showDebug ? CB.amber : CB.textTertiary,
+                                      color: _showDebug
+                                          ? CB.amber
+                                          : CB.textTertiary,
                                     ),
                                     const SizedBox(width: 10),
                                     Text(
@@ -1088,7 +1108,11 @@ class _ChatScreenState extends State<ChatScreen>
         if (msg.prUrl != null && msg.prUrl!.isNotEmpty) {
           return Column(
             mainAxisSize: MainAxisSize.min,
-            children: [pill, const SizedBox(height: 8), _PRCard(prUrl: msg.prUrl!)],
+            children: [
+              pill,
+              const SizedBox(height: 8),
+              _PRCard(prUrl: msg.prUrl!),
+            ],
           );
         }
         return pill;
@@ -1168,12 +1192,17 @@ class _ChatScreenState extends State<ChatScreen>
                     icon: const Icon(Icons.restart_alt_rounded, size: 20),
                     label: const Text(
                       'Revive Agent',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                      ),
                     ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: CB.neonGreen.withValues(alpha: 0.15),
                       foregroundColor: CB.neonGreen,
-                      side: BorderSide(color: CB.neonGreen.withValues(alpha: 0.5)),
+                      side: BorderSide(
+                        color: CB.neonGreen.withValues(alpha: 0.5),
+                      ),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(16),
                       ),
@@ -1181,54 +1210,57 @@ class _ChatScreenState extends State<ChatScreen>
                   ),
                 )
               : Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _inputController,
-                  maxLines: 5,
-                  minLines: 1,
-                  enabled: _sessionReady,
-                  style: const TextStyle(fontSize: 15, height: 1.4),
-                  decoration: InputDecoration(
-                    hintText: _sessionReady
-                        ? 'Message Copilot...'
-                        : 'Waiting for agent...',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: BorderSide(
-                        color: Colors.white.withValues(alpha: 0.08),
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _inputController,
+                        maxLines: 5,
+                        minLines: 1,
+                        enabled: _sessionReady,
+                        style: const TextStyle(fontSize: 15, height: 1.4),
+                        decoration: InputDecoration(
+                          hintText: _sessionReady
+                              ? 'Message Copilot...'
+                              : 'Waiting for agent...',
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(
+                              color: Colors.white.withValues(alpha: 0.08),
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(
+                              color: Colors.white.withValues(alpha: 0.08),
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: const BorderSide(
+                              color: CB.cyan,
+                              width: 1,
+                            ),
+                          ),
+                          disabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(
+                              color: Colors.white.withValues(alpha: 0.04),
+                            ),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 12,
+                          ),
+                        ),
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => _sendMessage(),
                       ),
                     ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: BorderSide(
-                        color: Colors.white.withValues(alpha: 0.08),
-                      ),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: const BorderSide(color: CB.cyan, width: 1),
-                    ),
-                    disabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: BorderSide(
-                        color: Colors.white.withValues(alpha: 0.04),
-                      ),
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 12,
-                    ),
-                  ),
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => _sendMessage(),
+                    const SizedBox(width: 8),
+                    _buildSendButton(),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 8),
-              _buildSendButton(),
-            ],
-          ),
         ),
       ),
     );
@@ -1297,10 +1329,14 @@ class _ChatScreenState extends State<ChatScreen>
         width: 36,
         height: 44,
         decoration: BoxDecoration(
-          color: enabled ? CB.cyan.withValues(alpha: 0.15) : CB.textTertiary.withValues(alpha: 0.2),
+          color: enabled
+              ? CB.cyan.withValues(alpha: 0.15)
+              : CB.textTertiary.withValues(alpha: 0.2),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: enabled ? CB.cyan.withValues(alpha: 0.35) : Colors.transparent,
+            color: enabled
+                ? CB.cyan.withValues(alpha: 0.35)
+                : Colors.transparent,
           ),
         ),
         child: Icon(
@@ -1328,7 +1364,11 @@ class _ChatScreenState extends State<ChatScreen>
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: CB.hotPink.withValues(alpha: 0.4)),
               ),
-              child: const Icon(Icons.stop_rounded, color: CB.hotPink, size: 18),
+              child: const Icon(
+                Icons.stop_rounded,
+                color: CB.hotPink,
+                size: 18,
+              ),
             ),
           ),
           const SizedBox(width: 6),
@@ -1339,11 +1379,7 @@ class _ChatScreenState extends State<ChatScreen>
 
     return Row(
       mainAxisSize: MainAxisSize.min,
-      children: [
-        cloneBtn,
-        const SizedBox(width: 6),
-        sendBtn,
-      ],
+      children: [cloneBtn, const SizedBox(width: 6), sendBtn],
     );
   }
 }
@@ -1352,15 +1388,16 @@ class _ChatScreenState extends State<ChatScreen>
 
 /// Parses a GitHub PR URL and fetches the PR state from the public API.
 Future<Map<String, dynamic>?> _fetchPRState(String prUrl) async {
-  final re = RegExp(
-      r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)');
+  final re = RegExp(r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)');
   final m = re.firstMatch(prUrl);
   if (m == null) return null;
-  final apiUrl =
-      'https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}';
+  final apiUrl = 'https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}';
   try {
     final resp = await http
-        .get(Uri.parse(apiUrl), headers: {'Accept': 'application/vnd.github+json'})
+        .get(
+          Uri.parse(apiUrl),
+          headers: {'Accept': 'application/vnd.github+json'},
+        )
         .timeout(const Duration(seconds: 6));
     if (resp.statusCode == 200) {
       return jsonDecode(resp.body) as Map<String, dynamic>;
@@ -1385,7 +1422,11 @@ class _PRCardState extends State<_PRCard> {
   void initState() {
     super.initState();
     _fetchPRState(widget.prUrl).then((data) {
-      if (mounted) setState(() { _prData = data; _loading = false; });
+      if (mounted)
+        setState(() {
+          _prData = data;
+          _loading = false;
+        });
     });
   }
 
@@ -1424,8 +1465,10 @@ class _PRCardState extends State<_PRCard> {
         : repoName;
 
     return GestureDetector(
-      onTap: () => launchUrl(Uri.parse(widget.prUrl),
-          mode: LaunchMode.externalApplication),
+      onTap: () => launchUrl(
+        Uri.parse(widget.prUrl),
+        mode: LaunchMode.externalApplication,
+      ),
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 16),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -1445,9 +1488,10 @@ class _PRCardState extends State<_PRCard> {
                   Text(
                     title,
                     style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        height: 1.3),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      height: 1.3,
+                    ),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -1455,8 +1499,9 @@ class _PRCardState extends State<_PRCard> {
                   Text(
                     '$repoName  $prNum',
                     style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.white.withValues(alpha: 0.4)),
+                      fontSize: 11,
+                      color: Colors.white.withValues(alpha: 0.4),
+                    ),
                   ),
                 ],
               ),
@@ -1464,14 +1509,16 @@ class _PRCardState extends State<_PRCard> {
             const SizedBox(width: 10),
             if (_loading)
               SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(
-                      strokeWidth: 1.5, color: stateColor))
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.5,
+                  color: stateColor,
+                ),
+              )
             else
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
                   color: stateColor.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(8),
@@ -1481,11 +1528,14 @@ class _PRCardState extends State<_PRCard> {
                   children: [
                     Icon(stateIcon, size: 11, color: stateColor),
                     const SizedBox(width: 4),
-                    Text(stateLabel,
-                        style: TextStyle(
-                            fontSize: 11,
-                            color: stateColor,
-                            fontWeight: FontWeight.w600)),
+                    Text(
+                      stateLabel,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: stateColor,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1561,9 +1611,7 @@ class _ToolGroupCardState extends State<_ToolGroupCard> {
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.03),
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.06),
-                ),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
               ),
               child: Row(
                 children: [

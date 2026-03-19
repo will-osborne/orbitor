@@ -2,68 +2,139 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cloudflare/tableflip"
 )
 
+// version is set at build time via -ldflags="-X main.version=vX.Y.Z".
+// It defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
-	// Load user client config first so flag defaults can reference it.
-	clientCfg := LoadClientConfig()
+	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println("orbitor", version)
+		return
+	}
 
-	addr := flag.String("addr", "0.0.0.0:8080", "listen address")
-	tuiMode := flag.Bool("tui", false, "run terminal UI client")
-	serverURL := flag.String("server", clientCfg.ServerURL, "bridge server URL used in -tui mode")
-	procOnly := flag.Bool("procmanager", false, "run procmanager only")
-	newMode := flag.Bool("new", false, "create a new session for cwd and attach in tui")
-	flag.Parse()
+	if len(os.Args) < 2 || os.Args[1] == "tui" {
+		// Default: TUI client
+		runTUIMode(false)
+		return
+	}
 
-	if *tuiMode {
-		// Determine backend/model from remaining positional args when -new is used.
-		// Config defaults apply; positional args override them.
-		if *newMode {
-			args := flag.Args()
-			backend := clientCfg.DefaultBackend
-			model := clientCfg.DefaultModel
-			skip := clientCfg.SkipPermissions
-			plan := clientCfg.PlanMode
-			if len(args) >= 1 {
-				backend = args[0]
-			}
-			if len(args) >= 2 {
-				model = args[1]
-			}
-			if err := RunTUI(*serverURL, true, backend, model, skip, plan); err != nil {
-				log.Fatalf("tui: %v", err)
-			}
-			return
+	switch os.Args[1] {
+	case "new":
+		runTUIMode(true)
+	case "server":
+		runServerMode()
+	case "setup":
+		if err := runSetup(); err != nil {
+			log.Fatal(err)
 		}
+	case "service":
+		runServiceSubcommand()
+	case "procmanager":
+		clientCfg := LoadClientConfig()
+		dir, err := OrbitorDir()
+		if err != nil {
+			log.Fatalf("orbitor dir: %v", err)
+		}
+		dbPath := filepath.Join(dir, "orbitor.db")
+		store, err := NewStore(dbPath)
+		if err != nil {
+			log.Fatalf("open store: %v", err)
+		}
+		defer store.Close()
+		_ = clientCfg
+		pm := NewProcManager(store)
+		if err := pm.StartServer("127.0.0.1:19101"); err != nil {
+			log.Fatalf("procmanager failed: %v", err)
+		}
+	default:
+		if strings.HasPrefix(os.Args[1], "-") {
+			// Legacy flag-style invocation: fall through to TUI for compatibility.
+			runTUIMode(false)
+		} else {
+			printUsage()
+		}
+	}
+}
 
-		if err := RunTUI(*serverURL, false, "", "", false, false); err != nil {
+// runTUIMode launches the TUI client. If newSession is true it creates a new
+// session for the current working directory (equivalent to the old -tui -new flags).
+func runTUIMode(newSession bool) {
+	clientCfg := LoadClientConfig()
+	serverURL := clientCfg.ServerURL
+
+	if newSession {
+		// Positional args after "new": [backend [model]]
+		args := os.Args[2:]
+		backend := clientCfg.DefaultBackend
+		model := clientCfg.DefaultModel
+		skip := clientCfg.SkipPermissions
+		plan := clientCfg.PlanMode
+		if len(args) >= 1 {
+			backend = args[0]
+		}
+		if len(args) >= 2 {
+			model = args[1]
+		}
+		if err := RunTUI(serverURL, true, backend, model, skip, plan); err != nil {
 			log.Fatalf("tui: %v", err)
 		}
 		return
 	}
 
-	store, err := NewStore("orbitor.db")
+	if err := RunTUI(serverURL, false, "", "", false, false); err != nil {
+		log.Fatalf("tui: %v", err)
+	}
+}
+
+// runServerMode starts the HTTP server in the foreground with tableflip support.
+func runServerMode() {
+	clientCfg := LoadClientConfig()
+	addr := clientCfg.ListenAddr
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
+
+	// Allow --addr flag override when running server subcommand.
+	args := os.Args[2:]
+	for i, a := range args {
+		if a == "--addr" && i+1 < len(args) {
+			addr = args[i+1]
+		} else if strings.HasPrefix(a, "--addr=") {
+			addr = strings.TrimPrefix(a, "--addr=")
+		}
+	}
+
+	// Print binding hint.
+	if strings.HasPrefix(addr, "100.") {
+		log.Printf("Binding to Tailscale address: %s", addr)
+	} else if strings.HasPrefix(addr, "127.") {
+		log.Printf("Binding to localhost only. Use 'orbitor setup' to configure Tailscale access.")
+	}
+
+	// Ensure ~/.orbitor/ exists and open the database there.
+	dir, err := OrbitorDir()
+	if err != nil {
+		log.Fatalf("orbitor dir: %v", err)
+	}
+	dbPath := filepath.Join(dir, "orbitor.db")
+	store, err := NewStore(dbPath)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-
-	if *procOnly {
-		pm := NewProcManager(store)
-		if err := pm.StartServer("127.0.0.1:19101"); err != nil {
-			log.Fatalf("procmanager failed: %v", err)
-		}
-		return
-	}
 
 	// Set up tableflip for graceful binary upgrades.
 	// On SIGHUP the current process spawns the new binary, hands off the
@@ -98,7 +169,7 @@ func main() {
 
 	// Get listener from tableflip (inherited from parent process during
 	// upgrade, or freshly created on first start).
-	ln, err := upg.Listen("tcp", *addr)
+	ln, err := upg.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
@@ -214,7 +285,7 @@ func main() {
 	srv := &http.Server{Handler: corsMiddleware(mux)}
 
 	go func() {
-		log.Printf("orbitor listening on %s (pid %d)", *addr, os.Getpid())
+		log.Printf("orbitor listening on %s (pid %d)", addr, os.Getpid())
 		if err := srv.Serve(ln); err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
@@ -259,6 +330,51 @@ func main() {
 	_ = srv.Shutdown(ctx)
 
 	log.Println("bye")
+}
+
+// runServiceSubcommand dispatches service management commands.
+func runServiceSubcommand() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: orbitor service [install|uninstall|start|stop|restart|status|logs]")
+		return
+	}
+	switch os.Args[2] {
+	case "install":
+		ServiceInstall()
+	case "uninstall":
+		ServiceUninstall()
+	case "start":
+		ServiceStart()
+	case "stop":
+		ServiceStop()
+	case "restart":
+		ServiceRestart()
+	case "status":
+		ServiceStatus()
+	case "logs":
+		ServiceLogs()
+	default:
+		fmt.Printf("Unknown service command: %s\n", os.Args[2])
+	}
+}
+
+// printUsage prints CLI usage information.
+func printUsage() {
+	fmt.Println(`orbitor - AI coding assistant bridge
+
+Usage:
+  orbitor              Open TUI client (default)
+  orbitor new          Create new session for current directory
+  orbitor server       Run server in foreground
+  orbitor setup        Run setup wizard
+  orbitor service      Manage background service
+    install            Install and start as system service
+    uninstall          Stop and remove service
+    start              Start service
+    stop               Stop service
+    restart            Restart service
+    status             Show service status
+    logs               Tail service logs`)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

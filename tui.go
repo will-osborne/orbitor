@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,12 +12,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode"
 
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -149,10 +157,70 @@ func init() {
 }
 
 const (
-	tuiStateDirName  = ".orbitor"
-	tuiStateFileName = "tui_state.json"
-	tuiHistoryLimit  = 500
+	tuiStateDirName          = ".orbitor"
+	tuiStateFileName         = "tui_state.json"
+	tuiHistoryLimit          = 500
+	pttHoldThreshold         = 4
+	pttReleaseDebounce       = 175 * time.Millisecond
+	spinnerTickInterval      = 100 * time.Millisecond
+	pttShutdownLogFloor      = 75 * time.Millisecond
+	pttTranscriptionLogFloor = 250 * time.Millisecond
+	// shiftEnterPrivate is a Unicode private-use character (U+E001) used as a
+	// sentinel to signal "Shift+Enter → insert newline". Bubbletea's standard
+	// terminal parser cannot distinguish Shift+Enter from Enter in most
+	// terminals, so shiftEnterFilter converts known Kitty/xterm escape
+	// sequences into a KeyRunes message carrying this rune before the model
+	// sees it.
+	shiftEnterPrivate = '\ue001'
+	// altEnterPrivate is a Unicode private-use character (U+E002) used as a
+	// sentinel to signal "Alt/Option+Enter → fork send". With modifyOtherKeys=2
+	// active, Alt+Enter sends \x1b[27;3;13~ or \x1b[13;3u rather than the
+	// traditional \x1b\r that bubbletea would parse natively as "alt+enter".
+	altEnterPrivate = '\ue002'
 )
+
+// keyFilter is a bubbletea WithFilter function that converts unrecognised CSI
+// sequences for Shift+Enter and Alt+Enter into synthetic KeyRunes messages
+// carrying private-use sentinels the model can act on.
+//
+// Sequences handled:
+//
+//	\x1b[13u     – Kitty keyboard protocol: bare Enter (no modifier)
+//	\x1b[13;1u   – Kitty keyboard protocol: bare Enter (explicit no-modifier)
+//	\x1b[13;2u   – Kitty keyboard protocol: Shift+Enter
+//	\x1b[27;2;13~ – xterm modifyOtherKeys=2: Shift+Enter
+//	\x1b[13;3u   – Kitty keyboard protocol: Alt+Enter
+//	\x1b[27;3;13~ – xterm modifyOtherKeys=2: Alt+Enter
+//
+// The bare-Enter cases are needed because enabling the Kitty keyboard protocol
+// (disambiguate flag) remaps plain Enter from \r to \x1b[13u.
+func shiftEnterFilter(_ tea.Model, msg tea.Msg) tea.Msg {
+	rv := reflect.ValueOf(msg)
+	// bubbletea's unknownCSISequenceMsg is an unexported []byte type.
+	// Detect it by checking the package path + slice-of-bytes shape.
+	if rv.Kind() != reflect.Slice {
+		return msg
+	}
+	rt := rv.Type()
+	if rt.Elem().Kind() != reflect.Uint8 {
+		return msg
+	}
+	if rt.PkgPath() != "github.com/charmbracelet/bubbletea" {
+		return msg
+	}
+	data := rv.Bytes()
+	// Kitty bare Enter (sent when the Kitty disambiguate flag is active).
+	if bytes.Equal(data, []byte("\x1b[13u")) || bytes.Equal(data, []byte("\x1b[13;1u")) {
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	}
+	if bytes.Equal(data, []byte("\x1b[13;2u")) || bytes.Equal(data, []byte("\x1b[27;2;13~")) {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{shiftEnterPrivate}}
+	}
+	if bytes.Equal(data, []byte("\x1b[13;3u")) || bytes.Equal(data, []byte("\x1b[27;3;13~")) {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{altEnterPrivate}}
+	}
+	return msg
+}
 
 type tuiStateFile struct {
 	Theme string `json:"theme"`
@@ -518,16 +586,39 @@ type updateSessionMsg struct {
 }
 type selfUpdateMsg struct{ err error }
 type wsPayloadMsg struct{ payload []byte }
+type wsDisconnectedMsg struct {
+	conn *websocket.Conn
+	err  error
+}
 type infoMsg struct{ text string }
 type errMsg struct{ err error }
 type sttStartedMsg struct {
-	proc      *exec.Cmd
-	audioPath string
-	err       error
+	proc          *exec.Cmd
+	stdin         io.WriteCloser
+	audioPath     string
+	streaming     bool
+	disableNative bool
+	disableNote   string
+	err           error
+}
+type sttPartialMsg struct {
+	text     string
+	external bool
 }
 type sttResultMsg struct {
-	text string
-	err  error
+	text               string
+	err                error
+	captureStopDelay   time.Duration
+	transcribeDelay    time.Duration
+	releaseToTextDelay time.Duration
+	disableNative      bool
+	disableNote        string
+	external           bool
+}
+type clipboardPasteMsg struct {
+	insert string
+	note   string
+	err    error
 }
 type whisperCLI struct {
 	path   string
@@ -550,7 +641,7 @@ type tuiModel struct {
 
 	logs []string
 
-	input    textinput.Model
+	input    textarea.Model
 	viewport viewport.Model
 
 	extCh chan tea.Msg
@@ -569,6 +660,10 @@ type tuiModel struct {
 	// per-session elapsed-time tracking
 	sessionStateStart map[string]time.Time
 	sessionLastState  map[string]string
+
+	// unread indicators — set when a non-active session's LastMessage changes
+	sessionUnread       map[string]bool
+	sessionLastMessage  map[string]string
 
 	// delete confirmation
 	deleteConfirmID string // non-empty = awaiting y/N confirmation
@@ -598,6 +693,9 @@ type tuiModel struct {
 	showZoo bool
 	zooBots []zooBot
 
+	// sub-agent hierarchy expansion (session ID → expanded)
+	expandedSessions map[string]bool
+
 	// new-session wizard
 	wizardActive   bool
 	wizardFocus    int // 0=dir, 1=backend, 2=model, 3=skip, 4=mode
@@ -616,18 +714,36 @@ type tuiModel struct {
 	thinkingLines []string
 	isThinking    bool
 
+	// toolCallCache tracks kind/title by toolCallID for history replay merging.
+	toolCallCache map[string]WSToolCall
+
 	// push-to-talk speech-to-text (space hold)
-	pttLastSpace time.Time
-	pttActive    bool
-	pttBusy      bool
-	pttAudioPath string
-	pttProc      *exec.Cmd
+	pttLastSpace          time.Time
+	pttActive             bool
+	pttStarting           bool
+	pttBusy               bool
+	pttAudioPath          string
+	pttProc               *exec.Cmd
+	pttProcInput          io.WriteCloser
+	pttStreaming          bool
+	pttReleaseAt          time.Time
+	pttSpaceRun           int
+	pttTriggerValue       string
+	pttTriggerCursor      int
+	pttTriggerCaptured    bool
+	pttInsertCursor       int
+	pttInsertValueVersion string
+	pttLiveText           string
+	pttDisableNativeLive  bool
 
 	// /model completion state
 	modelCompLast       string
 	modelCompCandidates []string
 	modelCompIndex      int
 	modelCompSessionID  string
+
+	// sidebar visibility
+	hideSidebar bool
 }
 
 func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
@@ -636,9 +752,27 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		return err
 	}
 
-	in := textinput.New()
-	in.Placeholder = "Type prompt or /help"
-	in.CharLimit = 4000
+	in := textarea.New()
+	in.Placeholder = "Type prompt, @/path, or Ctrl+V"
+	in.CharLimit = 32000
+	in.ShowLineNumbers = false
+	in.Prompt = "❯ "
+	in.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", string([]rune{shiftEnterPrivate})), key.WithHelp("shift+enter", "newline"))
+	in.KeyMap.WordBackward = key.NewBinding(key.WithKeys("alt+left", "ctrl+left", "alt+b"), key.WithHelp("ctrl+left", "word backward"))
+	in.KeyMap.WordForward = key.NewBinding(key.WithKeys("alt+right", "ctrl+right", "alt+f"), key.WithHelp("ctrl+right", "word forward"))
+	in.KeyMap.LineStart = key.NewBinding(key.WithKeys("home", "ctrl+a"), key.WithHelp("home", "line start"))
+	in.KeyMap.LineEnd = key.NewBinding(key.WithKeys("end", "ctrl+e"), key.WithHelp("end", "line end"))
+	focusedStyle, blurredStyle := textarea.DefaultStyles()
+	focusedStyle.CursorLine = lipgloss.NewStyle()
+	blurredStyle.CursorLine = lipgloss.NewStyle()
+	focusedStyle.Prompt = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	blurredStyle.Prompt = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	focusedStyle.Text = lipgloss.NewStyle().Foreground(colText)
+	blurredStyle.Text = lipgloss.NewStyle().Foreground(colText)
+	focusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+	blurredStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+	in.FocusedStyle = focusedStyle
+	in.BlurredStyle = blurredStyle
 	in.Focus()
 
 	m := &tuiModel{
@@ -646,8 +780,12 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		input:             in,
 		viewport:          viewport.New(60, 20),
 		extCh:             make(chan tea.Msg, 256),
-		sessionStateStart: make(map[string]time.Time),
-		sessionLastState:  make(map[string]string),
+		sessionStateStart:  make(map[string]time.Time),
+		sessionLastState:   make(map[string]string),
+		sessionUnread:      make(map[string]bool),
+		sessionLastMessage: make(map[string]string),
+		toolCallCache:      make(map[string]WSToolCall),
+		expandedSessions:  make(map[string]bool),
 		historyPos:        0,
 		agentBlockIdx:     -1,
 		renderMarkdown:    true,
@@ -661,7 +799,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter newline  ·  Ctrl+V attach/paste  ·  n new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -691,7 +829,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 							for {
 								_, payload, err := conn.ReadMessage()
 								if err != nil {
-									m.extCh <- infoMsg{text: "Session disconnected: " + err.Error()}
+									m.extCh <- wsDisconnectedMsg{conn: conn, err: err}
 									return
 								}
 								m.extCh <- wsPayloadMsg{payload: payload}
@@ -703,7 +841,21 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// Enable keyboard protocols so terminals send distinct sequences for
+	// Shift+Enter and Alt/Option+Enter.
+	//
+	// \x1b[>4;2m  – xterm modifyOtherKeys level 2: terminals like xterm and
+	//               older iTerm2 will send \x1b[27;mod;13~ for modified Enter.
+	// \x1b[=1u    – Kitty keyboard protocol "disambiguate" flag: modern
+	//               terminals (Ghostty, WezTerm, newer iTerm2, etc.) send
+	//               \x1b[13;mod u for modified Enter and \x1b[13u for plain
+	//               Enter. Unsupported terminals ignore this harmlessly.
+	//
+	// shiftEnterFilter handles all of the resulting sequences.
+	fmt.Print("\x1b[>4;2m\x1b[=1u")
+	defer fmt.Print("\x1b[>4;0m\x1b[=0u")
+
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(shiftEnterFilter))
 	_, err = p.Run()
 	return err
 }
@@ -865,6 +1017,7 @@ func (m *tuiModel) renderHelp() string {
 		row("Enter (empty input)", "connect to selected session"),
 		row("n", "new session wizard"),
 		row("z", "toggle agent zoo view"),
+		row("e", "expand/collapse sub-agents"),
 		row("Ctrl+D", "delete selected session"),
 		"",
 		head.Render("  Feed"),
@@ -882,6 +1035,7 @@ func (m *tuiModel) renderHelp() string {
 		row("Enter (with text)", "send prompt to session"),
 		row("Shift+Enter", "insert newline in prompt"),
 		row("Alt+Enter", "send prompt to cloned session"),
+		row("Ctrl+V", "paste clipboard image or file path"),
 		row("Hold Space", "push-to-talk dictation"),
 		row("Ctrl+↑/↓", "cycle prompt history"),
 		row("Ctrl+\\", "interrupt running session"),
@@ -1032,7 +1186,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-		if m.pttActive && time.Since(m.pttLastSpace) > 900*time.Millisecond {
+		if m.pttActive && time.Since(m.pttLastSpace) > pttReleaseDebounce {
 			return m, tea.Batch(m.stopPTTCapture(), spinnerTickCmd())
 		}
 		return m, spinnerTickCmd()
@@ -1046,7 +1200,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, zooTickCmd()
 
 	case tickMsg:
-		return m, tea.Batch(refreshSessionsCmd(m.api), tickCmd())
+		cmds := []tea.Cmd{refreshSessionsCmd(m.api), tickCmd()}
+		if m.wsReconnecting && m.activeSessionID != "" {
+			cmds = append(cmds, attachSessionCmd(m.api, m.activeSessionID, m.extCh))
+		}
+		return m, tea.Batch(cmds...)
 
 	case sessionsMsg:
 		if msg.err != nil {
@@ -1054,12 +1212,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Track state changes to measure elapsed time per session.
+		// Also detect new LastMessage on non-active sessions → mark unread.
 		for _, s := range msg.sessions {
 			state := sessionStateLabel(s)
 			if m.sessionLastState[s.ID] != state {
 				m.sessionLastState[s.ID] = state
 				m.sessionStateStart[s.ID] = time.Now()
 			}
+			if s.ID != m.activeSessionID {
+				prev, seen := m.sessionLastMessage[s.ID]
+				if seen && s.LastMessage != "" && s.LastMessage != prev {
+					m.sessionUnread[s.ID] = true
+				}
+			}
+			m.sessionLastMessage[s.ID] = s.LastMessage
 		}
 		// Preserve selection by ID so the cursor doesn't jump when sessions
 		// are added, removed, or reordered during a refresh.
@@ -1092,6 +1258,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.swapConn(msg.conn)
 		m.activeSessionID = msg.sessionID
 		m.wsReconnecting = false
+		delete(m.sessionUnread, msg.sessionID)
 		m.logSystem("Connected to session " + msg.sessionID)
 		m.updatePlaceholder()
 		return m, nil
@@ -1139,36 +1306,109 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, refreshSessionsCmd(m.api)
 
 	case sttResultMsg:
+		m.pttStarting = false
 		m.pttBusy = false
+		m.pttActive = false
+		m.pttStreaming = false
+		m.pttProcInput = nil
+		if msg.disableNative && !m.pttDisableNativeLive {
+			m.pttDisableNativeLive = true
+			if msg.disableNote != "" {
+				m.logSystem(msg.disableNote)
+			}
+		}
 		if m.pttAudioPath != "" {
 			_ = os.Remove(m.pttAudioPath)
 			m.pttAudioPath = ""
 		}
 		if msg.err != nil {
+			m.resetPTTTrigger()
 			m.logSystem("Dictation failed: " + msg.err.Error())
+			if msg.external {
+				return m, waitExternalCmd(m.extCh)
+			}
 			return m, nil
 		}
 		if strings.TrimSpace(msg.text) != "" {
-			if m.input.Value() != "" && !strings.HasSuffix(m.input.Value(), " ") {
-				m.insertAtCursor(" ")
+			m.applyDictationText(strings.TrimSpace(msg.text))
+			switch {
+			case msg.releaseToTextDelay > 0:
+				m.logSystem(fmt.Sprintf("Dictation inserted (%s live)", formatDurationRounded(msg.releaseToTextDelay)))
+			case msg.captureStopDelay >= pttShutdownLogFloor || msg.transcribeDelay >= pttTranscriptionLogFloor:
+				m.logSystem(fmt.Sprintf("Dictation inserted (%s stop, %s transcribe)", formatDurationRounded(msg.captureStopDelay), formatDurationRounded(msg.transcribeDelay)))
+			default:
+				m.logSystem("Dictation inserted")
 			}
-			m.insertAtCursor(strings.TrimSpace(msg.text))
-			m.logSystem("Dictation inserted")
+		}
+		m.resetPTTTrigger()
+		if msg.external {
+			return m, waitExternalCmd(m.extCh)
+		}
+		return m, nil
+
+	case sttPartialMsg:
+		if strings.TrimSpace(msg.text) == "" {
+			if msg.external {
+				return m, waitExternalCmd(m.extCh)
+			}
+			return m, nil
+		}
+		m.applyDictationText(msg.text)
+		if msg.external {
+			return m, waitExternalCmd(m.extCh)
+		}
+		return m, nil
+
+	case clipboardPasteMsg:
+		if msg.err != nil {
+			m.logSystem("Paste failed: " + msg.err.Error())
+			return m, nil
+		}
+		if strings.TrimSpace(msg.insert) == "" {
+			return m, nil
+		}
+		if strings.HasPrefix(strings.TrimSpace(msg.insert), "@") {
+			m.insertPromptTokenAtCursor(strings.TrimSpace(msg.insert))
+		} else {
+			m.insertAtCursor(msg.insert)
+		}
+		if msg.note != "" {
+			m.logSystem(msg.note)
 		}
 		return m, nil
 
 	case sttStartedMsg:
+		m.pttStarting = false
+		if msg.disableNative && !m.pttDisableNativeLive {
+			m.pttDisableNativeLive = true
+			if msg.disableNote != "" {
+				m.logSystem(msg.disableNote)
+			}
+		}
 		if msg.err != nil {
 			m.pttBusy = false
 			m.pttActive = false
+			m.pttProcInput = nil
+			m.pttStreaming = false
+			m.resetPTTTrigger()
 			m.logSystem("Dictation start failed: " + msg.err.Error())
 			return m, nil
 		}
 		m.pttProc = msg.proc
+		m.pttProcInput = msg.stdin
 		m.pttAudioPath = msg.audioPath
+		m.pttStreaming = msg.streaming
+		m.pttReleaseAt = time.Time{}
 		m.pttActive = true
 		m.pttBusy = true
-		m.logSystem("🎙 dictation listening (hold space), release to transcribe")
+		m.pttSpaceRun = pttHoldThreshold
+		m.pttInsertCursor = m.inputCursorPosition()
+		m.pttInsertValueVersion = m.input.Value()
+		if msg.streaming {
+			m.logSystem("🎙 live dictation listening (hold space), release to finish")
+		} else {
+			m.logSystem("🎙 dictation listening (hold space), release to transcribe")
+		}
 		return m, nil
 
 	case selfUpdateMsg:
@@ -1183,11 +1423,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleIncoming(msg.payload)
 		return m, waitExternalCmd(m.extCh)
 
-	case infoMsg:
-		if strings.Contains(msg.text, "disconnected") {
+	case wsDisconnectedMsg:
+		m.connMu.Lock()
+		isCurrent := m.conn == msg.conn
+		m.connMu.Unlock()
+		if isCurrent {
 			m.wsReconnecting = true
 			m.wsReconnectSince = time.Now()
 		}
+		m.logSystem("Session disconnected: " + msg.err.Error())
+		return m, waitExternalCmd(m.extCh)
+
+	case infoMsg:
 		m.logSystem(msg.text)
 		return m, waitExternalCmd(m.extCh)
 
@@ -1200,6 +1447,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if msg.String() != "tab" && msg.String() != "shift+tab" {
 			m.resetModelCompletion()
+		}
+		if msg.String() != " " {
+			m.resetPTTSpaceRun()
 		}
 		// When wizard is open, route all key events to it.
 		if m.wizardActive {
@@ -1263,23 +1513,33 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case " ":
-			now := time.Now()
-			m.pttLastSpace = now
-			if !m.pttBusy && m.input.Value() == "" {
-				if !m.pttActive {
-					return m, m.startPTTCapture()
-				}
+			m.pttLastSpace = time.Now()
+			if m.pttActive || m.pttBusy || m.pttStarting {
+				m.pttSpaceRun = pttHoldThreshold
 				return m, nil
 			}
-			if m.pttBusy {
-				return m, nil
+			m.capturePTTTriggerSnapshot()
+			m.pttSpaceRun++
+			if m.pttSpaceRun >= pttHoldThreshold {
+				m.restorePTTTriggerSnapshot()
+				m.pttStarting = true
+				return m, m.startPTTCapture()
 			}
 
 		case "up":
+			li := m.input.LineInfo()
+			if m.input.Line() > 0 || li.RowOffset > 0 {
+				break // let textarea move cursor up (logical or visual line)
+			}
 			m.viewport.ScrollUp(3)
 			return m, nil
 
 		case "down":
+			li := m.input.LineInfo()
+			lastLogLine := strings.Count(m.input.Value(), "\n")
+			if m.input.Line() < lastLogLine || li.RowOffset < li.Height-1 {
+				break // let textarea move cursor down (logical or visual line)
+			}
 			m.viewport.ScrollDown(3)
 			return m, nil
 
@@ -1293,7 +1553,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.historyPos < len(m.inputHistory) {
 				m.historyPos++
 				m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
-				m.input.CursorEnd()
+				m.setInputValueAndCursor(m.input.Value(), len([]rune(m.input.Value())))
 			}
 			return m, nil
 
@@ -1307,7 +1567,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.input.SetValue(m.inputHistory[len(m.inputHistory)-m.historyPos])
 			}
-			m.input.CursorEnd()
+			m.setInputValueAndCursor(m.input.Value(), len([]rune(m.input.Value())))
 			return m, nil
 
 		case "tab":
@@ -1399,6 +1659,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+r", "f5":
 			return m, refreshSessionsCmd(m.api)
 
+		case "ctrl+v":
+			return m, pasteClipboardCmd()
+
 		case "ctrl+m":
 			m.renderMarkdown = !m.renderMarkdown
 			m.logSystem("Markdown rendering: " + boolLabel(m.renderMarkdown))
@@ -1424,6 +1687,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rebuildViewport()
 			return m, nil
 
+		case "ctrl+p":
+			m.hideSidebar = !m.hideSidebar
+			m.resize()
+			return m, nil
+
 		case "n":
 			if m.input.Value() == "" {
 				m.openWizard()
@@ -1436,13 +1704,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case "shift+enter":
+		case "e":
+			if m.input.Value() == "" && len(m.sessions) > 0 {
+				id := m.sessions[m.selected].ID
+				m.expandedSessions[id] = !m.expandedSessions[id]
+				return m, nil
+			}
+
+		case "shift+enter", string([]rune{shiftEnterPrivate}):
 			m.insertAtCursor("\n")
 			return m, nil
 
 		case "enter":
-			text := strings.TrimSpace(m.input.Value())
-			if text == "" {
+			raw := m.input.Value()
+			if strings.TrimSpace(raw) == "" {
 				if len(m.sessions) == 0 {
 					m.logSystem("No sessions available")
 					return m, nil
@@ -1450,14 +1725,16 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, attachSessionCmd(m.api, m.sessions[m.selected].ID, m.extCh)
 			}
 			m.input.SetValue("")
+			m.syncInputChrome()
 			m.historyPos = 0
 			m.historyLive = ""
-			if strings.HasPrefix(text, "/") {
-				return m, m.handleCommand(text)
+			commandText := strings.TrimSpace(raw)
+			if !strings.Contains(raw, "\n") && strings.HasPrefix(commandText, "/") {
+				return m, m.handleCommand(commandText)
 			}
 			// Push to input history (deduplicate consecutive identical entries).
-			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != text {
-				m.inputHistory = append(m.inputHistory, text)
+			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != raw {
+				m.inputHistory = append(m.inputHistory, raw)
 				if len(m.inputHistory) > 100 {
 					m.inputHistory = m.inputHistory[1:]
 				}
@@ -1466,18 +1743,19 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logSystem("Connect to a session first (select and press Enter)")
 				return m, nil
 			}
-			return m, sendWSCmd(m, map[string]any{"type": "prompt", "text": text})
+			return m, sendWSCmd(m, map[string]any{"type": "prompt", "text": raw})
 
-		case "alt+enter":
-			text := strings.TrimSpace(m.input.Value())
-			if text == "" {
+		case "alt+enter", string([]rune{altEnterPrivate}):
+			raw := m.input.Value()
+			if strings.TrimSpace(raw) == "" {
 				return m, nil
 			}
 			m.input.SetValue("")
+			m.syncInputChrome()
 			m.historyPos = 0
 			m.historyLive = ""
-			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != text {
-				m.inputHistory = append(m.inputHistory, text)
+			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != raw {
+				m.inputHistory = append(m.inputHistory, raw)
 				if len(m.inputHistory) > 100 {
 					m.inputHistory = m.inputHistory[1:]
 				}
@@ -1486,7 +1764,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logSystem("Connect to a session first (select and press Enter)")
 				return m, nil
 			}
-			return m, clonePromptCmd(m.api, m.activeSessionID, text)
+			return m, clonePromptCmd(m.api, m.activeSessionID, raw)
 		}
 	}
 
@@ -1528,11 +1806,17 @@ func (m *tuiModel) View() string {
 	activeStyle := lipgloss.NewStyle().Foreground(colAccent)
 
 	// Sessions panel is ~19% of terminal width (≈ 2/3 of previous 28%).
-	leftW := max(22, m.width*19/100)
-	rightW := m.width - leftW
-	if rightW < 50 {
-		rightW = 50
-		leftW = m.width - rightW
+	var leftW, rightW int
+	if m.hideSidebar {
+		leftW = 0
+		rightW = m.width
+	} else {
+		leftW = max(22, m.width*19/100)
+		rightW = m.width - leftW
+		if rightW < 50 {
+			rightW = 50
+			leftW = m.width - rightW
+		}
 	}
 
 	// ── top bar (flat: one or two text lines + full-width separator) ──────────
@@ -1608,19 +1892,25 @@ func (m *tuiModel) View() string {
 	if bodyH < 18 {
 		thinkingH = 3
 	}
-	inputH := 3
+	inputMaxH := max(3, bodyH-detailsH-thinkingH-6)
+	inputEditorH := m.promptEditorHeight(inputMaxH - 1)
+	m.input.SetHeight(inputEditorH)
+	inputH := inputEditorH + 1
 	feedH := max(6, bodyH-detailsH-thinkingH-inputH)
 
 	// ── left panel (sessions) ─────────────────────────────────────────────────
-	sessionsAvailH := max(3, bodyH-1)
-	listW := max(20, leftW-4) // inner content width for separator lines
-	sessionsHeader := styleAccent.Render(" sessions")
-	if m.missionSummary != "" {
-		sessionsHeader += styleMuted.Render("  " + trimForLine(m.missionSummary, leftW-16))
+	var left string
+	if !m.hideSidebar {
+		sessionsAvailH := max(3, bodyH-1)
+		listW := max(20, leftW-4) // inner content width for separator lines
+		sessionsHeader := styleAccent.Render(" sessions")
+		if m.missionSummary != "" {
+			sessionsHeader += styleMuted.Render("  " + trimForLine(m.missionSummary, leftW-16))
+		}
+		left = panelStyle.Width(leftW - 2).Height(bodyH).Render(
+			clampLines(sessionsHeader+"\n"+m.renderMissionControl(selectedStyle, activeStyle, sessionsAvailH, listW), bodyH),
+		)
 	}
-	left := panelStyle.Width(leftW - 2).Height(bodyH).Render(
-		clampLines(sessionsHeader+"\n"+m.renderMissionControl(selectedStyle, activeStyle, sessionsAvailH, listW), bodyH),
-	)
 
 	// ── right panels ──────────────────────────────────────────────────────────
 	detailContentW := max(20, rightW-4)
@@ -1663,24 +1953,27 @@ func (m *tuiModel) View() string {
 		thinkingHeader + "\n" + clampLines(thinkingBody, max(1, thinkingH-1)),
 	)
 
-	var promptPrefix string
 	var hint string
 	if m.activeSessionID != "" {
-		promptPrefix = styleAccent.Render(" ❯ ")
-		hint = "Enter=send(queue)  ·  Alt+Enter=fork send  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
+		hint = "Enter=send(queue)  ·  Shift+Enter=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
 	} else {
-		promptPrefix = styleMuted.Render(" ❯ ")
-		hint = "Enter=connect  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
+		hint = "Enter=connect  ·  Shift+Enter=new line  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
 	}
 	if m.isThinking {
 		hint += "  ·  agent running"
 	}
+	m.syncInputChrome()
 	inputBox := panelStyle.Width(rightW - 2).Height(inputH).Render(
-		promptPrefix + m.input.View() + "\n" + styleMuted.Render("  "+hint),
+		m.input.View() + "\n" + styleMuted.Render("  "+hint),
 	)
 
 	right := lipgloss.JoinVertical(lipgloss.Left, detailBox, feedBox, thinkingBox, inputBox)
-	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	var mainRow string
+	if m.hideSidebar {
+		mainRow = right
+	} else {
+		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	}
 
 	parts := []string{topBar}
 	parts = append(parts, banners...)
@@ -1800,7 +2093,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  up/down=scroll chat  ctrl+up/down=prompt history  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -2104,6 +2397,56 @@ func (m *tuiModel) turnHeader(role string, roleStyle lipgloss.Style, ts string) 
 	return roleStyle.Render(bar) + styleMuted.Render(" "+ts)
 }
 
+func (m *tuiModel) renderChatBubble(role, ts, text string, border lipgloss.Color, alignRight bool) string {
+	maxBubbleWidth := max(28, min(m.chatWidth()-6, m.chatWidth()*4/5))
+	header := lipgloss.NewStyle().
+		Foreground(colMuted).
+		Bold(true).
+		Render(role) + styleMuted.Render("  "+ts)
+	body := m.renderRichTextBlock(text, maxBubbleWidth-4, false)
+	bubble := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1).
+		MaxWidth(maxBubbleWidth).
+		Render(header + "\n" + body)
+	if alignRight {
+		return lipgloss.NewStyle().Width(m.chatWidth()).Align(lipgloss.Right).Render(bubble)
+	}
+	return bubble
+}
+
+func (m *tuiModel) renderToolChatBubble(role, ts, meta, content string, border lipgloss.Color, alignRight bool) string {
+	maxBubbleWidth := max(28, min(m.chatWidth()-6, m.chatWidth()*4/5))
+	header := lipgloss.NewStyle().
+		Foreground(colMuted).
+		Bold(true).
+		Render(role) + styleMuted.Render("  "+ts)
+	body := m.renderMarkdownBlock(meta, maxBubbleWidth-4, false)
+	if strings.TrimSpace(content) != "" {
+		body += "\n\n" + m.renderRichTextBlock(content, maxBubbleWidth-4, true)
+	}
+	bubble := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1).
+		MaxWidth(maxBubbleWidth).
+		Render(header + "\n" + body)
+	if alignRight {
+		return lipgloss.NewStyle().Width(m.chatWidth()).Align(lipgloss.Right).Render(bubble)
+	}
+	return bubble
+}
+
+func (m *tuiModel) renderFeedSection(title string, titleStyle lipgloss.Style, body string) string {
+	titleLine := titleStyle.Render(" " + title + " ")
+	block := body
+	if strings.TrimSpace(block) == "" {
+		block = styleMuted.Render("  (empty)")
+	}
+	return titleLine + "\n" + block
+}
+
 // ── renderMessage ─────────────────────────────────────────────────────────────
 
 func (m *tuiModel) renderMessage(msg WSMessage) {
@@ -2119,16 +2462,12 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 		if m.agentBlockIdx >= 0 && m.agentBlockIdx < len(m.logs) {
 			m.agentBlockText += d.Text
-			hdr := m.turnHeader("assistant", styleAccent, m.agentBlockTime.Format("15:04"))
-			body := m.renderRichTextBlock(m.agentBlockText, w, false)
-			m.logs[m.agentBlockIdx] = hdr + "\n" + body
+			m.logs[m.agentBlockIdx] = m.renderChatBubble("assistant", m.agentBlockTime.Format("15:04"), m.agentBlockText, colAccent, false)
 		} else {
 			m.agentBlockIdx = len(m.logs)
 			m.agentBlockTime = time.Now()
 			m.agentBlockText = d.Text
-			hdr := m.turnHeader("assistant", styleAccent, tsStr)
-			body := m.renderRichTextBlock(d.Text, w, false)
-			m.logs = append(m.logs, hdr+"\n"+body)
+			m.logs = append(m.logs, m.renderChatBubble("assistant", tsStr, d.Text, colAccent, false))
 			if len(m.logs) > 4000 {
 				m.logs = m.logs[len(m.logs)-4000:]
 				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
@@ -2159,9 +2498,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Text string `json:"text"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			hdr := m.turnHeader("you", styleCyan, tsStr)
-			body := styleCyan.Render(wrapWords(d.Text, w, ""))
-			m.log(hdr + "\n" + body)
+			m.log(m.renderChatBubble("you", tsStr, d.Text, colCyan, true))
 			m.isThinking = true
 			m.pushThinking("prompt sent")
 		}
@@ -2169,34 +2506,36 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	case "tool_call":
 		var d WSToolCall
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log(styleMuted.Render("  --- tool call ---"))
-			icon, iconCol := toolKindIcon(d.Kind)
-			iconSty := lipgloss.NewStyle().Foreground(iconCol)
-
-			// Status determines the leading sigil and colour.
-			var sigil string
-			var sigilSty lipgloss.Style
-			switch d.Status {
-			case "success", "done":
-				sigil, sigilSty = "✓", styleGreen
-			case "error":
-				sigil, sigilSty = "✗", styleRed
-			default: // pending / running
-				sigil, sigilSty = icon, iconSty
+			// Client-side cache: merge kind/title from previous events for the
+			// same tool call ID so history replay also shows correct names.
+			if d.ToolCallID != "" {
+				if cached, ok := m.toolCallCache[d.ToolCallID]; ok {
+					if d.Kind == "" {
+						d.Kind = cached.Kind
+					}
+					if d.Title == "" {
+						d.Title = cached.Title
+					}
+				}
+				entry := m.toolCallCache[d.ToolCallID]
+				if d.Kind != "" {
+					entry.Kind = d.Kind
+				}
+				if d.Title != "" {
+					entry.Title = d.Title
+				}
+				m.toolCallCache[d.ToolCallID] = entry
 			}
-
-			titleStr := trimForLine(d.Title, w-14)
-			kindLabel := styleMuted.Render("  " + d.Kind)
-			titleLine := "  " + sigilSty.Render(sigil) + " " + styleText.Render(titleStr) + kindLabel + styleMuted.Render("  ["+d.Status+"]")
-
-			if d.Content == "" {
-				// Inline tool — single compact line.
-				m.log(titleLine)
-			} else {
-				// Block tool — title then content behind a coloured │ rail.
-				m.log(titleLine)
-				m.log(m.renderRichTextBlock(d.Content, w, true))
+			toolName := defaultString(d.Kind, "tool")
+			callTitle := defaultString(d.Title, toolName)
+			status := defaultString(d.Status, "running")
+			icon, _ := toolKindIcon(toolName)
+			metaParts := []string{
+				fmt.Sprintf("**Tool:** `%s`", toolName),
+				fmt.Sprintf("**Call:** %s %s", icon, callTitle),
+				fmt.Sprintf("**Status:** `%s`", status),
 			}
+			m.log(m.renderToolChatBubble("assistant · tool", tsStr, strings.Join(metaParts, "\n"), d.Content, colOrange, false))
 			m.isThinking = true
 			m.pushThinking("tool: " + trimForLine(defaultString(d.Title, d.Kind), 70))
 		}
@@ -2204,8 +2543,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	case "tool_result":
 		var d WSToolResult
 		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
-			m.log(styleMuted.Render("  --- tool result ---"))
-			m.log(m.renderRichTextBlock(d.Content, w, true))
+			m.log(m.renderFeedSection("tool result", styleGreen, m.renderRichTextBlock(d.Content, w, true)))
 			m.pushThinking("tool result")
 		}
 
@@ -2243,14 +2581,13 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			PRURL      string `json:"prUrl"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			hdr := m.turnHeader("done", styleGreen, tsStr)
-			entry := "\n" + hdr
+			entry := m.renderFeedSection("run complete", styleGreen, styleGreen.Render("  ✓ finished"))
 			if d.StopReason != "" && d.StopReason != "end_turn" {
-				entry += "\n" + styleMuted.Render("   "+d.StopReason)
+				entry += "\n" + styleMuted.Render("  reason: "+d.StopReason)
 			}
 			m.log(entry)
 			if d.PRURL != "" {
-				m.log("   " + styleCyan.Render("PR: ") + d.PRURL)
+				m.log(styleCyan.Render("  PR: ") + d.PRURL)
 			}
 			notifBody := m.sessionDisplayName()
 			if d.StopReason != "" {
@@ -2268,7 +2605,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Status string `json:"status"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil && d.Status != "" {
-			m.log(styleMuted.Render("  ◦ status: " + d.Status))
+			m.log(m.renderFeedSection("status", styleMuted, styleMuted.Render("  ◦ "+d.Status)))
 			m.pushThinking("status: " + d.Status)
 			switch strings.ToLower(d.Status) {
 			case "working", "running", "thinking", "starting", "respawning":
@@ -2281,13 +2618,13 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	case "error":
 		var d WSError
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log("  " + styleRed.Render("error") + styleMuted.Render("  "+d.Message))
+			m.log(m.renderFeedSection("error", styleRed, styleRed.Render("  ✗ ")+styleText.Render(d.Message)))
 			m.isThinking = false
 			m.pushThinking("error: " + trimForLine(d.Message, 70))
 		}
 	case "interrupted":
 		m.isThinking = false
-		m.log(styleMuted.Render("  · interrupted"))
+		m.log(m.renderFeedSection("interrupt", styleMuted, styleMuted.Render("  · interrupted")))
 	}
 }
 
@@ -2356,7 +2693,10 @@ func (m *tuiModel) renderMarkdownBlock(text string, width int, toolOutput bool) 
 	var out []string
 	inCode := false
 	codeLang := ""
-	codeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("251")).Background(lipgloss.Color("236"))
+	codeStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("251")).
+		Background(lipgloss.Color("236")).
+		Padding(0, 1)
 	for i := 0; i < maxLines; i++ {
 		line := lines[i]
 		trim := strings.TrimSpace(line)
@@ -2365,7 +2705,10 @@ func (m *tuiModel) renderMarkdownBlock(text string, width int, toolOutput bool) 
 			inCode = !inCode
 			codeLang = strings.TrimSpace(strings.TrimPrefix(trim, "```"))
 			if inCode && codeLang != "" {
-				out = append(out, styleMuted.Render("code: "+codeLang))
+				out = append(out, styleMuted.Render("  ┌ code: "+codeLang))
+			}
+			if !inCode {
+				out = append(out, styleMuted.Render("  └"))
 			}
 			continue
 		}
@@ -2446,31 +2789,79 @@ func (m *tuiModel) applyInlineMarkdown(line string) string {
 }
 
 func (m *tuiModel) renderDiffBlock(diff string, width int) string {
+	// Expand tabs to 4 spaces so that lipgloss.Width and terminal rendering agree.
+	diff = strings.ReplaceAll(diff, "\t", "    ")
 	lines := strings.Split(strings.ReplaceAll(diff, "\r\n", "\n"), "\n")
 	maxLines := len(lines)
 	if m.compactBlocks {
 		maxLines = min(maxLines, 24)
 	}
 	var out []string
+	leftWidth := max(12, (width-5)/2)
+	rightWidth := max(12, width-leftWidth-3)
+	flushPaired := func(left, right []string) {
+		rows := max(len(left), len(right))
+		for i := 0; i < rows; i++ {
+			var lText, rText string
+			if i < len(left) {
+				lText = styleRed.Render(" - " + trimForLine(left[i], max(6, leftWidth-3)))
+			}
+			if i < len(right) {
+				rText = styleGreen.Render(" + " + trimForLine(right[i], max(6, rightWidth-3)))
+			}
+			if lText == "" {
+				lText = styleMuted.Render("   ")
+			}
+			if rText == "" {
+				rText = styleMuted.Render("   ")
+			}
+			out = append(out, padToWidth(lText, leftWidth)+styleSep.Render(" │ ")+padToWidth(rText, rightWidth))
+		}
+	}
+	var pendingLeft []string
+	var pendingRight []string
+	flushPending := func() {
+		if len(pendingLeft) == 0 && len(pendingRight) == 0 {
+			return
+		}
+		flushPaired(pendingLeft, pendingRight)
+		pendingLeft = nil
+		pendingRight = nil
+	}
 	for i := 0; i < maxLines; i++ {
 		l := lines[i]
 		switch {
 		case strings.HasPrefix(l, "diff --git"):
-			out = append(out, styleAccent.Render("▌ file "+trimForLine(strings.TrimPrefix(l, "diff --git "), max(12, width-7))))
+			flushPending()
+			out = append(out, styleAccent.Render("▌ split diff  "+trimForLine(strings.TrimPrefix(l, "diff --git "), max(12, width-14))))
 		case strings.HasPrefix(l, "index "):
+			flushPending()
 			out = append(out, styleMuted.Render("  "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "@@"):
+			flushPending()
 			out = append(out, styleCyan.Render("┃ "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "+++"), strings.HasPrefix(l, "---"):
+			flushPending()
 			out = append(out, styleViolet.Render("│ "+trimForLine(l, max(12, width-2))))
 		case strings.HasPrefix(l, "+"):
-			out = append(out, styleGreen.Render("┃ + "+trimForLine(strings.TrimPrefix(l, "+"), max(12, width-4))))
+			pendingRight = append(pendingRight, strings.TrimPrefix(l, "+"))
 		case strings.HasPrefix(l, "-"):
-			out = append(out, styleRed.Render("┃ - "+trimForLine(strings.TrimPrefix(l, "-"), max(12, width-4))))
+			pendingLeft = append(pendingLeft, strings.TrimPrefix(l, "-"))
+		case strings.HasPrefix(l, " "):
+			flushPending()
+			body := trimForLine(strings.TrimPrefix(l, " "), max(6, min(leftWidth, rightWidth)-3))
+			leftCell := styleMuted.Render("   " + body)
+			rightCell := styleMuted.Render("   " + body)
+			out = append(out, padToWidth(leftCell, leftWidth)+styleSep.Render(" │ ")+padToWidth(rightCell, rightWidth))
+		case strings.HasPrefix(l, "\\ No newline at end of file"):
+			flushPending()
+			out = append(out, styleMuted.Render("  "+trimForLine(l, max(12, width-2))))
 		default:
+			flushPending()
 			out = append(out, styleText.Render("┃   "+trimForLine(l, max(12, width-4))))
 		}
 	}
+	flushPending()
 	if maxLines < len(lines) {
 		out = append(out, styleMuted.Render(fmt.Sprintf("[+%d diff lines]", len(lines)-maxLines)))
 	}
@@ -2517,14 +2908,21 @@ func (m *tuiModel) sessionDisplayName() string {
 // ── layout helpers ────────────────────────────────────────────────────────────
 
 func (m *tuiModel) resize() {
-	leftW := max(22, m.width*19/100)
-	rightW := m.width - leftW
-	if rightW < 50 {
-		rightW = 50
-		leftW = m.width - rightW
+	var leftW, rightW int
+	if m.hideSidebar {
+		leftW = 0
+		rightW = m.width
+	} else {
+		leftW = max(22, m.width*19/100)
+		rightW = m.width - leftW
+		if rightW < 50 {
+			rightW = 50
+			leftW = m.width - rightW
+		}
 	}
 	vw := max(24, rightW-8)
 	m.viewport.Width = vw
+	m.input.SetWidth(max(18, rightW-8))
 	// Viewport height is set in View() where the actual banner height is known.
 	m.rebuildViewport()
 }
@@ -2544,9 +2942,9 @@ func (m *tuiModel) renderViewportContent() string {
 	for _, entry := range m.logs {
 		lines := strings.Split(entry, "\n")
 		for _, line := range lines {
-			line = stripANSI(line)
 			out = append(out, bg.Render(padToWidth(line, w)))
 		}
+		out = append(out, bg.Render(padToWidth("", w)))
 	}
 	return strings.Join(out, "\n")
 }
@@ -2588,12 +2986,109 @@ func (m *tuiModel) log(s string) {
 	}
 }
 
+func (m *tuiModel) syncInputChrome() {
+	promptStyle := lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	if m.activeSessionID == "" {
+		promptStyle = lipgloss.NewStyle().Foreground(colMuted).Bold(true)
+	}
+	m.input.Prompt = "❯ "
+	m.input.FocusedStyle.Prompt = promptStyle
+	m.input.BlurredStyle.Prompt = promptStyle
+	m.input.FocusedStyle.Text = lipgloss.NewStyle().Foreground(colText)
+	m.input.BlurredStyle.Text = lipgloss.NewStyle().Foreground(colText)
+	m.input.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+	m.input.BlurredStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+}
+
+func promptVisualLineCount(text string, width int) int {
+	width = max(1, width)
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return 1
+	}
+	total := 0
+	for _, line := range lines {
+		lineWidth := lipgloss.Width(line)
+		if lineWidth == 0 {
+			total++
+			continue
+		}
+		total += max(1, (lineWidth+width-1)/width)
+	}
+	return max(1, total)
+}
+
+func (m *tuiModel) promptEditorHeight(maxRows int) int {
+	maxRows = max(1, maxRows)
+	// Use the textarea's actual content width so line-count matches its wrapping.
+	usableWidth := max(8, m.input.Width())
+	content := m.input.Value()
+	if content == "" {
+		content = m.input.Placeholder
+	}
+	return min(maxRows, max(1, promptVisualLineCount(content, usableWidth)))
+}
+
+func inputRowCol(value string, pos int) (int, int) {
+	runes := []rune(value)
+	pos = clamp(pos, 0, len(runes))
+	row := 0
+	col := 0
+	for i := 0; i < pos; i++ {
+		if runes[i] == '\n' {
+			row++
+			col = 0
+			continue
+		}
+		col++
+	}
+	return row, col
+}
+
+func inputAbsolutePosition(value string, row, col int) int {
+	lines := strings.Split(value, "\n")
+	if len(lines) == 0 {
+		return 0
+	}
+	row = clamp(row, 0, len(lines)-1)
+	pos := 0
+	for i := 0; i < row; i++ {
+		pos += len([]rune(lines[i])) + 1
+	}
+	lineRunes := []rune(lines[row])
+	col = clamp(col, 0, len(lineRunes))
+	return pos + col
+}
+
+func (m *tuiModel) inputCursorPosition() int {
+	value := m.input.Value()
+	lines := strings.Split(value, "\n")
+	row := clamp(m.input.Line(), 0, max(0, len(lines)-1))
+	col := m.input.LineInfo().CharOffset
+	if len(lines) == 0 {
+		return 0
+	}
+	col = clamp(col, 0, len([]rune(lines[row])))
+	return inputAbsolutePosition(value, row, col)
+}
+
+func (m *tuiModel) setInputValueAndCursor(value string, pos int) {
+	m.input.Reset()
+	m.input.SetValue(value)
+	remaining := len([]rune(value)) - clamp(pos, 0, len([]rune(value)))
+	for i := 0; i < remaining; i++ {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		_ = cmd
+	}
+}
+
 func (m *tuiModel) insertAtCursor(s string) {
 	if s == "" {
 		return
 	}
 	v := []rune(m.input.Value())
-	pos := m.input.Position()
+	pos := m.inputCursorPosition()
 	if pos < 0 {
 		pos = 0
 	}
@@ -2602,8 +3097,351 @@ func (m *tuiModel) insertAtCursor(s string) {
 	}
 	ins := []rune(s)
 	newVal := string(v[:pos]) + string(ins) + string(v[pos:])
-	m.input.SetValue(newVal)
-	m.input.SetCursor(pos + len(ins))
+	m.setInputValueAndCursor(newVal, pos+len(ins))
+}
+
+func (m *tuiModel) insertPromptTokenAtCursor(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	runes := []rune(m.input.Value())
+	pos := m.inputCursorPosition()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+	prefix := ""
+	suffix := ""
+	if pos > 0 && !isSpacingRune(runes[pos-1]) {
+		prefix = " "
+	}
+	if pos < len(runes) && !isSpacingRune(runes[pos]) {
+		suffix = " "
+	}
+	m.insertAtCursor(prefix + token + suffix)
+}
+
+var errNoClipboardImage = errors.New("no image found in clipboard")
+
+func pasteClipboardCmd() tea.Cmd {
+	return func() tea.Msg {
+		insert, note, err := clipboardPasteInsertion()
+		return clipboardPasteMsg{insert: insert, note: note, err: err}
+	}
+}
+
+func clipboardPasteInsertion() (string, string, error) {
+	if token, note, err := clipboardImagePromptToken(); err == nil {
+		return token, note, nil
+	} else if err != nil && !errors.Is(err, errNoClipboardImage) {
+		// Fall back to text clipboard handling below.
+	}
+
+	text, err := readClipboardText()
+	if err != nil {
+		return "", "", err
+	}
+	if token, note, ok := clipboardTextPromptInsert(text); ok {
+		return token, note, nil
+	}
+	text = strings.TrimRight(text, "\r\n")
+	if strings.TrimSpace(text) == "" {
+		return "", "", fmt.Errorf("clipboard is empty")
+	}
+	return text, "Pasted clipboard text", nil
+}
+
+func clipboardImagePromptToken() (string, string, error) {
+	data, err := readClipboardImage()
+	if err != nil {
+		return "", "", err
+	}
+	path, err := saveClipboardImage(data)
+	if err != nil {
+		return "", "", err
+	}
+	return "@" + path, "Attached clipboard image " + homeTildePath(path), nil
+}
+
+func readClipboardImage() ([]byte, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return readDarwinClipboardImage()
+	case "linux":
+		return readLinuxClipboardImage()
+	default:
+		return nil, errNoClipboardImage
+	}
+}
+
+func readDarwinClipboardImage() ([]byte, error) {
+	swiftPath, err := exec.LookPath("swift")
+	if err != nil {
+		return nil, errNoClipboardImage
+	}
+	script := `import AppKit
+let pasteboard = NSPasteboard.general
+guard let image = NSImage(pasteboard: pasteboard) else { exit(2) }
+guard let tiff = image.tiffRepresentation,
+      let rep = NSBitmapImageRep(data: tiff),
+      let png = rep.representation(using: .png, properties: [:]) else { exit(3) }
+FileHandle.standardOutput.write(png)`
+	out, err := exec.Command(swiftPath, "-e", script).Output()
+	if err != nil || len(out) == 0 {
+		return nil, errNoClipboardImage
+	}
+	return out, nil
+}
+
+func readLinuxClipboardImage() ([]byte, error) {
+	candidates := [][]string{
+		{"wl-paste", "--no-newline", "--type", "image/png"},
+		{"xclip", "-selection", "clipboard", "-t", "image/png", "-o"},
+	}
+	for _, candidate := range candidates {
+		path, err := exec.LookPath(candidate[0])
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(path, candidate[1:]...).Output()
+		if err == nil && len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, errNoClipboardImage
+}
+
+func saveClipboardImage(data []byte) (string, error) {
+	dir := filepath.Join(os.TempDir(), "orbitor-pasted")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("clipboard-image-%d.png", time.Now().UnixNano()))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func readClipboardText() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		path, err := exec.LookPath("pbpaste")
+		if err != nil {
+			return "", fmt.Errorf("pbpaste not available")
+		}
+		out, err := exec.Command(path).Output()
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	case "linux":
+		candidates := [][]string{
+			{"wl-paste", "--no-newline"},
+			{"xclip", "-selection", "clipboard", "-o"},
+			{"xsel", "--clipboard", "--output"},
+		}
+		for _, candidate := range candidates {
+			path, err := exec.LookPath(candidate[0])
+			if err != nil {
+				continue
+			}
+			out, err := exec.Command(path, candidate[1:]...).Output()
+			if err == nil {
+				return string(out), nil
+			}
+		}
+		return "", fmt.Errorf("clipboard text command not available")
+	case "windows":
+		path, err := exec.LookPath("powershell")
+		if err != nil {
+			return "", fmt.Errorf("powershell not available")
+		}
+		out, err := exec.Command(path, "-NoProfile", "-Command", "Get-Clipboard").Output()
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	default:
+		return "", fmt.Errorf("clipboard paste not supported on %s", runtime.GOOS)
+	}
+}
+
+func clipboardTextPromptInsert(text string) (string, string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(trimmed, "@") {
+		return trimmed, "Pasted file mention " + trimForLine(trimmed, 80), true
+	}
+	lines := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	if len(lines) == 0 {
+		return "", "", false
+	}
+	tokens := make([]string, 0, len(lines))
+	for _, line := range lines {
+		path, ok := normalizeClipboardFilePath(line)
+		if !ok {
+			return "", "", false
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return "", "", false
+		}
+		tokens = append(tokens, "@"+path)
+	}
+	if len(tokens) == 0 {
+		return "", "", false
+	}
+	note := "Attached file " + homeTildePath(strings.TrimPrefix(tokens[0], "@"))
+	if len(tokens) > 1 {
+		note = fmt.Sprintf("Attached %d files from clipboard paths", len(tokens))
+	}
+	return strings.Join(tokens, " "), note, true
+}
+
+func normalizeClipboardFilePath(raw string) (string, bool) {
+	s := strings.TrimSpace(strings.Trim(raw, `"'`))
+	if s == "" {
+		return "", false
+	}
+	if strings.HasPrefix(s, "@") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "@"))
+	}
+	if strings.HasPrefix(s, "file://") {
+		u, err := url.Parse(s)
+		if err != nil || (u.Host != "" && u.Host != "localhost") {
+			return "", false
+		}
+		s = u.Path
+	}
+	switch {
+	case strings.HasPrefix(s, "~/"):
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
+		}
+		s = filepath.Join(home, strings.TrimPrefix(s, "~/"))
+	case strings.HasPrefix(s, "/"):
+		// already absolute
+	case strings.HasPrefix(s, "./"), strings.HasPrefix(s, "../"):
+		abs, err := filepath.Abs(s)
+		if err != nil {
+			return "", false
+		}
+		s = abs
+	default:
+		if !strings.ContainsRune(s, os.PathSeparator) {
+			return "", false
+		}
+		abs, err := filepath.Abs(s)
+		if err != nil {
+			return "", false
+		}
+		s = abs
+	}
+	return filepath.Clean(s), true
+}
+
+func (m *tuiModel) capturePTTTriggerSnapshot() {
+	if m.pttTriggerCaptured {
+		return
+	}
+	m.pttTriggerCaptured = true
+	m.pttTriggerValue = m.input.Value()
+	m.pttTriggerCursor = m.inputCursorPosition()
+}
+
+func (m *tuiModel) restorePTTTriggerSnapshot() {
+	if !m.pttTriggerCaptured {
+		return
+	}
+	m.setInputValueAndCursor(m.pttTriggerValue, m.pttTriggerCursor)
+	m.pttInsertCursor = m.pttTriggerCursor
+	m.pttInsertValueVersion = m.pttTriggerValue
+}
+
+func (m *tuiModel) resetPTTTrigger() {
+	m.resetPTTSpaceRun()
+	m.pttStarting = false
+	m.pttStreaming = false
+	m.pttReleaseAt = time.Time{}
+	m.pttTriggerCaptured = false
+	m.pttTriggerValue = ""
+	m.pttTriggerCursor = 0
+	m.pttInsertCursor = 0
+	m.pttInsertValueVersion = ""
+	m.pttLiveText = ""
+}
+
+func (m *tuiModel) resetPTTSpaceRun() {
+	if m.pttActive || m.pttBusy || m.pttStarting {
+		return
+	}
+	m.pttSpaceRun = 0
+	m.pttTriggerCaptured = false
+}
+
+func (m *tuiModel) applyDictationText(text string) {
+	text = strings.TrimSpace(text)
+	if m.pttTriggerCaptured {
+		if text == "" {
+			m.restorePTTTriggerSnapshot()
+			m.pttLiveText = ""
+			return
+		}
+		newValue, newCursor := composeDictationValue(m.pttTriggerValue, m.pttTriggerCursor, text)
+		m.setInputValueAndCursor(newValue, newCursor)
+		m.pttInsertCursor = newCursor
+		m.pttInsertValueVersion = newValue
+		m.pttLiveText = text
+		return
+	}
+	if text == "" {
+		return
+	}
+	newValue, newCursor := composeDictationValue(m.input.Value(), m.inputCursorPosition(), text)
+	m.setInputValueAndCursor(newValue, newCursor)
+	m.pttInsertCursor = newCursor
+	m.pttInsertValueVersion = newValue
+	m.pttLiveText = text
+}
+
+func composeDictationValue(value string, cursor int, text string) (string, int) {
+	runes := []rune(value)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	prefix := ""
+	suffix := ""
+	if cursor > 0 {
+		prev := runes[cursor-1]
+		if !isSpacingRune(prev) && !startsWithPunctuation(text) {
+			prefix = " "
+		}
+	}
+	if cursor < len(runes) {
+		next := runes[cursor]
+		if !isSpacingRune(next) && !endsWithPunctuation(text) {
+			suffix = " "
+		}
+	}
+	insert := []rune(prefix + text + suffix)
+	newValue := string(runes[:cursor]) + string(insert) + string(runes[cursor:])
+	return newValue, cursor + len(insert)
+}
+
+func (m *tuiModel) insertDictationAtCursor(text string) {
+	m.applyDictationText(text)
 }
 
 func (m *tuiModel) pushThinking(s string) {
@@ -2806,7 +3644,7 @@ func attachSessionCmd(api *tuiAPIClient, sessionID string, extCh chan tea.Msg) t
 			for {
 				_, payload, err := conn.ReadMessage()
 				if err != nil {
-					extCh <- infoMsg{text: "Session disconnected: " + err.Error()}
+					extCh <- wsDisconnectedMsg{conn: conn, err: err}
 					return
 				}
 				extCh <- wsPayloadMsg{payload: payload}
@@ -2844,12 +3682,23 @@ func tickCmd() tea.Cmd {
 }
 
 func spinnerTickCmd() tea.Cmd {
-	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(spinnerTickInterval, func(t time.Time) tea.Msg {
 		return spinnerTickMsg(t)
 	})
 }
 
 // ── renderMissionControl ──────────────────────────────────────────────────────
+
+// sessionVisualLines returns the number of rendered lines a session occupies
+// in the sessions list (base 4 + 1 per sub-agent when expanded).
+func (m *tuiModel) sessionVisualLines(idx int) int {
+	base := 4
+	s := m.sessions[idx]
+	if m.expandedSessions[s.ID] && len(s.SubAgents) > 0 {
+		return base + len(s.SubAgents)
+	}
+	return base
+}
 
 func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style, availH int, listW int) string {
 	if len(m.sessions) == 0 {
@@ -2858,13 +3707,30 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			styleText.Render("  Press ") + styleCyan.Render("?") + styleText.Render(" for help")
 	}
 
-	linesPerSession := 4 // 3 content lines + 1 separator
-	maxSessions := max(1, availH/linesPerSession)
-	start := 0
-	if m.selected >= maxSessions {
-		start = m.selected - maxSessions + 1
+	// Determine visible window using a line-budget approach so that expanded
+	// sub-agent rows are properly accounted for.
+	selectedLines := m.sessionVisualLines(m.selected)
+	start := m.selected
+	usedLines := selectedLines
+	// Extend upward while there is budget.
+	for start > 0 {
+		prev := m.sessionVisualLines(start - 1)
+		if usedLines+prev > availH {
+			break
+		}
+		start--
+		usedLines += prev
 	}
-	end := min(len(m.sessions), start+maxSessions)
+	// Extend downward while there is budget.
+	end := m.selected + 1
+	for end < len(m.sessions) {
+		next := m.sessionVisualLines(end)
+		if usedLines+next > availH {
+			break
+		}
+		usedLines += next
+		end++
+	}
 
 	var out []string
 	for i := start; i < end; i++ {
@@ -2872,6 +3738,7 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		state := sessionStateLabel(s)
 		isSelected := i == m.selected
 		isActive := s.ID == m.activeSessionID
+		expanded := m.expandedSessions[s.ID]
 
 		prefix := "  "
 		if isSelected {
@@ -2886,6 +3753,16 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		}
 		titleText := defaultString(s.Title, defaultString(s.CurrentPrompt, defaultString(s.LastMessage, "—")))
 		fullPath := homeTildePath(s.WorkingDir)
+
+		// Sub-agent count badge shown on sessions with tracked sub-agents.
+		var subAgentBadge string
+		if n := len(s.SubAgents); n > 0 {
+			if expanded {
+				subAgentBadge = " " + styleCyan.Render(fmt.Sprintf("▾%d", n))
+			} else {
+				subAgentBadge = " " + styleCyan.Render(fmt.Sprintf("▸%d", n))
+			}
+		}
 
 		// Build inline badges for plan/skip modes.
 		var badges string
@@ -2911,7 +3788,7 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		sep := styleSep.Render(strings.Repeat("─", listW))
 		if isSelected {
 			titleLine := trimForLine("  "+titleText, max(10, listW))
-			out = append(out, selectedStyle.Render(topLine), selectedStyle.Render(titleLine), selectedStyle.Render(botLine), sep)
+			out = append(out, selectedStyle.Render(topLine)+subAgentBadge, selectedStyle.Render(titleLine), selectedStyle.Render(botLine), sep)
 		} else {
 			var stateTag string
 			switch state {
@@ -2930,13 +3807,49 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			default:
 				stateTag = stateStyle(state).Render(state)
 			}
+			unreadBadge := ""
+			if m.sessionUnread[s.ID] {
+				unreadBadge = " " + styleYellow.Render("◆")
+			}
 			topLine := prefix + s.ID + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
 			titleLine := styleText.Render(trimForLine("  "+titleText, max(10, listW)))
 			botLine := styleMuted.Render(trimForLine("  "+fullPath, max(10, listW)))
 			if isActive {
 				topLine = activeStyle.Render(prefix+s.ID) + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
 			}
-			out = append(out, trimForLine(topLine, max(10, listW))+badges, titleLine, botLine, sep)
+			out = append(out, trimForLine(topLine, max(10, listW))+badges+subAgentBadge+unreadBadge, titleLine, botLine, sep)
+		}
+
+		// Render sub-agent rows when expanded.
+		if expanded && len(s.SubAgents) > 0 {
+			for j, sa := range s.SubAgents {
+				connector := "├─"
+				if j == len(s.SubAgents)-1 {
+					connector = "└─"
+				}
+				var statusIcon string
+				switch sa.Status {
+				case "completed":
+					statusIcon = styleGreen.Render("✓")
+				case "failed", "error":
+					statusIcon = styleRed.Render("✗")
+				default:
+					statusIcon = styleOrange.Render(spinnerFrames[m.spinnerFrame])
+				}
+				title := sa.Title
+				if title == "" {
+					title = sa.ToolCallID
+				}
+				subLine := styleMuted.Render("  "+connector+" ") + statusIcon + " " + styleText.Render(trimForLine(title, max(6, listW-12)))
+				// Remove the last entry from out (the sep line) and re-append sub-agent row + sep.
+				if len(out) > 0 {
+					out = out[:len(out)-1] // remove previous sep
+				}
+				out = append(out, subLine)
+				if j == len(s.SubAgents)-1 {
+					out = append(out, sep) // restore sep after last sub-agent
+				}
+			}
 		}
 	}
 
@@ -2965,6 +3878,16 @@ func clampLines(s string, n int) string {
 
 // ── small helpers ─────────────────────────────────────────────────────────────
 
+func clamp(v, low, high int) int {
+	if v < low {
+		return low
+	}
+	if v > high {
+		return high
+	}
+	return v
+}
+
 func shortPath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -2979,9 +3902,9 @@ func shortPath(path string) string {
 
 func (m *tuiModel) moveCursorWordLeft() {
 	runes := []rune(m.input.Value())
-	pos := m.input.Position()
+	pos := m.inputCursorPosition()
 	if pos <= 0 {
-		m.input.SetCursor(0)
+		m.setInputValueAndCursor(m.input.Value(), 0)
 		return
 	}
 	if pos > len(runes) {
@@ -2993,15 +3916,15 @@ func (m *tuiModel) moveCursorWordLeft() {
 	for pos > 0 && !isWordBoundaryRune(runes[pos-1]) {
 		pos--
 	}
-	m.input.SetCursor(pos)
+	m.setInputValueAndCursor(m.input.Value(), pos)
 }
 
 func (m *tuiModel) moveCursorWordRight() {
 	runes := []rune(m.input.Value())
-	pos := m.input.Position()
+	pos := m.inputCursorPosition()
 	n := len(runes)
 	if pos >= n {
-		m.input.SetCursor(n)
+		m.setInputValueAndCursor(m.input.Value(), n)
 		return
 	}
 	for pos < n && isWordBoundaryRune(runes[pos]) {
@@ -3010,12 +3933,12 @@ func (m *tuiModel) moveCursorWordRight() {
 	for pos < n && !isWordBoundaryRune(runes[pos]) {
 		pos++
 	}
-	m.input.SetCursor(pos)
+	m.setInputValueAndCursor(m.input.Value(), pos)
 }
 
 func (m *tuiModel) deleteWordBackward() {
 	v := []rune(m.input.Value())
-	pos := m.input.Position()
+	pos := m.inputCursorPosition()
 	if pos <= 0 || len(v) == 0 {
 		return
 	}
@@ -3027,13 +3950,12 @@ func (m *tuiModel) deleteWordBackward() {
 		start--
 	}
 	newVal := string(append(v[:start], v[pos:]...))
-	m.input.SetValue(newVal)
-	m.input.SetCursor(start)
+	m.setInputValueAndCursor(newVal, start)
 }
 
 func (m *tuiModel) deleteWordForward() {
 	v := []rune(m.input.Value())
-	pos := m.input.Position()
+	pos := m.inputCursorPosition()
 	if pos >= len(v) {
 		return
 	}
@@ -3045,32 +3967,57 @@ func (m *tuiModel) deleteWordForward() {
 		end++
 	}
 	newVal := string(append(v[:pos], v[end:]...))
-	m.input.SetValue(newVal)
-	m.input.SetCursor(pos)
+	m.setInputValueAndCursor(newVal, pos)
 }
 
 func (m *tuiModel) deleteToLineStart() {
-	v := []rune(m.input.Value())
-	pos := m.input.Position()
-	if pos <= 0 {
+	value := m.input.Value()
+	pos := m.inputCursorPosition()
+	row, col := inputRowCol(value, pos)
+	if col <= 0 {
 		return
 	}
-	m.input.SetValue(string(v[pos:]))
-	m.input.SetCursor(0)
+	lines := strings.Split(value, "\n")
+	lineRunes := []rune(lines[row])
+	lines[row] = string(lineRunes[col:])
+	m.setInputValueAndCursor(strings.Join(lines, "\n"), inputAbsolutePosition(strings.Join(lines, "\n"), row, 0))
 }
 
 func (m *tuiModel) deleteToLineEnd() {
-	v := []rune(m.input.Value())
-	pos := m.input.Position()
-	if pos >= len(v) {
+	value := m.input.Value()
+	pos := m.inputCursorPosition()
+	row, col := inputRowCol(value, pos)
+	lines := strings.Split(value, "\n")
+	lineRunes := []rune(lines[row])
+	if col >= len(lineRunes) {
 		return
 	}
-	m.input.SetValue(string(v[:pos]))
-	m.input.SetCursor(pos)
+	lines[row] = string(lineRunes[:col])
+	m.setInputValueAndCursor(strings.Join(lines, "\n"), inputAbsolutePosition(strings.Join(lines, "\n"), row, col))
 }
 
 func isWordBoundaryRune(r rune) bool {
-	return r == ' ' || r == '\t' || r == '\n' || r == '/' || r == '\\' || r == ':' || r == '.' || r == '-' || r == '_' || r == ',' || r == ';' || r == '(' || r == ')' || r == '[' || r == ']'
+	return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
+}
+
+func isSpacingRune(r rune) bool {
+	return unicode.IsSpace(r)
+}
+
+func startsWithPunctuation(s string) bool {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) == 0 {
+		return false
+	}
+	return unicode.IsPunct(r[0]) || unicode.IsSymbol(r[0])
+}
+
+func endsWithPunctuation(s string) bool {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) == 0 {
+		return false
+	}
+	return unicode.IsPunct(r[len(r)-1]) || unicode.IsSymbol(r[len(r)-1])
 }
 
 func homeTildePath(path string) string {
@@ -3154,6 +4101,17 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+func formatDurationRounded(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return fmt.Sprintf("%dms", d.Round(10*time.Millisecond).Milliseconds())
+	case d < 10*time.Second:
+		return fmt.Sprintf("%.1fs", d.Round(100*time.Millisecond).Seconds())
+	default:
+		return formatElapsed(d)
+	}
+}
+
 func sessionStateLabel(s WSSessionInfo) string {
 	if s.Status == "starting" {
 		return "starting"
@@ -3191,24 +4149,76 @@ func (m *tuiModel) selectedSessionID() string {
 
 func (m *tuiModel) startPTTCapture() tea.Cmd {
 	return func() tea.Msg {
-		if m.pttBusy || m.pttActive {
-			return sttStartedMsg{err: fmt.Errorf("dictation already active")}
+		if runtime.GOOS == "darwin" && !m.pttDisableNativeLive {
+			m.extCh <- infoMsg{text: "Dictation debug: attempting native live dictation"}
+			msg := m.startDarwinStreamingPTTCapture()
+			if msg.err == nil {
+				return msg
+			}
+			m.extCh <- infoMsg{text: "Dictation debug: native live dictation startup failed: " + msg.err.Error()}
+			legacy := m.startLegacyPTTCapture()
+			legacy.disableNative = true
+			legacy.disableNote = nativeDictationFallbackNote(msg.err)
+			return legacy
 		}
-		if _, err := exec.LookPath("ffmpeg"); err != nil {
-			return sttStartedMsg{err: fmt.Errorf("ffmpeg not found")}
-		}
-		audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("orbitor-stt-%d.wav", time.Now().UnixNano()))
-		cmd := exec.Command("ffmpeg",
-			"-hide_banner", "-loglevel", "error", "-nostdin",
-			"-f", "avfoundation", "-i", ":0",
-			"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-			audioPath,
-		)
-		if err := cmd.Start(); err != nil {
-			return sttStartedMsg{err: err}
-		}
-		return sttStartedMsg{proc: cmd, audioPath: audioPath}
+		return m.startLegacyPTTCapture()
 	}
+}
+
+func (m *tuiModel) startLegacyPTTCapture() sttStartedMsg {
+	if m.pttBusy || m.pttActive {
+		return sttStartedMsg{err: fmt.Errorf("dictation already active")}
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return sttStartedMsg{err: fmt.Errorf("ffmpeg not found")}
+	}
+	audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("orbitor-stt-%d.wav", time.Now().UnixNano()))
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "avfoundation", "-i", ":0",
+		"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+		audioPath,
+	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return sttStartedMsg{err: err}
+	}
+	if err := cmd.Start(); err != nil {
+		return sttStartedMsg{err: err}
+	}
+	return sttStartedMsg{proc: cmd, stdin: stdin, audioPath: audioPath}
+}
+
+func (m *tuiModel) startDarwinStreamingPTTCapture() sttStartedMsg {
+	if m.pttBusy || m.pttActive {
+		return sttStartedMsg{err: fmt.Errorf("dictation already active")}
+	}
+	helperPath, err := ensureDarwinSpeechHelperBinary()
+	if err != nil {
+		return sttStartedMsg{err: err}
+	}
+	m.extCh <- infoMsg{text: "Dictation debug: native helper path " + helperPath}
+	cmd := exec.Command(helperPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return sttStartedMsg{err: err}
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return sttStartedMsg{err: err}
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return sttStartedMsg{err: err}
+	}
+	if err := cmd.Start(); err != nil {
+		return sttStartedMsg{err: err}
+	}
+	if cmd.Process != nil {
+		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper started pid=%d", cmd.Process.Pid)}
+	}
+	go m.consumeDarwinSpeechStream(cmd, stdout, stderr)
+	return sttStartedMsg{proc: cmd, stdin: stdin, streaming: true}
 }
 
 func (m *tuiModel) stopPTTCapture() tea.Cmd {
@@ -3217,26 +4227,412 @@ func (m *tuiModel) stopPTTCapture() tea.Cmd {
 			return nil
 		}
 		m.pttActive = false
+		m.pttSpaceRun = 0
 		proc := m.pttProc
+		procInput := m.pttProcInput
 		audioPath := m.pttAudioPath
 		m.pttProc = nil
+		m.pttProcInput = nil
+		if m.pttStreaming {
+			m.pttReleaseAt = time.Now()
+			if proc != nil && proc.Process != nil {
+				m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: sending stop to native helper pid=%d", proc.Process.Pid)}
+			}
+			if procInput != nil {
+				_, _ = io.WriteString(procInput, "stop\n")
+				_ = procInput.Close()
+			}
+			if proc == nil {
+				return sttResultMsg{err: fmt.Errorf("native dictation process missing")}
+			}
+			return nil
+		}
+		stopStart := time.Now()
 		if proc != nil && proc.Process != nil {
-			_ = proc.Process.Signal(os.Interrupt)
 			done := make(chan error, 1)
 			go func() { done <- proc.Wait() }()
+			if procInput != nil {
+				_, _ = io.WriteString(procInput, "q\n")
+				_ = procInput.Close()
+			}
 			select {
 			case <-done:
-			case <-time.After(2 * time.Second):
-				_ = proc.Process.Kill()
+			case <-time.After(350 * time.Millisecond):
+				_ = proc.Process.Signal(os.Interrupt)
+				select {
+				case <-done:
+				case <-time.After(750 * time.Millisecond):
+					_ = proc.Process.Kill()
+					select {
+					case <-done:
+					case <-time.After(250 * time.Millisecond):
+					}
+				}
 			}
 		}
+		captureStopDelay := time.Since(stopStart)
 		if audioPath == "" {
 			return sttResultMsg{err: fmt.Errorf("no audio captured")}
 		}
+		transcribeStart := time.Now()
 		text, err := transcribeAudioSwift(audioPath)
-		return sttResultMsg{text: text, err: err}
+		return sttResultMsg{
+			text:             text,
+			err:              err,
+			captureStopDelay: captureStopDelay,
+			transcribeDelay:  time.Since(transcribeStart),
+		}
 	}
 }
+
+type darwinSpeechEvent struct {
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser, stderr io.ReadCloser) {
+	defer stdout.Close()
+	defer stderr.Close()
+
+	pid := 0
+	if cmd != nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	stderrDone := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(stderr)
+		stderrDone <- strings.TrimSpace(string(b))
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	terminalSeen := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var evt darwinSpeechEvent
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper emitted non-JSON stdout (pid=%d): %s", pid, truncateDebugText(line, 160))}
+			continue
+		}
+		switch evt.Type {
+		case "ready":
+			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper ready (pid=%d)", pid)}
+			continue
+		case "partial":
+			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native partial chars=%d", len([]rune(strings.TrimSpace(evt.Text))))}
+			m.extCh <- sttPartialMsg{text: evt.Text, external: true}
+		case "final":
+			terminalSeen = true
+			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native final chars=%d", len([]rune(strings.TrimSpace(evt.Text))))}
+			delay := time.Duration(0)
+			if !m.pttReleaseAt.IsZero() {
+				delay = time.Since(m.pttReleaseAt)
+			}
+			m.extCh <- sttResultMsg{text: evt.Text, releaseToTextDelay: delay, external: true}
+		case "error":
+			terminalSeen = true
+			msg := strings.TrimSpace(evt.Message)
+			if msg == "" {
+				msg = "native dictation failed"
+			}
+			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper error event (pid=%d): %s", pid, truncateDebugText(msg, 200))}
+			err := fmt.Errorf("%s", msg)
+			m.extCh <- sttResultMsg{
+				err:           err,
+				disableNative: true,
+				disableNote:   nativeDictationFallbackNote(err),
+				external:      true,
+			}
+		}
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	stderrText := <-stderrDone
+	if scanErr != nil {
+		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native stdout scan error (pid=%d): %s", pid, scanErr)}
+	}
+	if stderrText != "" {
+		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper stderr (pid=%d): %s", pid, truncateDebugText(stderrText, 240))}
+	}
+	if waitErr != nil {
+		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper exit (pid=%d): %s", pid, describeProcessFailure(waitErr))}
+	}
+	if terminalSeen {
+		return
+	}
+	if scanErr != nil {
+		m.extCh <- sttResultMsg{err: scanErr, external: true}
+		return
+	}
+	if waitErr != nil {
+		msg := strings.TrimSpace(stderrText)
+		if msg == "" {
+			msg = waitErr.Error()
+		}
+		err := fmt.Errorf("native dictation failed: %s", msg)
+		m.extCh <- sttResultMsg{
+			err:           err,
+			disableNative: true,
+			disableNote:   nativeDictationFallbackNote(err),
+			external:      true,
+		}
+	}
+}
+
+func nativeDictationFallbackNote(err error) string {
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "abort trap") {
+		return "Native live dictation crashed; falling back to local file transcription for this session. Check microphone and speech permissions in macOS."
+	}
+	return "Native live dictation unavailable; falling back to local file transcription for this session."
+}
+
+func describeProcessFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return err.Error()
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		return err.Error()
+	}
+	switch {
+	case status.Signaled():
+		return fmt.Sprintf("%s (signal=%s, exitstatus=%d)", err.Error(), status.Signal(), status.ExitStatus())
+	case status.Exited():
+		return fmt.Sprintf("%s (exitstatus=%d)", err.Error(), status.ExitStatus())
+	default:
+		return err.Error()
+	}
+}
+
+func truncateDebugText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len([]rune(text)) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit]) + "..."
+}
+
+func ensureDarwinSpeechHelperBinary() (string, error) {
+	if runtime.GOOS != "darwin" {
+		return "", fmt.Errorf("native streaming dictation is only available on macOS")
+	}
+	swiftcPath, err := exec.LookPath("swiftc")
+	if err != nil {
+		return "", fmt.Errorf("swiftc not found")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".orbitor", "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	sourcePath := filepath.Join(dir, "orbitor-native-dictation.swift")
+	binaryPath := filepath.Join(dir, "orbitor-native-dictation")
+
+	compile := false
+	if existing, err := os.ReadFile(sourcePath); err != nil || string(existing) != darwinSpeechHelperSource {
+		if err := os.WriteFile(sourcePath, []byte(darwinSpeechHelperSource), 0o644); err != nil {
+			return "", err
+		}
+		compile = true
+	}
+	if _, err := os.Stat(binaryPath); err != nil {
+		compile = true
+	}
+	if !compile {
+		return binaryPath, nil
+	}
+
+	tmpPath := binaryPath + ".tmp"
+	cmd := exec.Command(swiftcPath, sourcePath, "-o", tmpPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("compile native dictation helper failed: %s", msg)
+	}
+	if err := os.Rename(tmpPath, binaryPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	return binaryPath, nil
+}
+
+const darwinSpeechHelperSource = `import Foundation
+import Speech
+import AVFoundation
+
+struct Event: Encodable {
+    let type: String
+    let text: String?
+    let message: String?
+}
+
+func emit(type: String, text: String? = nil, message: String? = nil) {
+    let event = Event(type: type, text: text, message: message)
+    guard let data = try? JSONEncoder().encode(event),
+          let line = String(data: data, encoding: .utf8) else { return }
+    FileHandle.standardOutput.write(Data(line.utf8))
+    FileHandle.standardOutput.write(Data([0x0a]))
+}
+
+func authLabel(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
+    switch status {
+    case .authorized: return "authorized"
+    case .denied: return "denied"
+    case .restricted: return "restricted"
+    case .notDetermined: return "not-determined"
+    @unknown default: return "unknown"
+    }
+}
+
+final class DictationDriver {
+    private let audioEngine = AVAudioEngine()
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var stopRequested = false
+    private var terminalSent = false
+    private var lastText = ""
+
+    func run() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            while let line = readLine(strippingNewline: true) {
+                if line.lowercased().contains("stop") {
+                    DispatchQueue.main.async {
+                        self.stop()
+                    }
+                    break
+                }
+            }
+        }
+
+        SFSpeechRecognizer.requestAuthorization { status in
+            DispatchQueue.main.async {
+                guard status == .authorized else {
+                    self.fail("speech recognition permission " + authLabel(status))
+                    return
+                }
+                self.startRecognition()
+            }
+        }
+
+        RunLoop.main.run()
+    }
+
+    private func startRecognition() {
+        guard let recognizer = recognizer, recognizer.isAvailable else {
+            fail("speech recognizer unavailable")
+            return
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if #available(macOS 10.15, *) {
+            request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
+        }
+        request.taskHint = .dictation
+        if #available(macOS 13.0, *) {
+            request.addsPunctuation = true
+        }
+        self.request = request
+
+        let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0)
+        let format = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.request?.append(buffer)
+        }
+
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            fail("audio engine start failed: " + error.localizedDescription)
+            return
+        }
+
+        emit(type: "ready")
+
+        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self = self else { return }
+
+            if let result = result {
+                let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    self.lastText = text
+                    if self.stopRequested && result.isFinal {
+                        self.finish(text)
+                        return
+                    }
+                    emit(type: "partial", text: text)
+                }
+            }
+
+            if let error = error {
+                if self.stopRequested {
+                    self.finish(self.lastText)
+                } else {
+                    self.fail(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func stop() {
+        guard !stopRequested else { return }
+        stopRequested = true
+        request?.endAudio()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if !self.terminalSent {
+                self.finish(self.lastText)
+            }
+        }
+    }
+
+    private func finish(_ text: String) {
+        guard !terminalSent else { return }
+        terminalSent = true
+        emit(type: "final", text: text)
+        cleanup()
+        exit(0)
+    }
+
+    private func fail(_ message: String) {
+        guard !terminalSent else { return }
+        terminalSent = true
+        emit(type: "error", message: message)
+        cleanup()
+        exit(1)
+    }
+
+    private func cleanup() {
+        task?.cancel()
+        request = nil
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+    }
+}
+
+DictationDriver().run()
+`
 
 func transcribeAudioSwift(path string) (string, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -3264,13 +4660,28 @@ func transcribeAudioSwift(path string) (string, error) {
 		}
 		return "", fmt.Errorf("%s", msg)
 	}
-	txtPath := outBase + ".txt"
-	defer os.Remove(txtPath)
-	b, err := os.ReadFile(txtPath)
-	if err != nil {
-		return "", fmt.Errorf("dictation output missing: %w", err)
+	txtPaths := []string{
+		outBase + ".txt",
+		path + ".txt",
+		filepath.Join(filepath.Dir(outBase), filepath.Base(path)+".txt"),
 	}
-	return strings.TrimSpace(string(b)), nil
+	var lastErr error
+	for _, txtPath := range txtPaths {
+		if txtPath == "" {
+			continue
+		}
+		b, err := os.ReadFile(txtPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer os.Remove(txtPath)
+		return strings.TrimSpace(string(b)), nil
+	}
+	if lastErr == nil {
+		lastErr = os.ErrNotExist
+	}
+	return "", fmt.Errorf("dictation output missing: %w", lastErr)
 }
 
 func whisperTranscriptionArgs(flavor, modelPath, audioPath, outBase string) []string {
@@ -3459,7 +4870,7 @@ func (m *tuiModel) tryCompleteModel(reverse bool) bool {
 		parts = append(parts, fields[2])
 	}
 	m.input.SetValue(strings.Join(parts, " "))
-	m.input.CursorEnd()
+	m.setInputValueAndCursor(m.input.Value(), len([]rune(m.input.Value())))
 	return true
 }
 

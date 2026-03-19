@@ -266,23 +266,33 @@ type WSError struct {
 	Message string `json:"message"`
 }
 
+// SubAgentInfo tracks a sub-agent tool call (e.g. Task or dispatch_agent)
+// spawned within a session.
+type SubAgentInfo struct {
+	ToolCallID string    `json:"toolCallId"`
+	Title      string    `json:"title"`
+	Status     string    `json:"status"` // "running", "completed", "failed"
+	StartedAt  time.Time `json:"startedAt"`
+}
+
 type WSSessionInfo struct {
-	ID                string    `json:"id"`
-	WorkingDir        string    `json:"workingDir"`
-	ACPSession        string    `json:"acpSessionId"`
-	Status            string    `json:"status"`
-	Backend           string    `json:"backend"`
-	Model             string    `json:"model,omitempty"`
-	SkipPermissions   bool      `json:"skipPermissions"`
-	PlanMode          bool      `json:"planMode"`
-	LastMessage       string    `json:"lastMessage,omitempty"`
-	CurrentTool       string    `json:"currentTool,omitempty"`
-	CurrentPrompt     string    `json:"currentPrompt,omitempty"`
-	IsRunning         bool      `json:"isRunning"`
-	QueueDepth        int       `json:"queueDepth"`
-	PendingPermission bool      `json:"pendingPermission"`
-	Title             string    `json:"title,omitempty"`
-	Summary           string    `json:"summary,omitempty"`
-	PRURL             string    `json:"prUrl,omitempty"`
-	CreatedAt         time.Time `json:"createdAt"`
+	ID                string         `json:"id"`
+	WorkingDir        string         `json:"workingDir"`
+	ACPSession        string         `json:"acpSessionId"`
+	Status            string         `json:"status"`
+	Backend           string         `json:"backend"`
+	Model             string         `json:"model,omitempty"`
+	SkipPermissions   bool           `json:"skipPermissions"`
+	PlanMode          bool           `json:"planMode"`
+	LastMessage       string         `json:"lastMessage,omitempty"`
+	CurrentTool       string         `json:"currentTool,omitempty"`
+	CurrentPrompt     string         `json:"currentPrompt,omitempty"`
+	IsRunning         bool           `json:"isRunning"`
+	QueueDepth        int            `json:"queueDepth"`
+	PendingPermission bool           `json:"pendingPermission"`
+	Title             string         `json:"title,omitempty"`
+	Summary           string         `json:"summary,omitempty"`
+	PRURL             string         `json:"prUrl,omitempty"`
+	CreatedAt         time.Time      `json:"createdAt"`
+	SubAgents         []SubAgentInfo `json:"subAgents,omitempty"`
 }

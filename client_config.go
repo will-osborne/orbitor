@@ -13,6 +13,7 @@ import (
 //
 //	{
 //	  "serverURL": "http://127.0.0.1:8080",
+//	  "listenAddr": "127.0.0.1:8080",
 //	  "defaultBackend": "claude",
 //	  "defaultModel": "claude-sonnet-4-6",
 //	  "skipPermissions": false,
@@ -20,6 +21,7 @@ import (
 //	}
 type ClientConfig struct {
 	ServerURL       string `json:"serverURL"`
+	ListenAddr      string `json:"listenAddr"`
 	DefaultBackend  string `json:"defaultBackend"`
 	DefaultModel    string `json:"defaultModel"`
 	SkipPermissions bool   `json:"skipPermissions"`
@@ -30,8 +32,22 @@ type ClientConfig struct {
 func defaultClientConfig() ClientConfig {
 	return ClientConfig{
 		ServerURL:      "http://127.0.0.1:8080",
-		DefaultBackend: "copilot",
+		ListenAddr:     "127.0.0.1:8080",
+		DefaultBackend: "claude",
 	}
+}
+
+// OrbitorDir returns the path to ~/.orbitor/ and ensures it exists.
+func OrbitorDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".orbitor")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 // ClientConfigPath returns the path to ~/.orbitor/config.json.
@@ -61,8 +77,11 @@ func LoadClientConfig() ClientConfig {
 	if cfg.ServerURL == "" {
 		cfg.ServerURL = "http://127.0.0.1:8080"
 	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = "127.0.0.1:8080"
+	}
 	if cfg.DefaultBackend == "" {
-		cfg.DefaultBackend = "copilot"
+		cfg.DefaultBackend = "claude"
 	}
 	return cfg
 }

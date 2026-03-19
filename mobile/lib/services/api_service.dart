@@ -8,17 +8,24 @@ import '../models/session.dart';
 import '../models/message.dart';
 
 class ApiService extends ChangeNotifier {
-  static const String defaultBaseUrl = 'http://ff00030.tail8466fb.ts.net:8080';
+  static const String defaultBaseUrl = '';
   String _baseUrl;
   String get baseUrl => _baseUrl;
+  bool get isConfigured => _baseUrl.isNotEmpty;
   WebSocketChannel? _eventsChannel;
   StreamSubscription? _eventsSub;
   Timer? _eventsReconnect;
 
   ApiService({String baseUrl = defaultBaseUrl}) : _baseUrl = baseUrl;
 
+  static Future<ApiService> create() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('api_base_url') ?? '';
+    return ApiService(baseUrl: saved);
+  }
+
   void updateBaseUrl(String url) {
-    _baseUrl = url.replaceAll(RegExp(r'/+$'), '');
+    _baseUrl = url.trim().replaceAll(RegExp(r'/+$'), '');
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setString('api_base_url', _baseUrl),
     );
@@ -31,6 +38,7 @@ class ApiService extends ChangeNotifier {
   void Function(GlobalNotificationEvent event)? onGlobalNotification;
 
   void _connectEvents() {
+    if (_baseUrl.isEmpty) return; // not configured yet
     _eventsSub?.cancel();
     _eventsReconnect?.cancel();
     try {
@@ -122,7 +130,10 @@ class ApiService extends ChangeNotifier {
     return Session.fromJson(jsonDecode(resp.body));
   }
 
-  Future<Session> cloneSessionAndPrompt(String sourceSessionId, String text) async {
+  Future<Session> cloneSessionAndPrompt(
+    String sourceSessionId,
+    String text,
+  ) async {
     final resp = await http.post(
       Uri.parse('$_baseUrl/api/sessions/$sourceSessionId/clone-prompt'),
       headers: {'Content-Type': 'application/json'},
@@ -164,7 +175,10 @@ class ApiService extends ChangeNotifier {
     final resp = await http.patch(
       Uri.parse('$_baseUrl/api/sessions/$id'),
       headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'skipPermissions': skipPermissions, 'planMode': planMode}),
+      body: jsonEncode({
+        'skipPermissions': skipPermissions,
+        'planMode': planMode,
+      }),
     );
     if (resp.statusCode != 200) {
       throw Exception('Failed to update session: ${resp.body}');
@@ -180,7 +194,9 @@ class ApiService extends ChangeNotifier {
   }
 
   Future<void> reviveSession(String id) async {
-    final resp = await http.post(Uri.parse('$_baseUrl/api/sessions/$id/revive'));
+    final resp = await http.post(
+      Uri.parse('$_baseUrl/api/sessions/$id/revive'),
+    );
     if (resp.statusCode != 204) {
       throw Exception('Failed to revive session: ${resp.body}');
     }
@@ -197,7 +213,9 @@ class ApiService extends ChangeNotifier {
     // doesn't throw on an expected async response.
     if (resp.statusCode != 200 && resp.statusCode != 202) {
       final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      throw Exception(body['error'] ?? 'Release APK failed (${resp.statusCode})');
+      throw Exception(
+        body['error'] ?? 'Release APK failed (${resp.statusCode})',
+      );
     }
   }
 
@@ -209,7 +227,7 @@ class ApiService extends ChangeNotifier {
     final body = jsonDecode(resp.body) as Map<String, dynamic>;
     return {
       'title': body['title'] as String? ?? '',
-      'summary': body['summary'] as String? ?? ''
+      'summary': body['summary'] as String? ?? '',
     };
   }
 
@@ -224,7 +242,10 @@ class ApiService extends ChangeNotifier {
     return BrowseResult.fromJson(jsonDecode(resp.body));
   }
 
-  Future<void> registerDeviceToken(String token, {String platform = 'android'}) async {
+  Future<void> registerDeviceToken(
+    String token, {
+    String platform = 'android',
+  }) async {
     final resp = await http.post(
       Uri.parse('$_baseUrl/api/device-token'),
       headers: {'Content-Type': 'application/json'},
@@ -312,7 +333,8 @@ class GlobalNotificationEvent {
     }
 
     final metaRaw = data['meta'] ?? data['Meta'];
-    final createdRaw = data['createdAt'] ?? data['created_at'] ?? data['created'];
+    final createdRaw =
+        data['createdAt'] ?? data['created_at'] ?? data['created'];
 
     return GlobalNotificationEvent(
       id: (data['id'] as num?)?.toInt() ?? 0,
@@ -353,7 +375,8 @@ class GlobalNotificationEvent {
     }
 
     final metaRaw = json['meta'] ?? json['Meta'];
-    final createdRaw = json['createdAt'] ?? json['created_at'] ?? json['created'];
+    final createdRaw =
+        json['createdAt'] ?? json['created_at'] ?? json['created'];
 
     return GlobalNotificationEvent(
       id: (json['ID'] as num?)?.toInt() ?? (json['id'] as num?)?.toInt() ?? 0,

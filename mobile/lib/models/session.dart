@@ -1,3 +1,28 @@
+class SubAgentInfo {
+  final String toolCallId;
+  final String title;
+  final String status;
+  final DateTime startedAt;
+
+  SubAgentInfo({
+    required this.toolCallId,
+    this.title = '',
+    this.status = 'running',
+    DateTime? startedAt,
+  }) : startedAt = startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+
+  factory SubAgentInfo.fromJson(Map<String, dynamic> json) {
+    return SubAgentInfo(
+      toolCallId: json['toolCallId'] ?? '',
+      title: json['title'] ?? '',
+      status: json['status'] ?? 'running',
+      startedAt: json['startedAt'] != null
+          ? DateTime.tryParse(json['startedAt'] as String) ?? DateTime.fromMillisecondsSinceEpoch(0)
+          : DateTime.fromMillisecondsSinceEpoch(0),
+    );
+  }
+}
+
 class Session {
   final String id;
   final String workingDir;
@@ -16,6 +41,7 @@ class Session {
   final String summary;
   final String prUrl;
   final DateTime createdAt;
+  final List<SubAgentInfo> subAgents;
 
   Session({
     required this.id,
@@ -35,7 +61,9 @@ class Session {
     this.summary = '',
     this.prUrl = '',
     DateTime? createdAt,
-  }) : createdAt = createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+    List<SubAgentInfo>? subAgents,
+  })  : createdAt = createdAt ?? DateTime.fromMillisecondsSinceEpoch(0),
+        subAgents = subAgents ?? [];
 
   /// Derived agent state for UI display.
   AgentState get agentState {
@@ -68,6 +96,10 @@ class Session {
       createdAt: json['createdAt'] != null
           ? DateTime.tryParse(json['createdAt'] as String) ?? DateTime.fromMillisecondsSinceEpoch(0)
           : DateTime.fromMillisecondsSinceEpoch(0),
+      subAgents: (json['subAgents'] as List<dynamic>?)
+              ?.map((e) => SubAgentInfo.fromJson(e as Map<String, dynamic>))
+              .toList() ??
+          [],
     );
   }
 }

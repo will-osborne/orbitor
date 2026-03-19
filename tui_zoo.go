@@ -335,6 +335,140 @@ func updateZooBots(bots []zooBot, sessions []WSSessionInfo, canvasW, canvasH int
 	return bots
 }
 
+// ── thought bubbles ───────────────────────────────────────────────────────────
+
+func zooThoughtColor(state, behavior string) string {
+	if behavior == "greet" {
+		return "42"
+	}
+	switch state {
+	case "working":
+		return "42"
+	case "waiting-input":
+		return "220"
+	case "error":
+		return "198"
+	case "starting":
+		return "39"
+	default:
+		return "244"
+	}
+}
+
+func zooTrimThought(s string, maxRunes int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " "))
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 3 {
+		return string(r[:maxRunes])
+	}
+	return string(r[:maxRunes-3]) + "..."
+}
+
+// zooThoughtLines returns a label line and optional detail line for the thought bubble.
+// detail may be empty for single-line bubbles.
+func zooThoughtLines(s WSSessionInfo, ticks int) (label, detail string) {
+	switch sessionStateLabel(s) {
+	case "working":
+		if tool := strings.TrimSpace(s.CurrentTool); tool != "" {
+			return "tool:", zooTrimThought(tool, 42)
+		}
+		if prompt := strings.TrimSpace(s.CurrentPrompt); prompt != "" {
+			return "task:", zooTrimThought(prompt, 42)
+		}
+		thoughts := []string{"working hard...", "on it!", "processing...", "deep in thought..."}
+		return thoughts[ticks/35%len(thoughts)], ""
+	case "waiting-input":
+		if tool := strings.TrimSpace(s.CurrentTool); tool != "" {
+			return "need permission:", zooTrimThought(tool, 34)
+		}
+		return "need your input!", ""
+	case "starting":
+		frames := []string{"booting .  ", "booting .. ", "booting ..."}
+		return frames[ticks/8%len(frames)], ""
+	case "error":
+		if msg := strings.TrimSpace(s.LastMessage); msg != "" {
+			return "error:", zooTrimThought(msg, 42)
+		}
+		return "something went wrong", ""
+	default:
+		idle := []string{
+			"ready for action",
+			"standing by...",
+			"taking a breather",
+			"idle thoughts...",
+			"waiting for a task",
+			"watching the stars",
+			"daydreaming...",
+			"all systems nominal",
+			"what's next?",
+		}
+		hash := 0
+		for _, r := range s.ID {
+			hash += int(r)
+		}
+		return idle[(hash+(ticks/50))%len(idle)], ""
+	}
+}
+
+// drawZooThoughtBubble draws a 1- or 2-line thought bubble above the bot at (bx, by).
+// label is always shown; detail adds a second content line when non-empty.
+// Returns false if there is not enough vertical room or the bubble would be degenerate.
+func drawZooThoughtBubble(c *zooCanvas, bx, by, maxWidth int, label, detail, color string) bool {
+	if maxWidth < 10 {
+		return false
+	}
+
+	innerMax := max(6, maxWidth-4)
+	label = zooTrimThought(label, innerMax)
+	if detail != "" {
+		detail = zooTrimThought(detail, innerMax)
+	}
+
+	var contentLines []string
+	if detail != "" {
+		contentLines = []string{label, detail}
+	} else {
+		contentLines = []string{label}
+	}
+
+	innerW := 0
+	for _, l := range contentLines {
+		if w := len([]rune(l)); w > innerW {
+			innerW = w
+		}
+	}
+	bubbleW := innerW + 4 // "( " + content + " )"
+	nLines := len(contentLines)
+
+	// Rows consumed above the bot: top border + nLines content rows + tail = nLines+2
+	if by < nLines+2 {
+		return false
+	}
+
+	// Horizontal: centre over the bot, clamp to canvas.
+	x := bx - (bubbleW-zooBotW)/2
+	if x+bubbleW > c.w {
+		x = c.w - bubbleW
+	}
+	if x < 0 {
+		x = 0
+	}
+
+	topY := by - nLines - 2
+
+	c.write(x, topY, "."+strings.Repeat("-", bubbleW-2)+".", color)
+	for i, line := range contentLines {
+		padded := line + strings.Repeat(" ", innerW-len([]rune(line)))
+		c.write(x, topY+1+i, "( "+padded+" )", color)
+	}
+	tailX := clamp(x+bubbleW/2, x+1, x+bubbleW-2)
+	c.write(tailX, topY+1+nLines, "o", color)
+	return true
+}
+
 // ── updateZoo ─────────────────────────────────────────────────────────────────
 
 // updateZoo handles key events while the zoo view is active.
@@ -446,42 +580,101 @@ func (m *tuiModel) renderZoo() string {
 
 	c := newZooCanvas(canvasW, canvasH)
 
-	// Sky and stars (mobile parity-inspired atmosphere).
-	for i := 0; i < max(8, canvasW/12); i++ {
-		x := (i*11 + (m.spinnerFrame * 3)) % max(1, canvasW-1)
-		y := 1 + ((i * 7) % max(1, canvasH/3))
-		c.write(x, y, "⋆", "63")
-	}
-	if canvasW > 10 {
-		c.write(canvasW-10, 1, "(  )", "220")
-		c.write(canvasW-9, 2, "(__)", "220")
+	// ── sky ──────────────────────────────────────────────────────────────────
+	// Twinkling stars: each cycles through glyphs at its own phase.
+	starGlyphs := []string{"·", "⋆", "✦", "⋆", "*", "⋆", "·", "·"}
+	nStars := max(12, canvasW/7)
+	for i := 0; i < nStars; i++ {
+		sx := (i*17 + 3) % max(1, canvasW)
+		sy := 1 + (i*5)%max(1, canvasH/3)
+		phase := (m.spinnerFrame/4 + i*3) % len(starGlyphs)
+		starColor := "63"
+		if i%7 == 0 {
+			starColor = "147"
+		} else if i%11 == 0 {
+			starColor = "69"
+		}
+		c.write(sx, sy, starGlyphs[phase], starColor)
 	}
 
-	// Floor texture: alternating dot rows.
+	// Moon: pulses between glyphs.
+	moonX := max(0, canvasW-12)
+	moonFaces := []string{"(  )", "(· )", "( ·)", "(··)"}
+	if canvasW > 12 && canvasH > 4 {
+		c.write(moonX, 1, moonFaces[(m.spinnerFrame/25)%len(moonFaces)], "220")
+		c.write(moonX, 2, "(__)", "220")
+	}
+
+	// Shooting star / comet (briefly streaks every ~350 ticks).
+	cometCycle := m.spinnerFrame % 350
+	if cometCycle < 25 && canvasW > 20 && canvasH > 5 {
+		cometX := (cometCycle * canvasW) / 30
+		cometY := 1 + cometCycle/12
+		c.write(cometX, cometY, "━", "255")
+		if cometX > 1 {
+			c.write(cometX-1, cometY, "⋆", "244")
+		}
+		if cometX > 2 {
+			c.write(cometX-2, cometY, "·", "240")
+		}
+	}
+
+	// Drifting cloud.
+	if canvasW > 14 && canvasH > 5 {
+		cloudX := (canvasW + 8 - (m.spinnerFrame/22)%(canvasW+10)) % (canvasW + 10)
+		cloudY := max(1, canvasH/5)
+		if cloudX < canvasW-6 {
+			c.write(cloudX, cloudY, "( ~~~ )", "245")
+			c.write(cloudX+1, cloudY+1, "~~~~~~", "240")
+		}
+	}
+
+	// ── ground ───────────────────────────────────────────────────────────────
+	// Background dot texture.
 	for row := 1; row < canvasH-1; row++ {
 		offset := (row % 2) * 4
 		for col := offset; col < canvasW-1; col += 9 {
 			c.write(col, row, "·", "237")
 		}
 	}
-	// Bottom floor line.
+	// Floor line.
 	for col := 0; col < canvasW; col++ {
-		c.write(col, canvasH-1, "-", "237")
+		c.write(col, canvasH-1, "─", "237")
 	}
-	// Corner plants.
-	if canvasW > 4 {
-		c.write(0, canvasH-2, "^^", "34")
-		c.write(canvasW-2, canvasH-2, "^^", "34")
+	// Animated grass tufts.
+	grassStep := max(7, canvasW/14)
+	for gx := 2; gx < canvasW-2; gx += grassStep {
+		grassPhase := (m.spinnerFrame/18 + gx) % 3
+		grassChars := []string{"⌒⌒", "⌒~", "~⌒"}
+		c.write(gx, canvasH-2, grassChars[grassPhase], "34")
 	}
-	if canvasW > 12 {
-		c.write(canvasW/2-1, canvasH-2, "^^", "34")
+
+	// Server racks with alternating blink indicators.
+	if canvasW > 22 && canvasH > 8 {
+		blinkA, blinkB := "#", "*"
+		if (m.spinnerFrame/10)%2 == 0 {
+			blinkA, blinkB = blinkB, blinkA
+		}
+		c.write(1, canvasH-8, ".---.", "61")
+		c.write(1, canvasH-7, "|###|", "61")
+		c.write(1, canvasH-6, "|["+blinkA+"]|", "61")
+		c.write(1, canvasH-5, "|   |", "61")
+		c.write(1, canvasH-4, "`---'", "61")
+		c.write(canvasW-6, canvasH-8, ".---.", "61")
+		c.write(canvasW-6, canvasH-7, "|###|", "61")
+		c.write(canvasW-6, canvasH-6, "|["+blinkB+"]|", "61")
+		c.write(canvasW-6, canvasH-5, "|   |", "61")
+		c.write(canvasW-6, canvasH-4, "`---'", "61")
 	}
-	// Simple structures.
-	if canvasW > 22 {
-		c.write(2, canvasH-6, "|#|", "61")
-		c.write(2, canvasH-5, "|_|", "61")
-		c.write(canvasW-6, canvasH-6, "|#|", "61")
-		c.write(canvasW-6, canvasH-5, "|_|", "61")
+
+	// Centre tree.
+	if canvasW > 20 && canvasH > 7 {
+		tx := canvasW/2 - 1
+		treeTops := []string{" /\\ ", " ^^ "}
+		c.write(tx-1, canvasH-6, treeTops[(m.spinnerFrame/30)%2], "34")
+		c.write(tx-1, canvasH-5, "/  \\", "34")
+		c.write(tx, canvasH-4, "||", "34")
+		c.write(tx, canvasH-3, "||", "34")
 	}
 
 	// Empty-state message.
@@ -497,8 +690,14 @@ func (m *tuiModel) renderZoo() string {
 		stateFor[s.ID] = sessionStateLabel(s)
 	}
 
+	maxBubbleW := min(50, max(16, canvasW*2/5))
+
 	// Draw each bot. zooBots is in the same order as m.sessions so botIdx == session index.
 	for botIdx, bot := range m.zooBots {
+		if botIdx >= len(m.sessions) {
+			continue
+		}
+		session := m.sessions[botIdx]
 		bx := int(bot.x)
 		by := int(bot.y)
 		// Clamp to safe canvas area.
@@ -508,8 +707,12 @@ func (m *tuiModel) renderZoo() string {
 		if bx > canvasW-zooBotW {
 			bx = canvasW - zooBotW
 		}
-		if by < 1 {
-			by = 1
+		minBotY := 1
+		if canvasH >= 12 {
+			minBotY = 5
+		}
+		if by < minBotY {
+			by = minBotY
 		}
 		if by > canvasH-zooBotH-2 {
 			by = canvasH - zooBotH - 2
@@ -527,11 +730,34 @@ func (m *tuiModel) renderZoo() string {
 			color = "86" // bright green for connected session
 		}
 
-		// Indicator above bot: selection arrow or waiting badge.
-		if isSelected {
-			c.write(bx+2, by-1, " v ", "86")
-		} else if state == "waiting-input" {
-			c.write(bx+2, by-1, "[!]", "220")
+		// Thought bubble.
+		bubbleColor := zooThoughtColor(state, bot.behavior)
+		bubbleLabel, bubbleDetail := zooThoughtLines(session, bot.ticks)
+		if greeting {
+			bubbleLabel = "hey there! o/"
+			bubbleDetail = ""
+		}
+		bubbleDrawn := drawZooThoughtBubble(c, bx, by, maxBubbleW, bubbleLabel, bubbleDetail, bubbleColor)
+
+		// Fallback indicator when no bubble fits.
+		if !bubbleDrawn {
+			if isSelected {
+				c.write(bx+2, by-1, " v ", "86")
+			} else if state == "waiting-input" {
+				c.write(bx+2, by-1, "[!]", "220")
+			}
+		}
+
+		// Working-bot energy sparks.
+		if state == "working" {
+			sparkGlyphs := []string{"✦", "·", "*", "·", "✦", " ", "*", " "}
+			sparkOffsets := [][2]int{{-1, -1}, {zooBotW, 0}, {zooBotW, -1}, {-1, 0}}
+			for si, sp := range sparkOffsets {
+				ch := sparkGlyphs[(bot.ticks/2+si*2)%len(sparkGlyphs)]
+				if ch != " " {
+					c.write(bx+sp[0], by+sp[1], ch, "214")
+				}
+			}
 		}
 
 		moving := !greeting && bot.pauseTicks == 0 &&
@@ -579,7 +805,7 @@ func (m *tuiModel) renderZoo() string {
 			}
 			c.write(bx, by+3, label, labelColor)
 		}
-		if state == "waiting-input" && by+4 < canvasH {
+		if state == "waiting-input" && !bubbleDrawn && by+4 < canvasH {
 			c.write(bx, by+4, "needs input", "220")
 		}
 

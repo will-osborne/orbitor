@@ -57,6 +57,16 @@ type Session struct {
 	summary       string // LLM-generated one-sentence summary
 	prURL         string // first GitHub PR URL detected in agent output
 
+	// toolCallCache remembers kind/title from the initial tool_call event so
+	// that subsequent tool_call_update deltas (which often omit those fields)
+	// can be displayed with the correct tool name and label.
+	toolCallCacheMu sync.Mutex
+	toolCallCache   map[string]WSToolCall // keyed by ToolCallID
+
+	// subAgents tracks active/completed sub-agent tool calls (Task, dispatch_agent, etc.)
+	subAgentsMu sync.RWMutex
+	subAgents   []SubAgentInfo
+
 	// agentTextCh batches frequent agent_text chunks to reduce broadcast frequency
 	agentTextCh    chan string
 	agentTextDone  chan struct{}
@@ -74,6 +84,54 @@ func (s *Session) persistSession() {
 		return
 	}
 	_ = s.store.UpsertSession(s)
+}
+
+// isSubAgentKind returns true if the tool kind indicates a sub-agent invocation
+// (e.g. Claude Code's Task tool or Copilot's dispatch_agent).
+func isSubAgentKind(kind string) bool {
+	k := strings.ToLower(kind)
+	return strings.Contains(k, "task") || strings.Contains(k, "agent")
+}
+
+// updateSubAgent creates or updates a tracked sub-agent entry.
+func (s *Session) updateSubAgent(toolCallID, title, status string) {
+	s.subAgentsMu.Lock()
+	defer s.subAgentsMu.Unlock()
+	for i, sa := range s.subAgents {
+		if sa.ToolCallID == toolCallID {
+			if title != "" {
+				s.subAgents[i].Title = title
+			}
+			if status != "" {
+				s.subAgents[i].Status = status
+			}
+			return
+		}
+	}
+	if status == "" {
+		status = "running"
+	}
+	s.subAgents = append(s.subAgents, SubAgentInfo{
+		ToolCallID: toolCallID,
+		Title:      title,
+		Status:     status,
+		StartedAt:  time.Now(),
+	})
+}
+
+// completeSubAgent marks a sub-agent as completed when its result arrives.
+func (s *Session) completeSubAgent(toolCallID string) {
+	s.subAgentsMu.Lock()
+	defer s.subAgentsMu.Unlock()
+	for i, sa := range s.subAgents {
+		if sa.ToolCallID == toolCallID {
+			if s.subAgents[i].Status == "running" {
+				s.subAgents[i].Status = "completed"
+			}
+			_ = sa
+			return
+		}
+	}
 }
 
 type SessionManager struct {
@@ -140,6 +198,7 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					hub:             NewHub(),
 					terminal:        NewTerminalManager(),
 					permPending:     make(map[string]chan string),
+						toolCallCache:   make(map[string]WSToolCall),
 					store:           store,
 					allocPort:       sm.AllocPort,
 					eventHub:        eventHub,
@@ -231,6 +290,11 @@ func (sm *SessionManager) List() []WSSessionInfo {
 			queueDepth = s.queue.QueueDepth()
 		}
 
+		s.subAgentsMu.RLock()
+		subAgents := make([]SubAgentInfo, len(s.subAgents))
+		copy(subAgents, s.subAgents)
+		s.subAgentsMu.RUnlock()
+
 		out = append(out, WSSessionInfo{
 			ID:                s.ID,
 			WorkingDir:        s.WorkingDir,
@@ -250,6 +314,7 @@ func (sm *SessionManager) List() []WSSessionInfo {
 			Title:             title,
 			Summary:           summary,
 			PRURL:             prURL,
+			SubAgents:         subAgents,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -295,6 +360,7 @@ func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissi
 		hub:             NewHub(),
 		terminal:        NewTerminalManager(),
 		permPending:     make(map[string]chan string),
+		toolCallCache:   make(map[string]WSToolCall),
 		store:           sm.store,
 		allocPort:       sm.AllocPort,
 		eventHub:        sm.EventHub,
@@ -1091,6 +1157,27 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		if err := json.Unmarshal(p.Update, &tc); err != nil {
 			return
 		}
+		// Merge with cached data: tool_call_update events often omit kind/title
+		// since they were already sent in the initial tool_call event. Pull them
+		// from the cache so the TUI always displays the correct tool name.
+		s.toolCallCacheMu.Lock()
+		cached := s.toolCallCache[tc.ToolCallID]
+		if tc.Kind == "" {
+			tc.Kind = cached.Kind
+		}
+		if tc.Title == "" {
+			tc.Title = cached.Title
+		}
+		// Update cache with any non-empty values from this event.
+		if tc.Kind != "" {
+			cached.Kind = tc.Kind
+		}
+		if tc.Title != "" {
+			cached.Title = tc.Title
+		}
+		s.toolCallCache[tc.ToolCallID] = cached
+		s.toolCallCacheMu.Unlock()
+
 		s.summaryMu.Lock()
 		if tc.Status == "pending" || tc.Status == "running" || tc.Status == "" {
 			s.currentTool = tc.Title
@@ -1099,6 +1186,14 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		}
 		s.summaryMu.Unlock()
 		s.persistSession()
+		// Track sub-agent invocations (Task tool, dispatch_agent, etc.)
+		if isSubAgentKind(tc.Kind) {
+			subStatus := tc.Status
+			if subStatus == "pending" || subStatus == "" {
+				subStatus = "running"
+			}
+			s.updateSubAgent(tc.ToolCallID, tc.Title, subStatus)
+		}
 		// Try rich content array first, then fall back to rawInput for context.
 		content := formatToolContent(tc.Content)
 		if content == "" {
@@ -1134,7 +1229,12 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		s.currentTool = ""
 		s.summaryMu.Unlock()
 		s.persistSession()
-		if result := string(tr.Result); result != "" {
+		s.completeSubAgent(tr.ToolCallID)
+		content := formatToolContent(tr.Result)
+		if content == "" && len(tr.Result) > 0 {
+			content = string(tr.Result)
+		}
+		if result := content; result != "" {
 			s.summaryMu.Lock()
 			if s.prURL == "" {
 				if m := prURLRe.FindString(result); m != "" {
@@ -1145,7 +1245,7 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		}
 		resultPayload := WSToolResult{
 			ToolCallID: tr.ToolCallID,
-			Content:    string(tr.Result),
+			Content:    content,
 		}
 		s.hub.Broadcast("tool_result", resultPayload)
 		if s.store != nil {
@@ -1510,7 +1610,13 @@ func formatToolContent(raw json.RawMessage) string {
 				}
 			case "diff":
 				path, _ := item["path"].(string)
-				if path != "" {
+				diffText := extractToolDiffText(item)
+				switch {
+				case path != "" && diffText != "":
+					parts = append(parts, path+"\n"+diffText)
+				case diffText != "":
+					parts = append(parts, diffText)
+				case path != "":
 					parts = append(parts, path)
 				}
 			case "terminal":
@@ -1523,6 +1629,16 @@ func formatToolContent(raw json.RawMessage) string {
 	// Try flat JSON object (rawInput).
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err == nil {
+		// str_replace_editor: synthesise a unified diff from old_str / new_str.
+		if diff := strReplaceEditorToDiff(obj); diff != "" {
+			return diff
+		}
+		// apply_patch: convert *** Update File: format to unified diff.
+		if patch, ok := obj["patch"].(string); ok && patch != "" {
+			if converted := normaliseApplyPatch(patch); converted != "" {
+				return converted
+			}
+		}
 		var parts []string
 		// Show the most useful keys in a sensible order.
 		for _, k := range []string{"file_path", "command", "pattern", "query", "url", "description", "content"} {
@@ -1544,8 +1660,137 @@ func formatToolContent(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 
+	// Try plain JSON string.
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil {
+		return truncate(str, 500)
+	}
+
 	// Fall back to raw string representation.
 	return truncate(string(raw), 500)
+}
+
+func extractToolDiffText(v any) string {
+	switch x := v.(type) {
+	case string:
+		s := strings.TrimSpace(x)
+		if looksLikeUnifiedDiff(s) {
+			return s
+		}
+		return ""
+	case map[string]any:
+		for _, k := range []string{"diff", "patch", "text", "unified", "unifiedDiff", "content"} {
+			if s := extractToolDiffText(x[k]); s != "" {
+				return s
+			}
+		}
+		for _, value := range x {
+			if s := extractToolDiffText(value); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if s := extractToolDiffText(item); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func looksLikeUnifiedDiff(s string) bool {
+	switch {
+	case s == "":
+		return false
+	case strings.Contains(s, "\ndiff --git ") || strings.HasPrefix(s, "diff --git "):
+		return true
+	case strings.Contains(s, "\n@@ ") || strings.HasPrefix(s, "@@ "):
+		return true
+	case strings.Contains(s, "\n+++ ") && strings.Contains(s, "\n--- "):
+		return true
+	default:
+		return false
+	}
+}
+
+// strReplaceEditorToDiff synthesises a unified diff from a str_replace_editor
+// tool input that carries old_str and new_str fields.
+func strReplaceEditorToDiff(obj map[string]any) string {
+	oldStr, hasOld := obj["old_str"].(string)
+	newStr, hasNew := obj["new_str"].(string)
+	if !hasOld || !hasNew {
+		return ""
+	}
+	path, _ := obj["path"].(string)
+	if path == "" {
+		path, _ = obj["file_path"].(string)
+	}
+	if path == "" {
+		path = "file"
+	}
+	var sb strings.Builder
+	sb.WriteString("--- a/" + path + "\n")
+	sb.WriteString("+++ b/" + path + "\n")
+	sb.WriteString("@@ ... @@\n")
+	for _, line := range strings.Split(oldStr, "\n") {
+		sb.WriteString("-" + line + "\n")
+	}
+	for _, line := range strings.Split(newStr, "\n") {
+		sb.WriteString("+" + line + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// normaliseApplyPatch converts Claude Code's apply_patch format to a standard
+// unified diff that renderDiffBlock can consume.
+//
+// apply_patch format:
+//
+//	*** Begin Patch
+//	*** Update File: path/to/file
+//	@@ context line @@
+//	-removed line
+//	+added line
+//	 context line
+//	*** End of File
+//	*** End Patch
+func normaliseApplyPatch(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "*** Update File:") && !strings.Contains(s, "*** Add File:") && !strings.Contains(s, "*** Delete File:") {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	var out []string
+	// If there is no *** Begin Patch wrapper, treat the whole string as patch content.
+	inPatch := !strings.Contains(s, "*** Begin Patch")
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "*** Begin Patch"):
+			inPatch = true
+		case strings.HasPrefix(line, "*** End Patch"):
+			inPatch = false
+		case !inPatch:
+			// skip preamble before *** Begin Patch
+		case strings.HasPrefix(line, "*** Add File: "):
+			f := strings.TrimPrefix(line, "*** Add File: ")
+			out = append(out, "--- /dev/null")
+			out = append(out, "+++ b/"+f)
+		case strings.HasPrefix(line, "*** Update File: "):
+			f := strings.TrimPrefix(line, "*** Update File: ")
+			out = append(out, "--- a/"+f)
+			out = append(out, "+++ b/"+f)
+		case strings.HasPrefix(line, "*** Delete File: "):
+			f := strings.TrimPrefix(line, "*** Delete File: ")
+			out = append(out, "--- a/"+f)
+			out = append(out, "+++ /dev/null")
+		case strings.HasPrefix(line, "*** End of File"):
+			// skip — separator between files in multi-file patches
+		default:
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func truncate(s string, n int) string {
