@@ -322,6 +322,23 @@ func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissi
 	return s, nil
 }
 
+// Clone creates a new session using the same runtime config as sourceID.
+func (sm *SessionManager) Clone(sourceID string) (*Session, error) {
+	sm.mu.RLock()
+	src := sm.sessions[sourceID]
+	if src == nil {
+		sm.mu.RUnlock()
+		return nil, fmt.Errorf("session not found: %s", sourceID)
+	}
+	workingDir := src.WorkingDir
+	backend := src.Backend
+	model := src.Model
+	skip := src.SkipPermissions
+	plan := src.PlanMode
+	sm.mu.RUnlock()
+	return sm.Create(workingDir, backend, model, skip, plan)
+}
+
 // startCopilot spawns `copilot --acp --port <port>` and connects via TCP.
 func (s *Session) startCopilot(workingDir string, port int) {
 	args := []string{"--acp", "--port", fmt.Sprintf("%d", port)}
@@ -856,9 +873,9 @@ func (sm *SessionManager) ReviveSession(id string) error {
 	return s.Revive()
 }
 
-// UpdateSession updates mutable session properties and respawns the backend
-// process so the new settings take effect.
-func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode bool) (*Session, error) {
+// UpdateSession updates mutable session properties and applies runtime changes.
+// For copilot, model changes require respawn so process args are updated.
+func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode bool, model *string) (*Session, error) {
 	sm.mu.RLock()
 	s, ok := sm.sessions[id]
 	sm.mu.RUnlock()
@@ -866,18 +883,52 @@ func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode boo
 		return nil, fmt.Errorf("session %s not found", id)
 	}
 
+	modelChanged := false
+	if model != nil {
+		next := strings.TrimSpace(*model)
+		if next != s.Model {
+			modelChanged = true
+			s.Model = next
+		}
+	}
 	s.SkipPermissions = skipPermissions
 	s.PlanMode = planMode
 	if sm.store != nil {
 		_ = sm.store.UpsertSession(s)
 	}
 
+	// Apply ACP config changes for live sessions.
+	if s.acp != nil && s.ACPSession != "" {
+		if modelChanged {
+			if s.Model == "" {
+				_ = s.acp.SessionSetConfigOption(s.ACPSession, "model", nil)
+			} else {
+				_ = s.acp.SessionSetConfigOption(s.ACPSession, "model", s.Model)
+			}
+		}
+		if s.SkipPermissions {
+			_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "bypassPermissions")
+		} else if s.PlanMode {
+			_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "plan")
+		}
+	}
+
 	// Kill the backend process. The respawn monitor goroutine (watching
 	// <-s.acp.Done()) will detect the death and restart the process with
-	// the updated SkipPermissions flag.
-	if s.process != nil && s.process.Process != nil {
+	// updated runtime config.
+	//
+	// Copilot model changes must respawn to ensure CLI startup flags match.
+	shouldRespawn := modelChanged && s.Backend == "copilot"
+	if shouldRespawn || s.process != nil && s.process.Process != nil || s.procID != 0 {
 		s.hub.Broadcast("status", map[string]string{"status": "respawning"})
-		_ = s.process.Process.Signal(syscall.SIGTERM)
+		if s.process != nil && s.process.Process != nil {
+			_ = s.process.Process.Signal(syscall.SIGTERM)
+		} else if s.procID != 0 {
+			// Session launched via local procmanager; request stop by processId.
+			stopReq := map[string]any{"processId": s.procID}
+			b, _ := json.Marshal(stopReq)
+			_, _ = http.Post("http://127.0.0.1:19101/proc/stop", "application/json", bytes.NewReader(b))
+		}
 	}
 
 	return s, nil
@@ -1382,16 +1433,38 @@ func (s *Session) Revive() error {
 }
 
 func (s *Session) SendPrompt(text string) {
+	if err := s.EnqueuePrompt(text); err != nil {
+		s.hub.Broadcast("error", WSError{Message: err.Error()})
+	}
+}
+
+func (s *Session) EnqueuePrompt(text string) error {
 	if s.queue == nil {
-		s.hub.Broadcast("error", WSError{Message: "session not ready"})
-		return
+		return fmt.Errorf("session not ready")
 	}
 	s.queue.Enqueue(text)
-	// Broadcast queue depth so connected clients can show a pending count.
-	// This runs after Enqueue so the depth reflects the newly added item.
 	depth := s.queue.QueueDepth()
 	if depth > 0 {
 		s.hub.Broadcast("queue_update", map[string]int{"depth": depth})
+	}
+	return nil
+}
+
+// QueuePromptWhenReady waits for queue initialization and then enqueues text.
+func (s *Session) QueuePromptWhenReady(text string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := s.EnqueuePrompt(text); err == nil {
+			return nil
+		}
+		switch s.Status {
+		case "error", "closed", "killed", "suspended":
+			return fmt.Errorf("session unavailable: %s", s.Status)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for session readiness")
+		}
+		time.Sleep(80 * time.Millisecond)
 	}
 }
 

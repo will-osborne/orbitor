@@ -106,6 +106,45 @@ func (h *Handlers) CreateSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handlers) CloneSessionAndPrompt(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("id")
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" {
+		http.Error(w, `{"error":"text required"}`, http.StatusBadRequest)
+		return
+	}
+
+	cloned, err := h.sm.Clone(sourceID)
+	if err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+		return
+	}
+
+	if err := cloned.QueuePromptWhenReady(req.Text, 20*time.Second); err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(WSSessionInfo{
+		ID:              cloned.ID,
+		WorkingDir:      cloned.WorkingDir,
+		Status:          cloned.Status,
+		Backend:         cloned.Backend,
+		Model:           cloned.Model,
+		SkipPermissions: cloned.SkipPermissions,
+		PlanMode:        cloned.PlanMode,
+	})
+}
+
 func (h *Handlers) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := h.sm.Delete(id); err != nil {
@@ -118,14 +157,15 @@ func (h *Handlers) DeleteSession(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) UpdateSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		SkipPermissions bool `json:"skipPermissions"`
-		PlanMode        bool `json:"planMode"`
+		SkipPermissions bool    `json:"skipPermissions"`
+		PlanMode        bool    `json:"planMode"`
+		Model           *string `json:"model,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	session, err := h.sm.UpdateSession(id, req.SkipPermissions, req.PlanMode)
+	session, err := h.sm.UpdateSession(id, req.SkipPermissions, req.PlanMode, req.Model)
 	if err != nil {
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
 		return

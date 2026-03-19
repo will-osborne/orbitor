@@ -168,6 +168,7 @@ func main() {
 	// API routes
 	mux.HandleFunc("GET /api/sessions", h.ListSessions)
 	mux.HandleFunc("POST /api/sessions", h.CreateSession)
+	mux.HandleFunc("POST /api/sessions/{id}/clone-prompt", h.CloneSessionAndPrompt)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.DeleteSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", h.UpdateSession)
 	mux.HandleFunc("POST /api/sessions/{id}/kill", h.KillSession)

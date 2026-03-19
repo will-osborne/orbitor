@@ -296,6 +296,30 @@ class _ChatScreenState extends State<ChatScreen>
     }
   }
 
+  Future<void> _sendMessageToClone() async {
+    final text = _inputController.text.trim();
+    if (text.isEmpty || !_sessionReady) return;
+    final api = context.read<ApiService>();
+    try {
+      final cloned = await api.cloneSessionAndPrompt(widget.session.id, text);
+      if (!mounted) return;
+      _inputController.clear();
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => ChatScreen(session: cloned)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            type: MessageType.error,
+            text: 'Clone-send failed: $e',
+          ),
+        );
+      });
+    }
+  }
+
   void _interruptSession() {
     _connection?.sendInterrupt();
   }
@@ -691,8 +715,13 @@ class _ChatScreenState extends State<ChatScreen>
                               switch (value) {
                                 case 'debug':
                                   setState(() => _showDebug = !_showDebug);
+                                  break;
+                                case 'fork_send':
+                                  _sendMessageToClone();
+                                  break;
                                 case 'delete':
                                   _confirmAndDeleteSession();
+                                  break;
                               }
                             },
                             itemBuilder: (context) => [
@@ -709,6 +738,23 @@ class _ChatScreenState extends State<ChatScreen>
                                     Text(
                                       _showDebug ? 'Hide debug' : 'Show debug',
                                       style: const TextStyle(fontSize: 14),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'fork_send',
+                                child: Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.call_split_rounded,
+                                      size: 18,
+                                      color: CB.cyan,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    const Text(
+                                      'Send to cloned session',
+                                      style: TextStyle(fontSize: 14),
                                     ),
                                   ],
                                 ),
@@ -1245,11 +1291,33 @@ class _ChatScreenState extends State<ChatScreen>
       ),
     );
 
+    final cloneBtn = GestureDetector(
+      onTap: enabled ? _sendMessageToClone : null,
+      child: Container(
+        width: 36,
+        height: 44,
+        decoration: BoxDecoration(
+          color: enabled ? CB.cyan.withValues(alpha: 0.15) : CB.textTertiary.withValues(alpha: 0.2),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: enabled ? CB.cyan.withValues(alpha: 0.35) : Colors.transparent,
+          ),
+        ),
+        child: Icon(
+          Icons.call_split_rounded,
+          color: enabled ? CB.cyan : CB.textTertiary,
+          size: 18,
+        ),
+      ),
+    );
+
     if (_isAgentRunning) {
       // Show interrupt button alongside send button when agent is running.
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          cloneBtn,
+          const SizedBox(width: 6),
           GestureDetector(
             onTap: _interruptSession,
             child: Container(
@@ -1269,7 +1337,14 @@ class _ChatScreenState extends State<ChatScreen>
       );
     }
 
-    return sendBtn;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        cloneBtn,
+        const SizedBox(width: 6),
+        sendBtn,
+      ],
+    );
   }
 }
 

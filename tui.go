@@ -151,6 +151,7 @@ func init() {
 const (
 	tuiStateDirName  = ".orbitor"
 	tuiStateFileName = "tui_state.json"
+	tuiHistoryLimit  = 500
 )
 
 type tuiStateFile struct {
@@ -252,6 +253,13 @@ var (
 	wizardBackends      = []string{"copilot", "claude"}
 	wizardCopilotModels = []string{
 		"(default)",
+		"gpt-5",
+		"gpt-5-mini",
+		"gpt-5.1",
+		"gpt-5.1-codex-mini",
+		"gpt-5.3-codex",
+		"gpt-5.4",
+		"gpt-5.4-mini",
 		"gpt-4o",
 		"gpt-4o-mini",
 		"o1",
@@ -275,6 +283,26 @@ var (
 		"plan   –  plan only, no tool execution",
 	}
 )
+
+func modelsForBackend(backend string) []string {
+	if backend == "claude" {
+		return wizardClaudeModels[1:]
+	}
+	return wizardCopilotModels[1:]
+}
+
+func canonicalModelForBackend(backend, input string) (string, bool) {
+	candidate := strings.TrimSpace(input)
+	if candidate == "" {
+		return "", true
+	}
+	for _, model := range modelsForBackend(backend) {
+		if strings.EqualFold(model, candidate) {
+			return model, true
+		}
+	}
+	return "", false
+}
 
 func stateStyle(state string) lipgloss.Style {
 	switch state {
@@ -389,6 +417,38 @@ func (c *tuiAPIClient) createSession(workingDir, backend, model string, skipPerm
 	return out, nil
 }
 
+func (c *tuiAPIClient) cloneSessionAndPrompt(sourceID, text string) (WSSessionInfo, error) {
+	body, _ := json.Marshal(map[string]any{"text": text})
+	resp, err := c.http.Post(c.baseURL+"/api/sessions/"+sourceID+"/clone-prompt", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return WSSessionInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		msg, _ := io.ReadAll(resp.Body)
+		return WSSessionInfo{}, fmt.Errorf("clone prompt failed: %s", strings.TrimSpace(string(msg)))
+	}
+	var out WSSessionInfo
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return WSSessionInfo{}, err
+	}
+	return out, nil
+}
+
+func (c *tuiAPIClient) selfUpdate(flutter bool) error {
+	body, _ := json.Marshal(map[string]any{"flutter": flutter})
+	resp, err := c.http.Post(c.baseURL+"/api/self-update", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("self-update failed: %s", strings.TrimSpace(string(msg)))
+	}
+	return nil
+}
+
 func (c *tuiAPIClient) deleteSession(id string) error {
 	req, _ := http.NewRequest(http.MethodDelete, c.baseURL+"/api/sessions/"+id, nil)
 	resp, err := c.http.Do(req)
@@ -403,8 +463,12 @@ func (c *tuiAPIClient) deleteSession(id string) error {
 	return nil
 }
 
-func (c *tuiAPIClient) updateSession(id string, skip, plan bool) (WSSessionInfo, error) {
-	body, _ := json.Marshal(map[string]any{"skipPermissions": skip, "planMode": plan})
+func (c *tuiAPIClient) updateSession(id string, skip, plan bool, model *string) (WSSessionInfo, error) {
+	payload := map[string]any{"skipPermissions": skip, "planMode": plan}
+	if model != nil {
+		payload["model"] = *model
+	}
+	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest(http.MethodPatch, c.baseURL+"/api/sessions/"+id, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
@@ -440,6 +504,10 @@ type createSessionMsg struct {
 	session WSSessionInfo
 	err     error
 }
+type clonePromptMsg struct {
+	session WSSessionInfo
+	err     error
+}
 type deleteSessionMsg struct {
 	id  string
 	err error
@@ -448,9 +516,23 @@ type updateSessionMsg struct {
 	session WSSessionInfo
 	err     error
 }
+type selfUpdateMsg struct{ err error }
 type wsPayloadMsg struct{ payload []byte }
 type infoMsg struct{ text string }
 type errMsg struct{ err error }
+type sttStartedMsg struct {
+	proc      *exec.Cmd
+	audioPath string
+	err       error
+}
+type sttResultMsg struct {
+	text string
+	err  error
+}
+type whisperCLI struct {
+	path   string
+	flavor string
+}
 type tickMsg time.Time
 type spinnerTickMsg time.Time
 
@@ -533,6 +615,19 @@ type tuiModel struct {
 	// non-scrolling thinking pane
 	thinkingLines []string
 	isThinking    bool
+
+	// push-to-talk speech-to-text (space hold)
+	pttLastSpace time.Time
+	pttActive    bool
+	pttBusy      bool
+	pttAudioPath string
+	pttProc      *exec.Cmd
+
+	// /model completion state
+	modelCompLast       string
+	modelCompCandidates []string
+	modelCompIndex      int
+	modelCompSessionID  string
 }
 
 func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
@@ -566,7 +661,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓/j/k scroll chat  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -765,7 +860,7 @@ func (m *tuiModel) renderHelp() string {
 		titleStyle.Render("  Keyboard Shortcuts"),
 		"",
 		head.Render("  Navigation"),
-		row("↑/↓  j/k", "scroll chat feed"),
+		row("↑/↓", "scroll chat feed"),
 		row("Tab/Shift+Tab", "cycle sessions"),
 		row("Enter (empty input)", "connect to selected session"),
 		row("n", "new session wizard"),
@@ -780,23 +875,28 @@ func (m *tuiModel) renderHelp() string {
 		row("Ctrl+M", "toggle markdown rendering"),
 		row("Ctrl+B", "toggle compact/full blocks"),
 		row("Ctrl+T", "cycle theme"),
-		row("Ctrl+. / Ctrl+I", "abort running session"),
+		row("Ctrl+. / Ctrl+\\", "abort running session"),
 		row("Ctrl+← / Ctrl+→", "move by word"),
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
+		row("Shift+Enter", "insert newline in prompt"),
+		row("Alt+Enter", "send prompt to cloned session"),
+		row("Hold Space", "push-to-talk dictation"),
 		row("Ctrl+↑/↓", "cycle prompt history"),
-		row("Ctrl+I", "interrupt running session"),
+		row("Ctrl+\\", "interrupt running session"),
 		row("Ctrl+R / F5", "refresh sessions"),
 		"",
 		head.Render("  Commands"),
 		row("/help", "show commands in feed"),
 		row("/use <id>", "connect to session by ID"),
 		row("/new <dir> [backend]", "create session"),
+		row("/fork <prompt>", "clone current session and send"),
 		row("/interrupt", "interrupt current session"),
 		row("/allow <req> <opt>", "approve permission request"),
 		row("/skip [true|false]", "toggle skip-permissions"),
 		row("/plan [true|false]", "toggle plan mode"),
+		row("/model <name> [id]", "set model for session"),
 		row("/markdown [on|off]", "toggle markdown rendering"),
 		row("/blocks [compact|full]", "toggle block density"),
 		row("/theme [name]", "switch tui theme"),
@@ -932,6 +1032,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		if m.pttActive && time.Since(m.pttLastSpace) > 900*time.Millisecond {
+			return m, tea.Batch(m.stopPTTCapture(), spinnerTickCmd())
+		}
 		return m, spinnerTickCmd()
 
 	case zooTickMsg:
@@ -1004,6 +1107,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			attachSessionCmd(m.api, msg.session.ID, m.extCh),
 		)
 
+	case clonePromptMsg:
+		if msg.err != nil {
+			m.logSystem("Clone prompt failed: " + msg.err.Error())
+			return m, nil
+		}
+		m.logSystem("Spawned clone session " + msg.session.ID)
+		return m, tea.Batch(
+			refreshSessionsCmd(m.api),
+			attachSessionCmd(m.api, msg.session.ID, m.extCh),
+		)
+
 	case deleteSessionMsg:
 		if msg.err != nil {
 			m.logSystem("Delete failed: " + msg.err.Error())
@@ -1021,8 +1135,49 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logSystem("Session update failed: " + msg.err.Error())
 			return m, nil
 		}
-		m.logSystem(fmt.Sprintf("Updated session %s (skipPermissions=%v, planMode=%v)", msg.session.ID, msg.session.SkipPermissions, msg.session.PlanMode))
+		m.logSystem(fmt.Sprintf("Updated session %s (model=%s, skipPermissions=%v, planMode=%v)", msg.session.ID, defaultString(msg.session.Model, "(default)"), msg.session.SkipPermissions, msg.session.PlanMode))
 		return m, refreshSessionsCmd(m.api)
+
+	case sttResultMsg:
+		m.pttBusy = false
+		if m.pttAudioPath != "" {
+			_ = os.Remove(m.pttAudioPath)
+			m.pttAudioPath = ""
+		}
+		if msg.err != nil {
+			m.logSystem("Dictation failed: " + msg.err.Error())
+			return m, nil
+		}
+		if strings.TrimSpace(msg.text) != "" {
+			if m.input.Value() != "" && !strings.HasSuffix(m.input.Value(), " ") {
+				m.insertAtCursor(" ")
+			}
+			m.insertAtCursor(strings.TrimSpace(msg.text))
+			m.logSystem("Dictation inserted")
+		}
+		return m, nil
+
+	case sttStartedMsg:
+		if msg.err != nil {
+			m.pttBusy = false
+			m.pttActive = false
+			m.logSystem("Dictation start failed: " + msg.err.Error())
+			return m, nil
+		}
+		m.pttProc = msg.proc
+		m.pttAudioPath = msg.audioPath
+		m.pttActive = true
+		m.pttBusy = true
+		m.logSystem("🎙 dictation listening (hold space), release to transcribe")
+		return m, nil
+
+	case selfUpdateMsg:
+		if msg.err != nil {
+			m.logSystem("Restart failed: " + msg.err.Error())
+			return m, nil
+		}
+		m.logSystem("Server restart initiated (graceful self-update)")
+		return m, nil
 
 	case wsPayloadMsg:
 		m.handleIncoming(msg.payload)
@@ -1043,6 +1198,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitExternalCmd(m.extCh)
 
 	case tea.KeyMsg:
+		if msg.String() != "tab" && msg.String() != "shift+tab" {
+			m.resetModelCompletion()
+		}
 		// When wizard is open, route all key events to it.
 		if m.wizardActive {
 			return m.updateWizard(msg)
@@ -1104,11 +1262,24 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.deleteConfirmID = m.sessions[m.selected].ID
 			return m, nil
 
-		case "up", "k":
+		case " ":
+			now := time.Now()
+			m.pttLastSpace = now
+			if !m.pttBusy && m.input.Value() == "" {
+				if !m.pttActive {
+					return m, m.startPTTCapture()
+				}
+				return m, nil
+			}
+			if m.pttBusy {
+				return m, nil
+			}
+
+		case "up":
 			m.viewport.ScrollUp(3)
 			return m, nil
 
-		case "down", "j":
+		case "down":
 			m.viewport.ScrollDown(3)
 			return m, nil
 
@@ -1140,6 +1311,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "tab":
+			if m.tryCompleteModel(false) {
+				return m, nil
+			}
 			// Tab cycles sessions even when input has content.
 			if len(m.sessions) > 0 {
 				m.selected = (m.selected + 1) % len(m.sessions)
@@ -1147,6 +1321,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "shift+tab":
+			if m.tryCompleteModel(true) {
+				return m, nil
+			}
 			// Shift+Tab cycles sessions backwards even when input has content.
 			if len(m.sessions) > 0 {
 				m.selected = (m.selected + len(m.sessions) - 1) % len(m.sessions)
@@ -1173,7 +1350,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case "ctrl+i", "ctrl+.", "ctrl+\\":
+		case "ctrl+.", "ctrl+\\":
 			if m.activeSessionID != "" {
 				return m, sendWSCmd(m, map[string]any{"type": "interrupt"})
 			}
@@ -1259,6 +1436,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "shift+enter":
+			m.insertAtCursor("\n")
+			return m, nil
+
 		case "enter":
 			text := strings.TrimSpace(m.input.Value())
 			if text == "" {
@@ -1286,6 +1467,26 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, sendWSCmd(m, map[string]any{"type": "prompt", "text": text})
+
+		case "alt+enter":
+			text := strings.TrimSpace(m.input.Value())
+			if text == "" {
+				return m, nil
+			}
+			m.input.SetValue("")
+			m.historyPos = 0
+			m.historyLive = ""
+			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != text {
+				m.inputHistory = append(m.inputHistory, text)
+				if len(m.inputHistory) > 100 {
+					m.inputHistory = m.inputHistory[1:]
+				}
+			}
+			if m.activeSessionID == "" {
+				m.logSystem("Connect to a session first (select and press Enter)")
+				return m, nil
+			}
+			return m, clonePromptCmd(m.api, m.activeSessionID, text)
 		}
 	}
 
@@ -1466,10 +1667,10 @@ func (m *tuiModel) View() string {
 	var hint string
 	if m.activeSessionID != "" {
 		promptPrefix = styleAccent.Render(" ❯ ")
-		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  ↑/↓ scroll  ·  Ctrl+↑/↓ history  ·  Alt+←/→ word-move"
+		hint = "Enter=send(queue)  ·  Alt+Enter=fork send  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
 	} else {
 		promptPrefix = styleMuted.Render(" ❯ ")
-		hint = "Enter=connect  ·  Tab cycle sessions  ·  ↑/↓ scroll  ·  Alt+←/→ word-move"
+		hint = "Enter=connect  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
 	}
 	if m.isThinking {
 		hint += "  ·  agent running"
@@ -1585,18 +1786,21 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /refresh")
 		m.logSystem("  /use <sessionId>")
 		m.logSystem("  /new <workingDir> [backend] [model] [skipPermissions(true|false)]")
+		m.logSystem("  /fork <prompt>")
 		m.logSystem("  /interrupt")
 		m.logSystem("  /abort")
 		m.logSystem("  /allow <requestId> <optionId>")
 		m.logSystem("  /skip [true|false] [id]")
 		m.logSystem("  /plan [true|false] [id]")
+		m.logSystem("  /model <model|default> [id]")
 		m.logSystem("  /markdown [on|off]")
 		m.logSystem("  /blocks [compact|full]")
 		m.logSystem("  /theme [name]")
 		m.logSystem("  /themes")
+		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  up/down/j/k=scroll chat  ctrl+up/down=prompt history  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+i=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  up/down=scroll chat  ctrl+up/down=prompt history  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -1650,6 +1854,17 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 			}
 		}
 		return createSessionCmd(m.api, wd, backend, model, skip, plan)
+	case "/fork":
+		if m.activeSessionID == "" {
+			m.logSystem("Connect to a session first")
+			return nil
+		}
+		prompt := strings.TrimSpace(strings.TrimPrefix(raw, "/fork"))
+		if prompt == "" {
+			m.logSystem("Usage: /fork <prompt>")
+			return nil
+		}
+		return clonePromptCmd(m.api, m.activeSessionID, prompt)
 	case "/interrupt":
 		return sendWSCmd(m, map[string]any{"type": "interrupt"})
 	case "/abort":
@@ -1684,7 +1899,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 				return nil
 			}
 		}
-		return updateSessionCmd(m.api, target.ID, next, target.PlanMode)
+		return updateSessionCmd(m.api, target.ID, next, target.PlanMode, nil)
 	case "/plan":
 		if len(m.sessions) == 0 {
 			m.logSystem("No sessions available")
@@ -1705,7 +1920,38 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 				return nil
 			}
 		}
-		return updateSessionCmd(m.api, target.ID, target.SkipPermissions, nextPlan)
+		return updateSessionCmd(m.api, target.ID, target.SkipPermissions, nextPlan, nil)
+	case "/model":
+		if len(m.sessions) == 0 {
+			m.logSystem("No sessions available")
+			return nil
+		}
+		target := m.sessions[m.selected]
+		if len(fields) >= 3 {
+			if s, ok := m.findSessionByID(fields[2]); ok {
+				target = s
+			} else {
+				m.logSystem("Session not found: " + fields[2])
+				return nil
+			}
+		}
+		if len(fields) < 2 {
+			m.logSystem("Usage: /model <model|default> [sessionId]")
+			m.logSystem("Available models (" + target.Backend + "): " + strings.Join(modelsForBackend(target.Backend), ", "))
+			return nil
+		}
+		rawModel := strings.TrimSpace(fields[1])
+		nextModel := ""
+		if !strings.EqualFold(rawModel, "default") && rawModel != "(default)" {
+			canon, ok := canonicalModelForBackend(target.Backend, rawModel)
+			if !ok {
+				m.logSystem("Unknown model for " + target.Backend + ": " + rawModel)
+				m.logSystem("Available models (" + target.Backend + "): " + strings.Join(modelsForBackend(target.Backend), ", "))
+				return nil
+			}
+			nextModel = canon
+		}
+		return updateSessionCmd(m.api, target.ID, target.SkipPermissions, target.PlanMode, &nextModel)
 	case "/markdown":
 		if len(fields) < 2 {
 			m.logSystem("Usage: /markdown [on|off]")
@@ -1774,6 +2020,8 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		}
 		m.logSystem("Themes: " + strings.Join(names, ", "))
 		return nil
+	case "/restart":
+		return selfUpdateCmd(m.api, false)
 	case "/delete":
 		if len(m.sessions) == 0 {
 			m.logSystem("No sessions available")
@@ -1806,6 +2054,10 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 		var h WSHistoryMessage
 		if err := json.Unmarshal(payload, &h); err != nil {
 			return
+		}
+		if len(h.Messages) > tuiHistoryLimit {
+			h.Messages = h.Messages[len(h.Messages)-tuiHistoryLimit:]
+			m.logSystem(fmt.Sprintf("Loaded recent %d messages (history truncated)", tuiHistoryLimit))
 		}
 		// Clear the feed and rebuild from the authoritative DB history.
 		// This handles both initial connect and reconnect cleanly.
@@ -1882,13 +2134,19 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
 			}
 		}
-		m.rebuildViewport()
+		if !m.replayingHistory {
+			m.rebuildViewport()
+		}
 		return
 	}
 
 	// Internal protocol messages with no visible representation — don't break
 	// an active agent text block (e.g. acp_update can interleave with text chunks).
-	if msg.Type == "acp_update" || msg.Type == "session_ended" {
+	if msg.Type == "acp_update" {
+		m.ingestACPThinking(msg.Data)
+		return
+	}
+	if msg.Type == "session_ended" {
 		return
 	}
 
@@ -1911,6 +2169,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	case "tool_call":
 		var d WSToolCall
 		if json.Unmarshal(msg.Data, &d) == nil {
+			m.log(styleMuted.Render("  --- tool call ---"))
 			icon, iconCol := toolKindIcon(d.Kind)
 			iconSty := lipgloss.NewStyle().Foreground(iconCol)
 
@@ -1945,6 +2204,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	case "tool_result":
 		var d WSToolResult
 		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
+			m.log(styleMuted.Render("  --- tool result ---"))
 			m.log(m.renderRichTextBlock(d.Content, w, true))
 			m.pushThinking("tool result")
 		}
@@ -1953,7 +2213,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		var d WSPermissionRequest
 		if json.Unmarshal(msg.Data, &d) == nil {
 			m.log("")
-			m.log("  " + styleYellow.Render("permission required") + styleMuted.Render("  "+d.Title))
+			m.log("  " + styleYellow.Render("⏸ permission required") + styleMuted.Render("  "+d.Title))
 			if d.Command != "" {
 				m.log(styleMuted.Render("    $ ") + styleText.Render(d.Command))
 			}
@@ -1973,7 +2233,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			OptionID  string `json:"optionId"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log("  " + styleGreen.Render("approved") + styleMuted.Render("  "+d.OptionID))
+			m.log("  " + styleGreen.Render("✓ approved") + styleMuted.Render("  "+d.OptionID))
 			m.isThinking = false
 		}
 
@@ -2008,7 +2268,7 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Status string `json:"status"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil && d.Status != "" {
-			m.log(styleMuted.Render("  · status: " + d.Status))
+			m.log(styleMuted.Render("  ◦ status: " + d.Status))
 			m.pushThinking("status: " + d.Status)
 			switch strings.ToLower(d.Status) {
 			case "working", "running", "thinking", "starting", "respawning":
@@ -2323,7 +2583,27 @@ func (m *tuiModel) log(s string) {
 	if len(m.logs) > 4000 {
 		m.logs = m.logs[len(m.logs)-4000:]
 	}
-	m.rebuildViewport()
+	if !m.replayingHistory {
+		m.rebuildViewport()
+	}
+}
+
+func (m *tuiModel) insertAtCursor(s string) {
+	if s == "" {
+		return
+	}
+	v := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(v) {
+		pos = len(v)
+	}
+	ins := []rune(s)
+	newVal := string(v[:pos]) + string(ins) + string(v[pos:])
+	m.input.SetValue(newVal)
+	m.input.SetCursor(pos + len(ins))
 }
 
 func (m *tuiModel) pushThinking(s string) {
@@ -2335,6 +2615,101 @@ func (m *tuiModel) pushThinking(s string) {
 	if len(m.thinkingLines) > 80 {
 		m.thinkingLines = m.thinkingLines[len(m.thinkingLines)-80:]
 	}
+}
+
+func (m *tuiModel) ingestACPThinking(raw json.RawMessage) {
+	var env struct {
+		UpdateType string          `json:"updateType"`
+		Data       json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return
+	}
+	updateType := strings.ToLower(strings.TrimSpace(env.UpdateType))
+	force := strings.Contains(updateType, "think") ||
+		strings.Contains(updateType, "reason") ||
+		strings.Contains(updateType, "analysis") ||
+		strings.Contains(updateType, "plan")
+
+	var data any
+	if len(env.Data) > 0 && json.Unmarshal(env.Data, &data) == nil {
+		lines := extractThinkingLines(data, force)
+		for _, line := range lines {
+			m.pushThinking("thought: " + line)
+		}
+	}
+}
+
+func extractThinkingLines(v any, force bool) []string {
+	seen := map[string]struct{}{}
+	var out []string
+
+	reasonKey := func(k string) bool {
+		k = strings.ToLower(strings.TrimSpace(k))
+		return strings.Contains(k, "thought") ||
+			strings.Contains(k, "think") ||
+			strings.Contains(k, "reason") ||
+			strings.Contains(k, "analysis") ||
+			strings.Contains(k, "plan") ||
+			strings.Contains(k, "rationale")
+	}
+	reasonType := func(t string) bool {
+		t = strings.ToLower(strings.TrimSpace(t))
+		return strings.Contains(t, "thought") ||
+			strings.Contains(t, "think") ||
+			strings.Contains(t, "reason") ||
+			strings.Contains(t, "analysis") ||
+			strings.Contains(t, "plan")
+	}
+	appendLine := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		s = strings.Join(strings.Fields(s), " ")
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+
+	var walk func(node any, ctx bool)
+	walk = func(node any, ctx bool) {
+		switch n := node.(type) {
+		case string:
+			if ctx || force {
+				appendLine(n)
+			}
+		case []any:
+			for _, item := range n {
+				walk(item, ctx)
+			}
+		case map[string]any:
+			localCtx := ctx
+			if typ, ok := n["type"].(string); ok && reasonType(typ) {
+				localCtx = true
+			}
+			for k, val := range n {
+				keyCtx := localCtx || reasonKey(k)
+				switch vv := val.(type) {
+				case string:
+					lk := strings.ToLower(strings.TrimSpace(k))
+					if keyCtx || (lk == "text" && localCtx) || force {
+						appendLine(vv)
+					}
+				default:
+					walk(vv, keyCtx)
+				}
+			}
+		}
+	}
+
+	walk(v, false)
+	if len(out) > 6 {
+		out = out[len(out)-6:]
+	}
+	return out
 }
 
 // logSystem renders a muted system/info line (no timestamp prefix).
@@ -2388,6 +2763,13 @@ func createSessionCmd(api *tuiAPIClient, wd, backend, model string, skip, plan b
 	}
 }
 
+func clonePromptCmd(api *tuiAPIClient, sourceID, text string) tea.Cmd {
+	return func() tea.Msg {
+		created, err := api.cloneSessionAndPrompt(sourceID, text)
+		return clonePromptMsg{session: created, err: err}
+	}
+}
+
 func deleteSessionCmd(api *tuiAPIClient, id string) tea.Cmd {
 	return func() tea.Msg {
 		err := api.deleteSession(id)
@@ -2395,10 +2777,17 @@ func deleteSessionCmd(api *tuiAPIClient, id string) tea.Cmd {
 	}
 }
 
-func updateSessionCmd(api *tuiAPIClient, id string, skip, plan bool) tea.Cmd {
+func updateSessionCmd(api *tuiAPIClient, id string, skip, plan bool, model *string) tea.Cmd {
 	return func() tea.Msg {
-		updated, err := api.updateSession(id, skip, plan)
+		updated, err := api.updateSession(id, skip, plan, model)
 		return updateSessionMsg{session: updated, err: err}
+	}
+}
+
+func selfUpdateCmd(api *tuiAPIClient, flutter bool) tea.Cmd {
+	return func() tea.Msg {
+		err := api.selfUpdate(flutter)
+		return selfUpdateMsg{err: err}
 	}
 }
 
@@ -2800,6 +3189,280 @@ func (m *tuiModel) selectedSessionID() string {
 	return m.sessions[m.selected].ID
 }
 
+func (m *tuiModel) startPTTCapture() tea.Cmd {
+	return func() tea.Msg {
+		if m.pttBusy || m.pttActive {
+			return sttStartedMsg{err: fmt.Errorf("dictation already active")}
+		}
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			return sttStartedMsg{err: fmt.Errorf("ffmpeg not found")}
+		}
+		audioPath := filepath.Join(os.TempDir(), fmt.Sprintf("orbitor-stt-%d.wav", time.Now().UnixNano()))
+		cmd := exec.Command("ffmpeg",
+			"-hide_banner", "-loglevel", "error", "-nostdin",
+			"-f", "avfoundation", "-i", ":0",
+			"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+			audioPath,
+		)
+		if err := cmd.Start(); err != nil {
+			return sttStartedMsg{err: err}
+		}
+		return sttStartedMsg{proc: cmd, audioPath: audioPath}
+	}
+}
+
+func (m *tuiModel) stopPTTCapture() tea.Cmd {
+	return func() tea.Msg {
+		if !m.pttActive {
+			return nil
+		}
+		m.pttActive = false
+		proc := m.pttProc
+		audioPath := m.pttAudioPath
+		m.pttProc = nil
+		if proc != nil && proc.Process != nil {
+			_ = proc.Process.Signal(os.Interrupt)
+			done := make(chan error, 1)
+			go func() { done <- proc.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				_ = proc.Process.Kill()
+			}
+		}
+		if audioPath == "" {
+			return sttResultMsg{err: fmt.Errorf("no audio captured")}
+		}
+		text, err := transcribeAudioSwift(audioPath)
+		return sttResultMsg{text: text, err: err}
+	}
+}
+
+func transcribeAudioSwift(path string) (string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("capture missing: %w", err)
+	}
+	cli, err := findWhisperCLI()
+	if err != nil {
+		return "", err
+	}
+	outBase := strings.TrimSuffix(path, filepath.Ext(path))
+	modelRef, err := whisperModelRef(cli.flavor)
+	if err != nil {
+		return "", err
+	}
+	args := whisperTranscriptionArgs(cli.flavor, modelRef, path, outBase)
+	cmd := exec.Command(cli.path, args...)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
+	txtPath := outBase + ".txt"
+	defer os.Remove(txtPath)
+	b, err := os.ReadFile(txtPath)
+	if err != nil {
+		return "", fmt.Errorf("dictation output missing: %w", err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func whisperTranscriptionArgs(flavor, modelPath, audioPath, outBase string) []string {
+	switch flavor {
+	case "python":
+		return []string{
+			audioPath,
+			"--model", modelPath,
+			"--language", "en",
+			"--output_format", "txt",
+			"--output_dir", filepath.Dir(outBase),
+			"--verbose", "False",
+		}
+	default:
+		return []string{
+			"-m", modelPath,
+			"-f", audioPath,
+			"-l", "en",
+			"-otxt",
+			"-of", outBase,
+			"-np",
+		}
+	}
+}
+
+func whisperModelRef(flavor string) (string, error) {
+	if flavor == "python" {
+		return "tiny.en", nil
+	}
+	return ensureWhisperTinyModel()
+}
+
+func findWhisperCLI() (whisperCLI, error) {
+	candidates := []whisperCLI{
+		{path: "whisper-cli", flavor: "cpp"},
+		{path: "whisper-cpp", flavor: "cpp"},
+	}
+	for _, candidate := range candidates {
+		if p, err := exec.LookPath(candidate.path); err == nil {
+			candidate.path = p
+			return candidate, nil
+		}
+	}
+	if p, err := exec.LookPath("whisper"); err == nil {
+		flavor, detectErr := detectWhisperFlavor(p)
+		if detectErr != nil {
+			return whisperCLI{}, detectErr
+		}
+		return whisperCLI{path: p, flavor: flavor}, nil
+	}
+	return whisperCLI{}, fmt.Errorf("local STT not installed: run `brew install whisper-cpp` or install the Python `whisper` CLI")
+}
+
+func detectWhisperFlavor(path string) (string, error) {
+	cmd := exec.Command(path, "--help")
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	helpText := strings.ToLower(out.String() + "\n" + stderr.String())
+	switch {
+	case strings.Contains(helpText, "--output_format") || strings.Contains(helpText, "--model_dir"):
+		return "python", nil
+	case strings.Contains(helpText, "-otxt") || strings.Contains(helpText, "whisper.cpp"):
+		return "cpp", nil
+	case err == nil:
+		return "", fmt.Errorf("unsupported whisper CLI at %s", path)
+	default:
+		return "", fmt.Errorf("detect whisper CLI failed: %w", err)
+	}
+}
+
+func ensureWhisperTinyModel() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".orbitor", "models")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	modelPath := filepath.Join(dir, "ggml-tiny.en.bin")
+	if _, err := os.Stat(modelPath); err == nil {
+		return modelPath, nil
+	}
+	url := "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("download tiny model failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download tiny model failed: %s", resp.Status)
+	}
+	tmp := modelPath + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, modelPath); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return modelPath, nil
+}
+
+func (m *tuiModel) resetModelCompletion() {
+	m.modelCompLast = ""
+	m.modelCompCandidates = nil
+	m.modelCompIndex = 0
+	m.modelCompSessionID = ""
+}
+
+func (m *tuiModel) resolveModelCompletionTarget(fields []string) (WSSessionInfo, bool) {
+	if len(m.sessions) == 0 {
+		return WSSessionInfo{}, false
+	}
+	target := m.sessions[m.selected]
+	if len(fields) >= 3 {
+		s, ok := m.findSessionByID(fields[2])
+		if !ok {
+			return WSSessionInfo{}, false
+		}
+		target = s
+	}
+	return target, true
+}
+
+func (m *tuiModel) tryCompleteModel(reverse bool) bool {
+	raw := strings.TrimSpace(m.input.Value())
+	if !strings.HasPrefix(raw, "/model") {
+		return false
+	}
+	fields := strings.Fields(raw)
+	target, ok := m.resolveModelCompletionTarget(fields)
+	if !ok {
+		return true
+	}
+	typedModel := ""
+	if len(fields) >= 2 {
+		typedModel = fields[1]
+	}
+
+	snapshot := target.ID + "::" + typedModel
+	if m.modelCompLast != snapshot {
+		var candidates []string
+		for _, mdl := range modelsForBackend(target.Backend) {
+			if typedModel == "" || strings.HasPrefix(strings.ToLower(mdl), strings.ToLower(typedModel)) {
+				candidates = append(candidates, mdl)
+			}
+		}
+		if strings.HasPrefix(strings.ToLower("default"), strings.ToLower(typedModel)) {
+			candidates = append(candidates, "default")
+		}
+		if len(candidates) == 0 {
+			return true
+		}
+		m.modelCompLast = snapshot
+		m.modelCompCandidates = candidates
+		m.modelCompIndex = 0
+		m.modelCompSessionID = target.ID
+	} else if len(m.modelCompCandidates) > 0 {
+		if reverse {
+			m.modelCompIndex = (m.modelCompIndex + len(m.modelCompCandidates) - 1) % len(m.modelCompCandidates)
+		} else {
+			m.modelCompIndex = (m.modelCompIndex + 1) % len(m.modelCompCandidates)
+		}
+	}
+	if len(m.modelCompCandidates) == 0 {
+		return true
+	}
+	completed := m.modelCompCandidates[m.modelCompIndex]
+	parts := []string{"/model", completed}
+	if len(fields) >= 3 {
+		parts = append(parts, fields[2])
+	}
+	m.input.SetValue(strings.Join(parts, " "))
+	m.input.CursorEnd()
+	return true
+}
+
 func (m *tuiModel) updatePlaceholder() {
 	if len(m.sessions) == 0 {
 		m.input.Placeholder = "Press n to create a new session..."
@@ -2813,7 +3476,7 @@ func (m *tuiModel) updatePlaceholder() {
 		state := sessionStateLabel(s)
 		switch state {
 		case "working":
-			m.input.Placeholder = "Session is busy — Ctrl+I to interrupt..."
+			m.input.Placeholder = "Session is busy — Ctrl+\\ to interrupt..."
 		case "waiting-input":
 			m.input.Placeholder = "Session needs permission — /allow <requestId> <optionId>"
 		default:

@@ -122,6 +122,18 @@ class ApiService extends ChangeNotifier {
     return Session.fromJson(jsonDecode(resp.body));
   }
 
+  Future<Session> cloneSessionAndPrompt(String sourceSessionId, String text) async {
+    final resp = await http.post(
+      Uri.parse('$_baseUrl/api/sessions/$sourceSessionId/clone-prompt'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'text': text}),
+    );
+    if (resp.statusCode != 201) {
+      throw Exception('Failed to clone session prompt: ${resp.body}');
+    }
+    return Session.fromJson(jsonDecode(resp.body));
+  }
+
   Future<Map<String, dynamic>> selfUpdate({bool flutter = false}) async {
     final resp = await http.post(
       Uri.parse('$_baseUrl/api/self-update'),
