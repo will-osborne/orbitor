@@ -21,8 +21,9 @@ config/config.yaml
 # Claude Code local directory (machine-specific settings, worktrees, memory)
 .claude/
 
-# Firebase service account key (private credential — never commit)
+# Firebase config files (contain project IDs and API keys)
 config/firebase-service-account.json
+mobile/android/app/google-services.json
 
 # Flutter build output
 mobile/build/
