@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../models/session.dart';
 import '../services/api_service.dart';
 import '../theme.dart';
@@ -923,6 +924,47 @@ class _SessionsScreenState extends State<SessionsScreen>
           ],
         );
       case AgentState.idle:
+        if (s.prUrl.isNotEmpty) {
+          final re = RegExp(r'github\.com/[^/]+/[^/]+/pull/(\d+)');
+          final m = re.firstMatch(s.prUrl);
+          final label = m != null ? 'PR #${m[1]}' : 'Pull Request';
+          return GestureDetector(
+            onTap: () => launchUrl(Uri.parse(s.prUrl),
+                mode: LaunchMode.externalApplication),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.merge_type_rounded,
+                    size: 13,
+                    color: const Color(0xFF8957E5).withValues(alpha: 0.9)),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: const Color(0xFF8957E5).withValues(alpha: 0.9),
+                      fontWeight: FontWeight.w600),
+                ),
+                if (s.summary.isNotEmpty) ...[
+                  Text('  ·  ',
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.white.withValues(alpha: 0.25))),
+                  Flexible(
+                    child: Text(
+                      s.summary,
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.white.withValues(alpha: 0.4)),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        }
         if (s.summary.isNotEmpty) {
           return Text(
             s.summary,

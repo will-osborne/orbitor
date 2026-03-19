@@ -14,6 +14,7 @@ class Session {
   final bool pendingPermission;
   final String title;
   final String summary;
+  final String prUrl;
   final DateTime createdAt;
 
   Session({
@@ -32,6 +33,7 @@ class Session {
     this.pendingPermission = false,
     this.title = '',
     this.summary = '',
+    this.prUrl = '',
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -62,6 +64,7 @@ class Session {
       pendingPermission: json['pendingPermission'] ?? false,
       title: json['title'] ?? '',
       summary: json['summary'] ?? '',
+      prUrl: json['prUrl'] ?? '',
       createdAt: json['createdAt'] != null
           ? DateTime.tryParse(json['createdAt'] as String) ?? DateTime.fromMillisecondsSinceEpoch(0)
           : DateTime.fromMillisecondsSinceEpoch(0),

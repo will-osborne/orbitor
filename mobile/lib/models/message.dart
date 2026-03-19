@@ -19,6 +19,7 @@ class ChatMessage {
   final String? toolKind;
   final String? toolStatus;
   final PermissionData? permission;
+  final String? prUrl;
   final DateTime timestamp;
 
   ChatMessage({
@@ -29,6 +30,7 @@ class ChatMessage {
     this.toolKind,
     this.toolStatus,
     this.permission,
+    this.prUrl,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();
 
@@ -68,6 +70,7 @@ class ChatMessage {
         return ChatMessage(
           type: MessageType.runComplete,
           text: data['stopReason'] ?? 'done',
+          prUrl: data['prUrl'] as String?,
         );
       case 'interrupted':
         return ChatMessage(type: MessageType.interrupted, text: 'Interrupted');

@@ -14,32 +14,38 @@ import (
 )
 
 func main() {
+	// Load user client config first so flag defaults can reference it.
+	clientCfg := LoadClientConfig()
+
 	addr := flag.String("addr", "0.0.0.0:8080", "listen address")
 	tuiMode := flag.Bool("tui", false, "run terminal UI client")
-	serverURL := flag.String("server", "http://127.0.0.1:8080", "bridge server URL used in -tui mode")
+	serverURL := flag.String("server", clientCfg.ServerURL, "bridge server URL used in -tui mode")
 	procOnly := flag.Bool("procmanager", false, "run procmanager only")
 	newMode := flag.Bool("new", false, "create a new session for cwd and attach in tui")
 	flag.Parse()
 
 	if *tuiMode {
-		// Determine backend/model from remaining positional args when -new is used
+		// Determine backend/model from remaining positional args when -new is used.
+		// Config defaults apply; positional args override them.
 		if *newMode {
 			args := flag.Args()
-			backend := "copilot"
-			model := ""
+			backend := clientCfg.DefaultBackend
+			model := clientCfg.DefaultModel
+			skip := clientCfg.SkipPermissions
+			plan := clientCfg.PlanMode
 			if len(args) >= 1 {
 				backend = args[0]
 			}
 			if len(args) >= 2 {
 				model = args[1]
 			}
-			if err := RunTUI(*serverURL, true, backend, model, true); err != nil {
+			if err := RunTUI(*serverURL, true, backend, model, skip, plan); err != nil {
 				log.Fatalf("tui: %v", err)
 			}
 			return
 		}
 
-		if err := RunTUI(*serverURL, false, "", "", false); err != nil {
+		if err := RunTUI(*serverURL, false, "", "", false, false); err != nil {
 			log.Fatalf("tui: %v", err)
 		}
 		return

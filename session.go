@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +19,9 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// prURLRe matches GitHub pull request URLs in any text/output.
+var prURLRe = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pull/\d+`)
 
 type Session struct {
 	ID              string
@@ -51,6 +55,7 @@ type Session struct {
 	isRunning     bool   // true while a prompt is being processed
 	title         string // LLM-generated session title (set after run completes)
 	summary       string // LLM-generated one-sentence summary
+	prURL         string // first GitHub PR URL detected in agent output
 
 	// agentTextCh batches frequent agent_text chunks to reduce broadcast frequency
 	agentTextCh    chan string
@@ -131,6 +136,7 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					currentTool:     r.CurrentTool,
 					title:           r.Title,
 					summary:         r.Summary,
+					prURL:           r.PRURL,
 					hub:             NewHub(),
 					terminal:        NewTerminalManager(),
 					permPending:     make(map[string]chan string),
@@ -213,6 +219,7 @@ func (sm *SessionManager) List() []WSSessionInfo {
 		running := s.isRunning
 		title := s.title
 		summary := s.summary
+		prURL := s.prURL
 		s.summaryMu.RUnlock()
 
 		s.permMu.Lock()
@@ -242,6 +249,7 @@ func (sm *SessionManager) List() []WSSessionInfo {
 			CreatedAt:         s.CreatedAt,
 			Title:             title,
 			Summary:           summary,
+			PRURL:             prURL,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -686,10 +694,11 @@ func (s *Session) finishACPSetup(workingDir string) {
 		}
 		s.summaryMu.Lock()
 		s.isRunning = false
+		prURL := s.prURL
 		s.summaryMu.Unlock()
 		s.persistSession()
 		s.flushAgentText()
-		completePayload := map[string]string{"stopReason": result.StopReason}
+		completePayload := map[string]string{"stopReason": result.StopReason, "prUrl": prURL}
 		s.hub.Broadcast("run_complete", completePayload)
 		if s.eventHub != nil {
 			sessionName := filepath.Base(s.WorkingDir)
@@ -721,12 +730,17 @@ func (s *Session) finishACPSetup(workingDir string) {
 				"model":          s.Model,
 				"sessionTitle":   s.title,
 				"sessionSummary": s.summary,
+				"prUrl":          prURL,
 				"createdAt":      createdAt,
 			})
-			go s.fcm.Send(title, body, map[string]string{
+			fcmData := map[string]string{
 				"eventType": "run_complete",
 				"sessionId": s.ID,
-			})
+			}
+			if prURL != "" {
+				fcmData["prUrl"] = prURL
+			}
+			go s.fcm.Send(title, body, fcmData)
 		}
 		if s.store != nil {
 			_ = s.store.SaveMessageJSON(s.ID, "run_complete", completePayload)
@@ -990,6 +1004,11 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		if len(s.lastMessage) > 200 {
 			s.lastMessage = s.lastMessage[len(s.lastMessage)-200:]
 		}
+		if s.prURL == "" {
+			if m := prURLRe.FindString(chunk.Content.Text); m != "" {
+				s.prURL = m
+			}
+		}
 		s.summaryMu.Unlock()
 		// Buffer the agent text and let the per-session coalescer flush periodically.
 		// The coalescer handles both broadcasting and persistence, so we do NOT
@@ -1034,6 +1053,15 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		if content == "" {
 			content = formatToolContent(tc.RawInput)
 		}
+		if content != "" {
+			s.summaryMu.Lock()
+			if s.prURL == "" {
+				if m := prURLRe.FindString(content); m != "" {
+					s.prURL = m
+				}
+			}
+			s.summaryMu.Unlock()
+		}
 		toolPayload := WSToolCall{
 			ToolCallID: tc.ToolCallID,
 			Title:      tc.Title,
@@ -1055,6 +1083,15 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		s.currentTool = ""
 		s.summaryMu.Unlock()
 		s.persistSession()
+		if result := string(tr.Result); result != "" {
+			s.summaryMu.Lock()
+			if s.prURL == "" {
+				if m := prURLRe.FindString(result); m != "" {
+					s.prURL = m
+				}
+			}
+			s.summaryMu.Unlock()
+		}
 		resultPayload := WSToolResult{
 			ToolCallID: tr.ToolCallID,
 			Content:    string(tr.Result),

@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../models/session.dart';
 import '../models/message.dart';
 import '../services/api_service.dart';
@@ -454,6 +457,8 @@ class _ChatScreenState extends State<ChatScreen>
   List<ChatMessage> get _filteredMessages {
     var msgs = _messages.where((m) {
       if (!_showDebug && m.type == MessageType.status) return false;
+      // Tool results are redundant — the tool call card already shows completion.
+      if (m.type == MessageType.toolResult) return false;
       return true;
     }).toList();
 
@@ -481,7 +486,7 @@ class _ChatScreenState extends State<ChatScreen>
           group.add(filtered[j]);
           j++;
         }
-        if (group.length >= 3) {
+        if (group.length >= 2) {
           items.add(_CollapsedToolGroup(group));
         } else {
           for (final m in group) {
@@ -502,7 +507,6 @@ class _ChatScreenState extends State<ChatScreen>
       final s = msg.toolStatus ?? '';
       return s == 'completed' || s == 'failed';
     }
-    if (msg.type == MessageType.toolResult) return true;
     return false;
   }
 
@@ -614,7 +618,7 @@ class _ChatScreenState extends State<ChatScreen>
                           ),
                           if (_isAgentRunning)
                             Padding(
-                              padding: const EdgeInsets.only(right: 4),
+                              padding: const EdgeInsets.only(right: 2),
                               child: PulsingDot(
                                 color: _currentToolKind != null
                                     ? toolKindColor(_currentToolKind!)
@@ -632,6 +636,7 @@ class _ChatScreenState extends State<ChatScreen>
                                   ? CB.amber
                                   : CB.textTertiary,
                             ),
+                            visualDensity: VisualDensity.compact,
                             onPressed: _toggleSkipPermissions,
                           ),
                           IconButton(
@@ -642,11 +647,13 @@ class _ChatScreenState extends State<ChatScreen>
                               size: 20,
                               color: _planMode ? CB.cyan : CB.textTertiary,
                             ),
+                            visualDensity: VisualDensity.compact,
                             tooltip: _planMode ? 'Plan mode on' : 'Plan mode off',
                             onPressed: _togglePlanMode,
                           ),
                           IconButton(
                             icon: const Icon(Icons.search_rounded, size: 20),
+                            visualDensity: VisualDensity.compact,
                             onPressed: () => setState(() {
                               _searchOpen = !_searchOpen;
                               if (!_searchOpen) {
@@ -655,15 +662,6 @@ class _ChatScreenState extends State<ChatScreen>
                               }
                             }),
                             color: _searchOpen ? CB.cyan : CB.textSecondary,
-                          ),
-                          IconButton(
-                            icon: Icon(
-                              Icons.bug_report_rounded,
-                              size: 20,
-                              color: _showDebug ? CB.amber : CB.textTertiary,
-                            ),
-                            onPressed: () =>
-                                setState(() => _showDebug = !_showDebug),
                           ),
                           // Emergency kill / revive
                           IconButton(
@@ -676,17 +674,66 @@ class _ChatScreenState extends State<ChatScreen>
                                   ? CB.neonGreen
                                   : Colors.deepOrange.withValues(alpha: 0.8),
                             ),
+                            visualDensity: VisualDensity.compact,
                             tooltip: _isKilled ? 'Revive agent' : 'Emergency stop',
                             onPressed: _isKilled ? _reviveSession : _killSession,
                           ),
-                          // Delete session from inside the chat view
-                          IconButton(
-                            icon: Icon(
-                              Icons.delete_outline_rounded,
+                          // Overflow menu for less-frequent actions
+                          PopupMenuButton<String>(
+                            icon: const Icon(
+                              Icons.more_vert_rounded,
                               size: 20,
-                              color: CB.hotPink,
+                              color: CB.textTertiary,
                             ),
-                            onPressed: _confirmAndDeleteSession,
+                            padding: EdgeInsets.zero,
+                            color: CB.surfaceLight,
+                            onSelected: (value) {
+                              switch (value) {
+                                case 'debug':
+                                  setState(() => _showDebug = !_showDebug);
+                                case 'delete':
+                                  _confirmAndDeleteSession();
+                              }
+                            },
+                            itemBuilder: (context) => [
+                              PopupMenuItem(
+                                value: 'debug',
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Icons.bug_report_rounded,
+                                      size: 18,
+                                      color: _showDebug ? CB.amber : CB.textTertiary,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      _showDebug ? 'Hide debug' : 'Show debug',
+                                      style: const TextStyle(fontSize: 14),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'delete',
+                                child: Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.delete_outline_rounded,
+                                      size: 18,
+                                      color: CB.hotPink,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    const Text(
+                                      'Delete session',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color: CB.hotPink,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),
@@ -977,12 +1024,7 @@ class _ChatScreenState extends State<ChatScreen>
           content: msg.text.isNotEmpty ? msg.text : null,
         );
       case MessageType.toolResult:
-        return ToolCallCard(
-          title: 'Result: ${msg.toolCallId ?? ''}',
-          kind: 'result',
-          status: 'completed',
-          content: msg.text,
-        );
+        return const SizedBox.shrink();
       case MessageType.permissionRequest:
         if (msg.permission == null) return const SizedBox.shrink();
         return PermissionCard(
@@ -992,11 +1034,18 @@ class _ChatScreenState extends State<ChatScreen>
       case MessageType.permissionResolved:
         return _statusPill(msg.text, CB.neonGreen, Icons.check_circle_rounded);
       case MessageType.runComplete:
-        return _statusPill(
+        final pill = _statusPill(
           'Done  -  ${msg.text}',
           CB.cyan,
           Icons.done_all_rounded,
         );
+        if (msg.prUrl != null && msg.prUrl!.isNotEmpty) {
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [pill, const SizedBox(height: 8), _PRCard(prUrl: msg.prUrl!)],
+          );
+        }
+        return pill;
       case MessageType.interrupted:
         return _statusPill(
           'Interrupted',
@@ -1224,6 +1273,154 @@ class _ChatScreenState extends State<ChatScreen>
   }
 }
 
+// ─── PR Card ─────────────────────────────────────────────────────────────────
+
+/// Parses a GitHub PR URL and fetches the PR state from the public API.
+Future<Map<String, dynamic>?> _fetchPRState(String prUrl) async {
+  final re = RegExp(
+      r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)');
+  final m = re.firstMatch(prUrl);
+  if (m == null) return null;
+  final apiUrl =
+      'https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}';
+  try {
+    final resp = await http
+        .get(Uri.parse(apiUrl), headers: {'Accept': 'application/vnd.github+json'})
+        .timeout(const Duration(seconds: 6));
+    if (resp.statusCode == 200) {
+      return jsonDecode(resp.body) as Map<String, dynamic>;
+    }
+  } catch (_) {}
+  return null;
+}
+
+class _PRCard extends StatefulWidget {
+  final String prUrl;
+  const _PRCard({required this.prUrl});
+
+  @override
+  State<_PRCard> createState() => _PRCardState();
+}
+
+class _PRCardState extends State<_PRCard> {
+  Map<String, dynamic>? _prData;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchPRState(widget.prUrl).then((data) {
+      if (mounted) setState(() { _prData = data; _loading = false; });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final re = RegExp(r'github\.com/([^/]+)/([^/]+)/pull/(\d+)');
+    final m = re.firstMatch(widget.prUrl);
+    final prNum = m != null ? '#${m[3]}' : '';
+    final repoName = m != null ? '${m[1]}/${m[2]}' : widget.prUrl;
+
+    Color stateColor = CB.cyan;
+    IconData stateIcon = Icons.call_merge_rounded;
+    String stateLabel = 'Open';
+
+    if (!_loading && _prData != null) {
+      final merged = _prData!['merged'] as bool? ?? false;
+      final state = _prData!['state'] as String? ?? 'open';
+      final draft = _prData!['draft'] as bool? ?? false;
+      if (merged) {
+        stateColor = const Color(0xFF8957E5); // GitHub purple
+        stateIcon = Icons.merge_rounded;
+        stateLabel = 'Merged';
+      } else if (state == 'closed') {
+        stateColor = CB.hotPink;
+        stateIcon = Icons.close_rounded;
+        stateLabel = 'Closed';
+      } else if (draft) {
+        stateColor = CB.textTertiary;
+        stateIcon = Icons.edit_outlined;
+        stateLabel = 'Draft';
+      }
+    }
+
+    final title = (!_loading && _prData != null)
+        ? (_prData!['title'] as String? ?? repoName)
+        : repoName;
+
+    return GestureDetector(
+      onTap: () => launchUrl(Uri.parse(widget.prUrl),
+          mode: LaunchMode.externalApplication),
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 16),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: stateColor.withValues(alpha: 0.07),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: stateColor.withValues(alpha: 0.25)),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.merge_type_rounded, color: stateColor, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.3),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    '$repoName  $prNum',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.white.withValues(alpha: 0.4)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            if (_loading)
+              SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 1.5, color: stateColor))
+            else
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: stateColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(stateIcon, size: 11, color: stateColor),
+                    const SizedBox(width: 4),
+                    Text(stateLabel,
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: stateColor,
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 // Display item types for grouping consecutive tool calls.
 sealed class _DisplayItem {}
 
@@ -1253,61 +1450,82 @@ class _ToolGroupCardState extends State<_ToolGroupCard> {
 
   @override
   Widget build(BuildContext context) {
-    // Count by kind for the summary.
+    final calls = widget.tools
+        .where((t) => t.type == MessageType.toolCall)
+        .toList();
+
+    // Count by kind for badges.
     final kindCounts = <String, int>{};
-    for (final t in widget.tools) {
-      if (t.type == MessageType.toolResult) continue;
+    for (final t in calls) {
       final k = t.toolKind ?? 'other';
       kindCounts[k] = (kindCounts[k] ?? 0) + 1;
     }
-    // If all are results, count those.
-    if (kindCounts.isEmpty) {
-      kindCounts['result'] = widget.tools.length;
-    }
+
+    // Short title preview (first 3 unique titles, abbreviated to last path component).
+    final titles = calls
+        .map((t) {
+          final raw = t.toolTitle ?? '';
+          // Keep just the last path segment for readability.
+          return raw.contains('/') ? raw.split('/').last : raw;
+        })
+        .where((s) => s.isNotEmpty)
+        .toSet()
+        .take(3)
+        .toList();
+    final extraTitles = calls.length - titles.length;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: 3),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           GestureDetector(
             onTap: () => setState(() => _expanded = !_expanded),
-            child: GlassCard(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.03),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.06),
+                ),
+              ),
               child: Row(
                 children: [
                   Icon(
                     _expanded
                         ? Icons.expand_less_rounded
-                        : Icons.expand_more_rounded,
+                        : Icons.chevron_right_rounded,
                     color: CB.textTertiary,
-                    size: 18,
+                    size: 14,
                   ),
-                  const SizedBox(width: 8),
-                  ...kindCounts.entries.expand(
-                    (e) => [
-                      Container(
+                  const SizedBox(width: 6),
+                  // Kind count badges.
+                  ...kindCounts.entries.map(
+                    (e) => Padding(
+                      padding: const EdgeInsets.only(right: 5),
+                      child: Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
+                          horizontal: 5,
                           vertical: 2,
                         ),
-                        margin: const EdgeInsets.only(right: 6),
                         decoration: BoxDecoration(
-                          color: toolKindColor(e.key).withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(6),
+                          color: toolKindColor(e.key).withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(5),
                         ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Icon(
                               toolKindIcon(e.key),
-                              size: 11,
+                              size: 10,
                               color: toolKindColor(e.key),
                             ),
-                            const SizedBox(width: 4),
+                            const SizedBox(width: 3),
                             Text(
                               '${e.value}',
                               style: TextStyle(
-                                fontSize: 11,
+                                fontSize: 10,
                                 fontWeight: FontWeight.w600,
                                 color: toolKindColor(e.key),
                               ),
@@ -1315,22 +1533,38 @@ class _ToolGroupCardState extends State<_ToolGroupCard> {
                           ],
                         ),
                       ),
-                    ],
-                  ),
-                  const Spacer(),
-                  Text(
-                    '${widget.tools.where((t) => t.type == MessageType.toolCall).length} tools',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: CB.textTertiary,
-                      fontFamily: 'monospace',
                     ),
                   ),
+                  // Title preview.
+                  if (titles.isNotEmpty) ...[
+                    const SizedBox(width: 2),
+                    Expanded(
+                      child: Text(
+                        [
+                          ...titles,
+                          if (extraTitles > 0) '+$extraTitles',
+                        ].join('  ·  '),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          color: CB.textTertiary,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ] else
+                    const Spacer(),
                 ],
               ),
             ),
           ),
-          if (_expanded) ...widget.tools.map((t) => widget.buildMessage(t)),
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, top: 2),
+              child: Column(
+                children: calls.map((t) => widget.buildMessage(t)).toList(),
+              ),
+            ),
         ],
       ),
     );

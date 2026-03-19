@@ -8,7 +8,6 @@ Color toolKindColor(String kind) {
     case 'execute': return CB.neonGreen;
     case 'search': return CB.purple;
     case 'delete': return CB.hotPink;
-    case 'result': return const Color(0xFF00D4AA);
     default: return CB.textTertiary;
   }
 }
@@ -20,12 +19,12 @@ IconData toolKindIcon(String kind) {
     case 'execute': return Icons.terminal_rounded;
     case 'search': return Icons.search_rounded;
     case 'delete': return Icons.delete_rounded;
-    case 'result': return Icons.output_rounded;
     default: return Icons.build_rounded;
   }
 }
 
-class ToolCallCard extends StatelessWidget {
+/// Compact, expandable single-row tool call indicator.
+class ToolCallCard extends StatefulWidget {
   final String title;
   final String kind;
   final String status;
@@ -40,130 +39,109 @@ class ToolCallCard extends StatelessWidget {
   });
 
   @override
+  State<ToolCallCard> createState() => _ToolCallCardState();
+}
+
+class _ToolCallCardState extends State<ToolCallCard> {
+  bool _expanded = false;
+
+  @override
   Widget build(BuildContext context) {
+    final color = toolKindColor(widget.kind);
+    final icon = toolKindIcon(widget.kind);
+    final isPending = widget.status == 'pending' || widget.status.isEmpty;
+    final isFailed = widget.status == 'failed';
+    final hasContent = widget.content != null && widget.content!.isNotEmpty;
+
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: GlassCard(
-        padding: EdgeInsets.zero,
-        child: IntrinsicHeight(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Colored accent bar
-              Container(
-                width: 3,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [_kindColor(), _kindColor().withValues(alpha: 0.2)],
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: GestureDetector(
+        onTap: hasContent ? () => setState(() => _expanded = !_expanded) : null,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                // Kind icon box
+                Container(
+                  width: 20,
+                  height: 20,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: isPending ? 0.18 : 0.1),
+                    borderRadius: BorderRadius.circular(5),
                   ),
-                  borderRadius: const BorderRadius.only(
-                    topLeft: Radius.circular(16),
-                    bottomLeft: Radius.circular(16),
-                  ),
-                ),
-              ),
-              Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        _kindIcon(),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            title,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w500,
+                  child: isPending
+                      ? Center(
+                          child: SizedBox(
+                            width: 10,
+                            height: 10,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 1.5,
+                              color: color,
                             ),
-                            overflow: TextOverflow.ellipsis,
                           ),
-                        ),
-                        _statusChip(),
-                      ],
+                        )
+                      : Icon(icon, size: 11, color: color),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                      color: isPending ? CB.textSecondary : CB.textTertiary,
+                      fontWeight: isPending ? FontWeight.w500 : FontWeight.w400,
                     ),
-                    if (content != null && content!.isNotEmpty) ...[
-                      const SizedBox(height: 10),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.03),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
-                        ),
-                        constraints: const BoxConstraints(maxHeight: 100),
-                        child: SingleChildScrollView(
-                          child: SelectableText(
-                            content!,
-                            style: const TextStyle(
-                              fontSize: 11,
-                              fontFamily: 'monospace',
-                              color: CB.textSecondary,
-                              height: 1.4,
-                            ),
-                          ),
-                        ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (isFailed)
+                  Icon(Icons.close_rounded, size: 12, color: CB.hotPink),
+                if (!isPending && !isFailed)
+                  Icon(
+                    Icons.check_rounded,
+                    size: 12,
+                    color: color.withValues(alpha: 0.45),
+                  ),
+                if (hasContent) ...[
+                  const SizedBox(width: 4),
+                  Icon(
+                    _expanded
+                        ? Icons.expand_less_rounded
+                        : Icons.chevron_right_rounded,
+                    size: 13,
+                    color: CB.textTertiary.withValues(alpha: 0.6),
+                  ),
+                ],
+              ],
+            ),
+            if (_expanded && hasContent)
+              Padding(
+                padding: const EdgeInsets.only(left: 28, top: 5, bottom: 3),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.03),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: color.withValues(alpha: 0.12)),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      widget.content!,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        color: CB.textSecondary,
+                        height: 1.4,
                       ),
-                    ],
-                  ],
+                    ),
+                  ),
                 ),
               ),
-            ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Color _kindColor() => toolKindColor(kind);
-
-  Widget _kindIcon() {
-    final color = _kindColor();
-    final icon = toolKindIcon(kind);
-    return Container(
-      width: 26, height: 26,
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(7),
-      ),
-      child: Icon(icon, size: 14, color: color),
-    );
-  }
-
-  Widget _statusChip() {
-    Color color;
-    switch (status) {
-      case 'pending':
-        color = CB.amber;
-      case 'completed':
-        color = CB.neonGreen;
-      case 'failed':
-        color = CB.hotPink;
-      default:
-        color = CB.textTertiary;
-    }
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: color.withValues(alpha: 0.2)),
-      ),
-      child: Text(
-        status.toUpperCase(),
-        style: TextStyle(
-          fontSize: 9,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.8,
-          color: color,
+          ],
         ),
       ),
     );

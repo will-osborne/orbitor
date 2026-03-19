@@ -30,6 +30,7 @@ type SessionRecord struct {
 	CurrentTool     string
 	Title           string
 	Summary         string
+	PRURL           string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -134,6 +135,7 @@ func NewStore(path string) (*Store, error) {
 		hasTitle := false
 		hasSummary := false
 		hasPlanMode := false
+		hasPRURL := false
 		for rows.Next() {
 			var cid int
 			var name string
@@ -157,6 +159,9 @@ func NewStore(path string) (*Store, error) {
 				if name == "plan_mode" {
 					hasPlanMode = true
 				}
+				if name == "pr_url" {
+					hasPRURL = true
+				}
 			}
 		}
 		if !hasProcID {
@@ -173,6 +178,9 @@ func NewStore(path string) (*Store, error) {
 		}
 		if !hasPlanMode {
 			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN plan_mode INTEGER DEFAULT 0;`)
+		}
+		if !hasPRURL {
+			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN pr_url TEXT;`)
 		}
 	}
 
@@ -226,6 +234,7 @@ func (st *Store) UpsertSession(s *Session) error {
 	currentTool := s.currentTool
 	title := s.title
 	summary := s.summary
+	prURL := s.prURL
 	s.summaryMu.RUnlock()
 
 	skipPerms := 0
@@ -237,8 +246,8 @@ func (st *Store) UpsertSession(s *Session) error {
 		planMode = 1
 	}
 	_, err := st.db.Exec(
-		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(id) DO UPDATE SET
 		   working_dir=excluded.working_dir,
 		   backend=excluded.backend,
@@ -253,8 +262,9 @@ func (st *Store) UpsertSession(s *Session) error {
 		   current_tool=excluded.current_tool,
 		   title=excluded.title,
 		   summary=excluded.summary,
+		   pr_url=excluded.pr_url,
 		   updated_at=CURRENT_TIMESTAMP;`,
-		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, planMode, s.ACPSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary,
+		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, planMode, s.ACPSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary, prURL,
 	)
 	return err
 }
@@ -289,7 +299,7 @@ func (st *Store) DeleteSession(sessionID string) error {
 
 // LoadSessions returns all persisted sessions.
 func (st *Store) LoadSessions() ([]SessionRecord, error) {
-	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, created_at FROM sessions ORDER BY created_at DESC`)
+	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, created_at FROM sessions ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -306,8 +316,9 @@ func (st *Store) LoadSessions() ([]SessionRecord, error) {
 		var curTool sql.NullString
 		var title sql.NullString
 		var summary sql.NullString
+		var prURL sql.NullString
 		var createdAt sql.NullString
-		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &planModeInt, &r.ACPSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &createdAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &planModeInt, &r.ACPSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &prURL, &createdAt); err != nil {
 			return nil, err
 		}
 		r.SkipPermissions = skipPerms.Valid && skipPerms.Int64 != 0
@@ -329,6 +340,9 @@ func (st *Store) LoadSessions() ([]SessionRecord, error) {
 		}
 		if summary.Valid {
 			r.Summary = summary.String
+		}
+		if prURL.Valid {
+			r.PRURL = prURL.String
 		}
 		if createdAt.Valid {
 			if t, err := time.Parse("2006-01-02 15:04:05", createdAt.String); err == nil {

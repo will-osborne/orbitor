@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,32 +25,174 @@ import (
 
 // ── colour palette ────────────────────────────────────────────────────────────
 
-var (
-	colGreen  = lipgloss.Color("42")
-	colOrange = lipgloss.Color("214")
-	colYellow = lipgloss.Color("220")
-	colRed    = lipgloss.Color("196")
-	colCyan   = lipgloss.Color("39")
-	colGray   = lipgloss.Color("240")
-	colMuted  = lipgloss.Color("244")
-	colText   = lipgloss.Color("252")
-	colSep    = lipgloss.Color("237")
+type tuiTheme struct {
+	Name   string
+	Green  lipgloss.Color
+	Orange lipgloss.Color
+	Yellow lipgloss.Color
+	Red    lipgloss.Color
+	Cyan   lipgloss.Color
+	Violet lipgloss.Color
+	Gray   lipgloss.Color
+	Muted  lipgloss.Color
+	Text   lipgloss.Color
+	Sep    lipgloss.Color
+	Border lipgloss.Color
+	Accent lipgloss.Color
+	SelBg  lipgloss.Color
+	Panel  lipgloss.Color
+}
 
-	styleGreen  = lipgloss.NewStyle().Foreground(colGreen).Bold(true)
+var tuiThemes = []tuiTheme{
+	{
+		Name:   "opencode",
+		Green:  lipgloss.Color("78"),
+		Orange: lipgloss.Color("215"),
+		Yellow: lipgloss.Color("221"),
+		Red:    lipgloss.Color("203"),
+		Cyan:   lipgloss.Color("81"),
+		Violet: lipgloss.Color("147"),
+		Gray:   lipgloss.Color("243"),
+		Muted:  lipgloss.Color("246"),
+		Text:   lipgloss.Color("252"),
+		Sep:    lipgloss.Color("239"),
+		Border: lipgloss.Color("238"),
+		Accent: lipgloss.Color("117"),
+		SelBg:  lipgloss.Color("239"),
+		Panel:  lipgloss.Color("235"),
+	},
+	{
+		Name:   "catppuccin",
+		Green:  lipgloss.Color("#A6E3A1"),
+		Orange: lipgloss.Color("#FAB387"),
+		Yellow: lipgloss.Color("#F9E2AF"),
+		Red:    lipgloss.Color("#F38BA8"),
+		Cyan:   lipgloss.Color("#89DCEB"),
+		Violet: lipgloss.Color("#CBA6F7"),
+		Gray:   lipgloss.Color("#7F849C"),
+		Muted:  lipgloss.Color("#BAC2DE"),
+		Text:   lipgloss.Color("#CDD6F4"),
+		Sep:    lipgloss.Color("#6C7086"),
+		Border: lipgloss.Color("#585B70"),
+		Accent: lipgloss.Color("#94E2D5"),
+		SelBg:  lipgloss.Color("#45475A"),
+		Panel:  lipgloss.Color("#1E1E2E"),
+	},
+	{
+		Name:   "dracula",
+		Green:  lipgloss.Color("#50FA7B"),
+		Orange: lipgloss.Color("#FFB86C"),
+		Yellow: lipgloss.Color("#F1FA8C"),
+		Red:    lipgloss.Color("#FF5555"),
+		Cyan:   lipgloss.Color("#8BE9FD"),
+		Violet: lipgloss.Color("#BD93F9"),
+		Gray:   lipgloss.Color("#6272A4"),
+		Muted:  lipgloss.Color("#94A3C5"),
+		Text:   lipgloss.Color("#F8F8F2"),
+		Sep:    lipgloss.Color("#44475A"),
+		Border: lipgloss.Color("#3B3E52"),
+		Accent: lipgloss.Color("#BD93F9"),
+		SelBg:  lipgloss.Color("#343746"),
+		Panel:  lipgloss.Color("#282A36"),
+	},
+	{
+		Name:   "tokyonight",
+		Green:  lipgloss.Color("#9ECE6A"),
+		Orange: lipgloss.Color("#FF9E64"),
+		Yellow: lipgloss.Color("#E0AF68"),
+		Red:    lipgloss.Color("#F7768E"),
+		Cyan:   lipgloss.Color("#7DCFFF"),
+		Violet: lipgloss.Color("#BB9AF7"),
+		Gray:   lipgloss.Color("#7AA2F7"),
+		Muted:  lipgloss.Color("#A9B1D6"),
+		Text:   lipgloss.Color("#C0CAF5"),
+		Sep:    lipgloss.Color("#3B4261"),
+		Border: lipgloss.Color("#292E42"),
+		Accent: lipgloss.Color("#7AA2F7"),
+		SelBg:  lipgloss.Color("#2F3549"),
+		Panel:  lipgloss.Color("#1A1B26"),
+	},
+}
+
+var (
+	colGreen  lipgloss.Color
+	colOrange lipgloss.Color
+	colYellow lipgloss.Color
+	colRed    lipgloss.Color
+	colCyan   lipgloss.Color
+	colViolet lipgloss.Color
+	colGray   lipgloss.Color
+	colMuted  lipgloss.Color
+	colText   lipgloss.Color
+	colSep    lipgloss.Color
+	colBorder lipgloss.Color
+	colAccent lipgloss.Color
+	colSelBg  lipgloss.Color
+	colPanel  lipgloss.Color
+
+	styleGreen  lipgloss.Style
+	styleOrange lipgloss.Style
+	styleYellow lipgloss.Style
+	styleRed    lipgloss.Style
+	styleCyan   lipgloss.Style
+	styleViolet lipgloss.Style
+	styleGray   lipgloss.Style
+	styleMuted  lipgloss.Style
+	styleText   lipgloss.Style
+	styleSep    lipgloss.Style
+	styleLabel  lipgloss.Style
+	styleAccent lipgloss.Style
+)
+
+func init() {
+	applyTheme(tuiThemes[0])
+}
+
+func applyTheme(th tuiTheme) {
+	colGreen = th.Green
+	colOrange = th.Orange
+	colYellow = th.Yellow
+	colRed = th.Red
+	colCyan = th.Cyan
+	colViolet = th.Violet
+	colGray = th.Gray
+	colMuted = th.Muted
+	colText = th.Text
+	colSep = th.Sep
+	colBorder = th.Border
+	colAccent = th.Accent
+	colSelBg = th.SelBg
+	colPanel = th.Panel
+
+	styleGreen = lipgloss.NewStyle().Foreground(colGreen).Bold(true)
 	styleOrange = lipgloss.NewStyle().Foreground(colOrange).Bold(true)
 	styleYellow = lipgloss.NewStyle().Foreground(colYellow).Bold(true)
-	styleRed    = lipgloss.NewStyle().Foreground(colRed).Bold(true)
-	styleCyan   = lipgloss.NewStyle().Foreground(colCyan).Bold(true)
-	styleGray   = lipgloss.NewStyle().Foreground(colGray)
-	styleMuted  = lipgloss.NewStyle().Foreground(colMuted)
-	styleText   = lipgloss.NewStyle().Foreground(colText)
-	styleSep    = lipgloss.NewStyle().Foreground(colSep)
-	styleLabel  = lipgloss.NewStyle().Foreground(colMuted)
-)
+	styleRed = lipgloss.NewStyle().Foreground(colRed).Bold(true)
+	styleCyan = lipgloss.NewStyle().Foreground(colCyan).Bold(true)
+	styleViolet = lipgloss.NewStyle().Foreground(colViolet).Bold(true)
+	styleGray = lipgloss.NewStyle().Foreground(colGray)
+	styleMuted = lipgloss.NewStyle().Foreground(colMuted)
+	styleText = lipgloss.NewStyle().Foreground(colText)
+	styleSep = lipgloss.NewStyle().Foreground(colSep)
+	styleLabel = lipgloss.NewStyle().Foreground(colMuted)
+	styleAccent = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+}
+
+func currentThemeName(idx int) string {
+	if idx < 0 || idx >= len(tuiThemes) {
+		return "unknown"
+	}
+	return tuiThemes[idx].Name
+}
 
 // ── spinner ───────────────────────────────────────────────────────────────────
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+var (
+	inlineCodeRe = regexp.MustCompile("`([^`]+)`")
+	boldRe       = regexp.MustCompile(`\*\*([^\*]+)\*\*`)
+)
 
 // ── wizard options ────────────────────────────────────────────────────────────
 
@@ -305,12 +449,20 @@ type tuiModel struct {
 	agentBlockTime time.Time // timestamp captured at block start
 	agentBlockText string    // raw accumulated text (unstyled) for the block
 
+	// replayingHistory suppresses notifications while replaying stored history
+	// so that old events don't trigger a burst of notifications on open.
+	replayingHistory bool
+
 	// reconnect state
 	wsReconnecting   bool
 	wsReconnectSince time.Time
 
 	// help overlay
 	showHelp bool
+
+	// zoo view
+	showZoo bool
+	zooBots []zooBot
 
 	// new-session wizard
 	wizardActive   bool
@@ -320,9 +472,14 @@ type tuiModel struct {
 	wizardSkip     int
 	wizardMode     int
 	wizardDirInput textinput.Model
+
+	// feed render options
+	renderMarkdown bool
+	compactBlocks  bool
+	themeIdx       int
 }
 
-func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) error {
+func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
 	api, err := newTUIAPIClient(serverURL)
 	if err != nil {
 		return err
@@ -342,6 +499,8 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		sessionLastState:  make(map[string]string),
 		historyPos:        0,
 		agentBlockIdx:     -1,
+		renderMarkdown:    true,
+		compactBlocks:     true,
 	}
 	m.logSystem("Connected to " + api.baseURL)
 	m.logSystem("↑/↓ or j/k navigate sessions  ·  Tab/Shift+Tab cycle sessions  ·  Enter connect/send  ·  n new session  ·  Ctrl+D delete")
@@ -353,7 +512,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		if err != nil {
 			m.logSystem("failed to get cwd: " + err.Error())
 		} else {
-			created, err := api.createSession(wd, backend, model, skip, false)
+			created, err := api.createSession(wd, backend, model, skip, plan)
 			if err != nil {
 				m.logSystem("Create session failed: " + err.Error())
 			} else {
@@ -386,7 +545,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip bool) 
 		}
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err = p.Run()
 	return err
 }
@@ -530,7 +689,7 @@ func (m *tuiModel) wizardCreate() (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) renderHelp() string {
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colAccent)
 	head := lipgloss.NewStyle().Foreground(colCyan).Bold(true)
 	key := lipgloss.NewStyle().Foreground(colText).Bold(true)
 	desc := lipgloss.NewStyle().Foreground(colMuted)
@@ -547,13 +706,19 @@ func (m *tuiModel) renderHelp() string {
 		row("Tab/Shift+Tab", "cycle sessions"),
 		row("Enter (empty input)", "connect to selected session"),
 		row("n", "new session wizard"),
+		row("z", "toggle agent zoo view"),
 		row("Ctrl+D", "delete selected session"),
 		"",
 		head.Render("  Feed"),
 		row("PgUp/PgDn", "scroll feed"),
 		row("g / G", "scroll to top / bottom"),
 		row("Ctrl+L", "clear feed"),
-		row("Mouse wheel", "scroll feed"),
+		row("Mouse drag", "select/highlight chat text"),
+		row("Ctrl+M", "toggle markdown rendering"),
+		row("Ctrl+B", "toggle compact/full blocks"),
+		row("Ctrl+T", "cycle theme"),
+		row("Ctrl+. / Ctrl+I", "abort running session"),
+		row("Ctrl+← / Ctrl+→", "move by word"),
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
@@ -569,6 +734,9 @@ func (m *tuiModel) renderHelp() string {
 		row("/allow <req> <opt>", "approve permission request"),
 		row("/skip [true|false]", "toggle skip-permissions"),
 		row("/plan [true|false]", "toggle plan mode"),
+		row("/markdown [on|off]", "toggle markdown rendering"),
+		row("/blocks [compact|full]", "toggle block density"),
+		row("/theme [name]", "switch tui theme"),
 		row("/delete [id]", "delete a session"),
 		row("/quit", "exit"),
 		"",
@@ -576,8 +744,9 @@ func (m *tuiModel) renderHelp() string {
 	}
 
 	panel := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colCyan).
+		Background(colPanel).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(colBorder).
 		Padding(0, 1).
 		Width(56).
 		Render(strings.Join(lines, "\n"))
@@ -588,7 +757,7 @@ func (m *tuiModel) renderHelp() string {
 func (m *tuiModel) renderWizard() string {
 	const wizW = 60
 
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colAccent)
 	focusedLabel := lipgloss.NewStyle().Foreground(colCyan).Bold(true)
 	dimLabel := lipgloss.NewStyle().Foreground(colMuted).Bold(true)
 	selOpt := lipgloss.NewStyle().Foreground(colGreen).Bold(true)
@@ -657,8 +826,9 @@ func (m *tuiModel) renderWizard() string {
 	lines = append(lines, styleMuted.Render("  Tab/Shift+Tab=next section  ↑/↓=select  Enter=create  Esc=cancel"))
 
 	panel := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colCyan).
+		Background(colPanel).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(colBorder).
 		Padding(0, 1).
 		Width(wizW).
 		Render(strings.Join(lines, "\n"))
@@ -674,6 +844,7 @@ func (m *tuiModel) Init() tea.Cmd {
 		waitExternalCmd(m.extCh),
 		tickCmd(),
 		spinnerTickCmd(),
+		zooTickCmd(),
 	)
 }
 
@@ -699,6 +870,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
 		return m, spinnerTickCmd()
+
+	case zooTickMsg:
+		if m.showZoo {
+			canvasW := max(20, m.width)
+			canvasH := max(8, m.height-6)
+			m.zooBots = updateZooBots(m.zooBots, m.sessions, canvasW, canvasH)
+		}
+		return m, zooTickCmd()
 
 	case tickMsg:
 		return m, tea.Batch(refreshSessionsCmd(m.api), tickCmd())
@@ -815,6 +994,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showHelp {
 			m.showHelp = false
 			return m, nil
+		}
+
+		// Zoo view intercepts all keys when active.
+		if m.showZoo {
+			return m.updateZoo(msg)
 		}
 
 		// While in delete-confirm mode, only y/n/esc are meaningful.
@@ -943,18 +1127,54 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case "ctrl+i":
+		case "ctrl+i", "ctrl+.", "ctrl+\\":
 			if m.activeSessionID != "" {
 				return m, sendWSCmd(m, map[string]any{"type": "interrupt"})
 			}
 			return m, nil
 
+		case "ctrl+left", "alt+b":
+			m.moveCursorWordLeft()
+			return m, nil
+
+		case "ctrl+right", "alt+f":
+			m.moveCursorWordRight()
+			return m, nil
+
 		case "ctrl+r", "f5":
 			return m, refreshSessionsCmd(m.api)
+
+		case "ctrl+m":
+			m.renderMarkdown = !m.renderMarkdown
+			m.logSystem("Markdown rendering: " + boolLabel(m.renderMarkdown))
+			m.rebuildViewport()
+			return m, nil
+
+		case "ctrl+b":
+			m.compactBlocks = !m.compactBlocks
+			if m.compactBlocks {
+				m.logSystem("Block mode: compact")
+			} else {
+				m.logSystem("Block mode: full")
+			}
+			return m, nil
+
+		case "ctrl+t":
+			m.themeIdx = (m.themeIdx + 1) % len(tuiThemes)
+			applyTheme(tuiThemes[m.themeIdx])
+			m.logSystem("Theme: " + tuiThemes[m.themeIdx].Name)
+			m.rebuildViewport()
+			return m, nil
 
 		case "n":
 			if m.input.Value() == "" {
 				m.openWizard()
+				return m, nil
+			}
+
+		case "z":
+			if m.input.Value() == "" {
+				m.showZoo = true
 				return m, nil
 			}
 
@@ -1008,45 +1228,60 @@ func (m *tuiModel) View() string {
 		return m.renderHelp()
 	}
 
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
-	panelStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("63")).
-		Padding(0, 1)
-	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62")).Bold(true)
-	activeStyle := lipgloss.NewStyle().Foreground(colGreen)
-
-	leftW := max(46, m.width*42/100)
-	rightW := max(50, m.width-leftW)
-	if leftW+rightW > m.width {
-		rightW = m.width - leftW
+	if m.showZoo {
+		return m.renderZoo()
 	}
 
-	// ── top bar ───────────────────────────────────────────────────────────────
-	topBar := panelStyle.Width(m.width - 2).Height(3).Render(
-		titleStyle.Render(" Orbitor  Mission Control ") +
-			"\n" +
-			styleMuted.Render(fmt.Sprintf(
-				"sessions=%d  selected=%s  connected=%s",
-				len(m.sessions),
-				m.selectedSessionID(),
-				defaultString(m.activeSessionID, "none"),
-			)),
-	)
+	// opencode-inspired: flat, low-contrast chrome with subtle panel tint.
+	panelStyle := lipgloss.NewStyle().
+		Background(colPanel).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(colBorder).
+		Padding(0, 1)
+	// Selected row: dark bg, white text.
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("255")).
+		Background(colSelBg).
+		Bold(true)
+	activeStyle := lipgloss.NewStyle().Foreground(colAccent)
+
+	// Sessions panel is ~19% of terminal width (≈ 2/3 of previous 28%).
+	leftW := max(22, m.width*19/100)
+	rightW := m.width - leftW
+	if rightW < 50 {
+		rightW = 50
+		leftW = m.width - rightW
+	}
+
+	// ── top bar (flat: one or two text lines + full-width separator) ──────────
+	connLabel := styleMuted.Render(defaultString(m.activeSessionID, "–"))
+	if m.activeSessionID != "" {
+		connLabel = styleAccent.Render(m.activeSessionID)
+	}
+	topRight := connLabel + styleMuted.Render("  ·  "+fmt.Sprintf("%d sessions", len(m.sessions)))
+	topLeft := styleAccent.Render("orbitor") + styleMuted.Render("  mission control")
+	topGap := m.width - lipgloss.Width(topLeft) - lipgloss.Width(topRight) - 2
+	if topGap < 1 {
+		topGap = 1
+	}
+	topLine := " " + topLeft + strings.Repeat(" ", topGap) + topRight
+	if strings.TrimSpace(m.missionTitle) != "" {
+		topLine += "\n" + styleMuted.Render(" "+m.missionTitle)
+	}
+	topBar := topLine + "\n" + styleSep.Render(strings.Repeat("─", m.width))
 	topBarH := lipgloss.Height(topBar)
 
 	// ── optional banners ──────────────────────────────────────────────────────
 	var banners []string
 
-	// Permission banner — shown whenever any session needs approval.
 	if pendingSessions := m.pendingPermissionSessions(); len(pendingSessions) > 0 {
-		lines := []string{styleYellow.Render("⚠ Permission approval required:")}
+		lines := []string{styleYellow.Render(" ⚠ permission required")}
 		for _, s := range pendingSessions {
 			name := defaultString(s.Title, s.ID)
 			lines = append(lines, styleMuted.Render("  "+name+"  ")+styleCyan.Render("/allow <requestId> <optionId>"))
 		}
 		banner := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(colYellow).
 			Padding(0, 1).
 			Width(m.width - 2).
@@ -1054,15 +1289,14 @@ func (m *tuiModel) View() string {
 		banners = append(banners, banner)
 	}
 
-	// Delete confirmation banner.
 	if m.deleteConfirmID != "" {
 		banner := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(colRed).
 			Padding(0, 1).
 			Width(m.width - 2).
-			Render(styleRed.Render("⚠ Delete session "+m.deleteConfirmID+"?") +
-				styleMuted.Render("  y = confirm  ·  any other key = cancel"))
+			Render(styleRed.Render(" ⚠ delete "+m.deleteConfirmID+"?") +
+				styleMuted.Render("  y=confirm  ·  any other key=cancel"))
 		banners = append(banners, banner)
 	}
 
@@ -1072,85 +1306,78 @@ func (m *tuiModel) View() string {
 	}
 
 	// ── status bar ────────────────────────────────────────────────────────────
-	statusLeft := fmt.Sprintf("  server: %s  ·  sessions: %d  ·  n=new  tab=cycle  ctrl+d=delete  ?=help  ctrl+c=quit", m.api.baseURL, len(m.sessions))
+	statusLeft := fmt.Sprintf("  %s  ·  n=new  z=zoo  tab=cycle  ctrl+d=del  ?=help", m.api.baseURL)
 	statusRight := time.Now().Format("15:04:05  ")
 	statusPad := m.width - lipgloss.Width(statusLeft) - lipgloss.Width(statusRight)
 	if statusPad < 0 {
 		statusPad = 0
 	}
-	statusBar := styleMuted.Render(statusLeft + strings.Repeat(" ", statusPad) + statusRight)
-	statusBarH := 1
+	statusBar := styleSep.Render(strings.Repeat("─", m.width)) + "\n" +
+		styleMuted.Render(statusLeft+strings.Repeat(" ", statusPad)+statusRight)
+	statusBarH := 2
 
 	// ── body layout ───────────────────────────────────────────────────────────
-	// Subtract 6 for the 3 bordered right-column panels (each border adds 2 lines).
 	bodyH := max(10, m.height-topBarH-bannerH-statusBarH-6)
-	detailsH := 9
+	detailsH := 8
 	if bodyH < 20 {
-		detailsH = 7
+		detailsH = 6
 	}
-	inputH := 4
+	inputH := 3
 	feedH := max(6, bodyH-detailsH-inputH)
 
-	// Left panel: add mission summary if available
-	var missionBlock string
-	if strings.TrimSpace(m.missionTitle) != "" || strings.TrimSpace(m.missionSummary) != "" {
-		mb := ""
-		if m.missionTitle != "" {
-			mb += styleText.Render(m.missionTitle) + "\n"
-		}
-		if m.missionSummary != "" {
-			mb += styleMuted.Render(m.missionSummary) + "\n"
-		}
-		missionBlock = mb + "\n"
+	// ── left panel (sessions) ─────────────────────────────────────────────────
+	sessionsAvailH := max(3, bodyH-1)
+	listW := max(20, leftW-4) // inner content width for separator lines
+	sessionsHeader := styleAccent.Render(" sessions")
+	if m.missionSummary != "" {
+		sessionsHeader += styleMuted.Render("  " + trimForLine(m.missionSummary, leftW-16))
 	}
-	// Calculate how many lines the sessions list can use inside the left panel:
-	// bodyH (inner) minus 1 for the " Sessions " header minus the mission block.
-	missionBlockH := 0
-	if missionBlock != "" {
-		missionBlockH = lipgloss.Height(missionBlock)
-	}
-	sessionsAvailH := max(3, bodyH-1-missionBlockH)
 	left := panelStyle.Width(leftW - 2).Height(bodyH).Render(
-		clampLines(titleStyle.Render(" Sessions ")+"\n"+missionBlock+m.renderMissionControl(selectedStyle, activeStyle, sessionsAvailH), bodyH),
+		clampLines(sessionsHeader+"\n"+m.renderMissionControl(selectedStyle, activeStyle, sessionsAvailH, listW), bodyH),
 	)
 
-	// Content width inside the right panel: frame (rightW-2) minus padding (1 each side).
+	// ── right panels ──────────────────────────────────────────────────────────
 	detailContentW := max(20, rightW-4)
 	detailBox := panelStyle.Width(rightW - 2).Height(detailsH).Render(
-		clampLines(titleStyle.Render(" Session Details ")+"\n"+m.renderDetails(detailContentW), detailsH),
+		clampLines(styleMuted.Render(" details")+"\n"+m.renderDetails(detailContentW), detailsH),
 	)
 
-	// Sync viewport height to the actual feedH (which accounts for current banner
-	// heights). resize() doesn't know about banners so we must do it here.
 	m.viewport.Height = max(4, feedH-3)
 
-	// Feed header with connected session, live/scroll indicator, and reconnect state.
-	feedHeader := titleStyle.Render(" Session Feed ")
+	feedHeader := styleMuted.Render(" feed")
+	feedHeader += styleMuted.Render("  theme:" + currentThemeName(m.themeIdx))
+	feedHeader += styleMuted.Render("  md:" + boolLabel(m.renderMarkdown))
+	if m.compactBlocks {
+		feedHeader += styleMuted.Render("  blocks:compact")
+	} else {
+		feedHeader += styleMuted.Render("  blocks:full")
+	}
 	if m.wsReconnecting {
 		elapsed := time.Since(m.wsReconnectSince).Round(time.Second)
 		feedHeader += styleYellow.Render("  ⟳ reconnecting… " + elapsed.String())
 	} else if m.activeSessionID != "" {
 		feedHeader += styleMuted.Render("  " + m.activeSessionID)
 	} else {
-		feedHeader += styleMuted.Render("  not connected")
+		feedHeader += styleMuted.Render("  –")
 	}
 	if m.viewport.AtBottom() {
-		feedHeader += styleGreen.Render("  ● LIVE")
+		feedHeader += styleAccent.Render("  ●")
 	} else {
-		feedHeader += styleMuted.Render("  ↑ scrolled · PgUp/PgDn · G=bottom")
+		feedHeader += styleMuted.Render("  ↑ PgUp/PgDn  G=bottom")
 	}
 	feedBox := panelStyle.Width(rightW - 2).Height(feedH).Render(feedHeader + "\n" + m.viewport.View())
 
-	// Input box hint line reflects current context.
+	var promptPrefix string
 	var hint string
 	if m.activeSessionID != "" {
-		hint = "Enter=send  ·  Ctrl+I=interrupt  ·  ↑/↓=history  ·  ?=help"
+		promptPrefix = styleAccent.Render(" ❯ ")
+		hint = "Enter=send  ·  Ctrl+./Ctrl+I=abort  ·  Ctrl+←/→ word-move  ·  ?=help"
 	} else {
-		hint = "Enter=connect  ·  n=new session  ·  ↑/↓=navigate  ·  ?=help"
+		promptPrefix = styleMuted.Render(" ❯ ")
+		hint = "Enter=connect  ·  n=new  ·  ↑/↓=navigate  ·  Ctrl+←/→ word-move  ·  ?=help"
 	}
 	inputBox := panelStyle.Width(rightW - 2).Height(inputH).Render(
-		styleCyan.Render(" ❯ ") + m.input.View() + "\n" +
-			styleMuted.Render("  "+hint),
+		promptPrefix + m.input.View() + "\n" + styleMuted.Render("  "+hint),
 	)
 
 	right := lipgloss.JoinVertical(lipgloss.Left, detailBox, feedBox, inputBox)
@@ -1209,7 +1436,7 @@ func (m *tuiModel) renderDetails(contentWidth int) string {
 	}
 	planStr := styleText.Render("false")
 	if s.PlanMode {
-		planStr = styleCyan.Render("true")
+		planStr = styleViolet.Render("true")
 	}
 	tool := defaultString(s.CurrentTool, "-")
 	toolStr := styleText.Render(tool)
@@ -1261,12 +1488,17 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /use <sessionId>")
 		m.logSystem("  /new <workingDir> [backend] [model] [skipPermissions(true|false)]")
 		m.logSystem("  /interrupt")
+		m.logSystem("  /abort")
 		m.logSystem("  /allow <requestId> <optionId>")
 		m.logSystem("  /skip [true|false] [id]")
 		m.logSystem("  /plan [true|false] [id]")
+		m.logSystem("  /markdown [on|off]")
+		m.logSystem("  /blocks [compact|full]")
+		m.logSystem("  /theme [name]")
+		m.logSystem("  /themes")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  ctrl+d=delete  ctrl+l=clear  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+./ctrl+i=abort  ctrl+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -1322,6 +1554,8 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		return createSessionCmd(m.api, wd, backend, model, skip, plan)
 	case "/interrupt":
 		return sendWSCmd(m, map[string]any{"type": "interrupt"})
+	case "/abort":
+		return sendWSCmd(m, map[string]any{"type": "interrupt"})
 	case "/allow":
 		if len(fields) < 3 {
 			m.logSystem("Usage: /allow <requestId> <optionId>")
@@ -1374,6 +1608,71 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 			}
 		}
 		return updateSessionCmd(m.api, target.ID, target.SkipPermissions, nextPlan)
+	case "/markdown":
+		if len(fields) < 2 {
+			m.logSystem("Usage: /markdown [on|off]")
+			return nil
+		}
+		switch strings.ToLower(fields[1]) {
+		case "on", "true", "1":
+			m.renderMarkdown = true
+		case "off", "false", "0":
+			m.renderMarkdown = false
+		default:
+			m.logSystem("Usage: /markdown [on|off]")
+			return nil
+		}
+		m.logSystem("Markdown rendering: " + boolLabel(m.renderMarkdown))
+		m.rebuildViewport()
+		return nil
+	case "/blocks":
+		if len(fields) < 2 {
+			m.logSystem("Usage: /blocks [compact|full]")
+			return nil
+		}
+		switch strings.ToLower(fields[1]) {
+		case "compact":
+			m.compactBlocks = true
+		case "full":
+			m.compactBlocks = false
+		default:
+			m.logSystem("Usage: /blocks [compact|full]")
+			return nil
+		}
+		if m.compactBlocks {
+			m.logSystem("Block mode: compact")
+		} else {
+			m.logSystem("Block mode: full")
+		}
+		return nil
+	case "/theme":
+		if len(fields) < 2 {
+			var names []string
+			for _, th := range tuiThemes {
+				names = append(names, th.Name)
+			}
+			m.logSystem("Themes: " + strings.Join(names, ", "))
+			return nil
+		}
+		want := strings.ToLower(fields[1])
+		for i, th := range tuiThemes {
+			if strings.EqualFold(th.Name, want) {
+				m.themeIdx = i
+				applyTheme(th)
+				m.logSystem("Theme: " + th.Name)
+				m.rebuildViewport()
+				return nil
+			}
+		}
+		m.logSystem("Unknown theme: " + fields[1])
+		return nil
+	case "/themes":
+		var names []string
+		for _, th := range tuiThemes {
+			names = append(names, th.Name)
+		}
+		m.logSystem("Themes: " + strings.Join(names, ", "))
+		return nil
 	case "/delete":
 		if len(m.sessions) == 0 {
 			m.logSystem("No sessions available")
@@ -1411,9 +1710,11 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 		// This handles both initial connect and reconnect cleanly.
 		m.logs = nil
 		m.agentBlockIdx = -1
+		m.replayingHistory = true
 		for _, it := range h.Messages {
 			m.renderMessage(it)
 		}
+		m.replayingHistory = false
 		m.rebuildViewport()
 		return
 	}
@@ -1424,10 +1725,29 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 	m.renderMessage(msg)
 }
 
+// ── chat display helpers ───────────────────────────────────────────────────────
+
+func (m *tuiModel) chatWidth() int {
+	if m.viewport.Width > 4 {
+		return m.viewport.Width
+	}
+	return 80
+}
+
+// turnHeader renders a visual separator line for a conversation turn:
+//
+//	── role  ·  14:23 ──────────────────────────────
+func (m *tuiModel) turnHeader(role string, roleStyle lipgloss.Style, ts string) string {
+	_ = roleStyle
+	_ = m.chatWidth()
+	return styleMuted.Render("  " + role + "  " + ts)
+}
+
 // ── renderMessage ─────────────────────────────────────────────────────────────
 
 func (m *tuiModel) renderMessage(msg WSMessage) {
-	ts := styleMuted.Render(time.Now().Format("15:04") + " ")
+	tsStr := time.Now().Format("15:04")
+	w := m.chatWidth()
 
 	// Agent text is coalesced into a single growing log entry so the feed reads
 	// as flowing prose rather than one line per network chunk.
@@ -1438,13 +1758,14 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		}
 		if m.agentBlockIdx >= 0 && m.agentBlockIdx < len(m.logs) {
 			m.agentBlockText += d.Text
-			blockTS := styleMuted.Render(m.agentBlockTime.Format("15:04") + " ")
-			m.logs[m.agentBlockIdx] = blockTS + styleText.Render(m.agentBlockText)
+			body := m.renderRichTextBlock(m.agentBlockText, w, false)
+			m.logs[m.agentBlockIdx] = body
 		} else {
 			m.agentBlockIdx = len(m.logs)
 			m.agentBlockTime = time.Now()
 			m.agentBlockText = d.Text
-			m.logs = append(m.logs, ts+styleText.Render(d.Text))
+			body := m.renderRichTextBlock(d.Text, w, false)
+			m.logs = append(m.logs, body)
 			if len(m.logs) > 4000 {
 				m.logs = m.logs[len(m.logs)-4000:]
 				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
@@ -1469,62 +1790,64 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Text string `json:"text"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log("")
-			m.log(ts + styleCyan.Render("❯ ") + styleText.Render(d.Text))
+			hdr := m.turnHeader("you", styleCyan, tsStr)
+			body := styleCyan.Render(wrapWords(d.Text, w, ""))
+			m.log(hdr + "\n" + body)
 		}
 
 	case "tool_call":
 		var d WSToolCall
 		if json.Unmarshal(msg.Data, &d) == nil {
-			var icon string
-			var titleStyle lipgloss.Style
+			icon, iconCol := toolKindIcon(d.Kind)
+			iconSty := lipgloss.NewStyle().Foreground(iconCol)
+
+			// Status determines the leading sigil and colour.
+			var sigil string
+			var sigilSty lipgloss.Style
 			switch d.Status {
 			case "success", "done":
-				icon = "✓"
-				titleStyle = styleGreen
+				sigil, sigilSty = "✓", styleGreen
 			case "error":
-				icon = "✗"
-				titleStyle = styleRed
-			default:
-				icon = "⚙"
-				titleStyle = styleOrange
+				sigil, sigilSty = "✗", styleRed
+			default: // pending / running
+				sigil, sigilSty = icon, iconSty
 			}
-			line := ts + titleStyle.Render(icon+" "+d.Title) + styleMuted.Render(" ("+d.Kind+")")
-			m.log(line)
-			if d.Content != "" {
-				// Show first line; if content has more lines hint at it.
-				lines := strings.SplitN(strings.TrimSpace(d.Content), "\n", 3)
-				m.log(styleMuted.Render("  → ") + trimForLine(lines[0], 120))
-				if len(lines) > 1 {
-					remaining := strings.Count(d.Content, "\n")
-					m.log(styleMuted.Render(fmt.Sprintf("  [+%d lines]", remaining)))
-				}
+
+			titleStr := trimForLine(d.Title, w-14)
+			kindLabel := styleMuted.Render("  " + d.Kind)
+			titleLine := "  " + sigilSty.Render(sigil) + " " + styleText.Render(titleStr) + kindLabel
+
+			if d.Content == "" {
+				// Inline tool — single compact line.
+				m.log(titleLine)
+			} else {
+				// Block tool — title then content behind a coloured │ rail.
+				m.log(titleLine)
+				m.log(m.renderRichTextBlock(d.Content, w, true))
 			}
 		}
 
 	case "tool_result":
 		var d WSToolResult
 		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
-			lines := strings.SplitN(strings.TrimSpace(d.Content), "\n", 3)
-			m.log(styleMuted.Render("  ↳ ") + trimForLine(lines[0], 120))
-			if len(lines) > 1 {
-				remaining := strings.Count(d.Content, "\n")
-				m.log(styleMuted.Render(fmt.Sprintf("  [+%d lines]", remaining)))
-			}
+			m.log(m.renderRichTextBlock(d.Content, w, true))
 		}
 
 	case "permission_request":
 		var d WSPermissionRequest
 		if json.Unmarshal(msg.Data, &d) == nil {
 			m.log("")
-			m.log(ts + styleYellow.Render("⚠ Permission Required: ") + styleText.Render(d.Title))
+			m.log("  " + styleYellow.Render("permission required") + styleMuted.Render("  "+d.Title))
 			if d.Command != "" {
-				m.log(styleMuted.Render("  cmd: ") + styleText.Render(d.Command))
+				m.log(styleMuted.Render("    $ ") + styleText.Render(d.Command))
 			}
 			for _, o := range d.Options {
-				m.log(styleCyan.Render("  ["+o.OptionID+"] ") + o.Name + styleMuted.Render(" ("+o.Kind+")"))
+				m.log("    " + styleCyan.Render("["+o.OptionID+"]") + "  " + styleText.Render(o.Name) + styleMuted.Render("  "+o.Kind))
 			}
-			m.log(styleMuted.Render("  Use: /allow " + d.RequestID + " <optionId>"))
+			m.log(styleMuted.Render("    /allow " + d.RequestID + " <optionId>"))
+			if !m.replayingHistory {
+				go sendNotification("Permission needed", m.sessionDisplayName()+" is waiting for approval")
+			}
 		}
 
 	case "permission_resolved":
@@ -1533,16 +1856,31 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			OptionID  string `json:"optionId"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log(ts + styleGreen.Render("✓ Approved ") + styleMuted.Render(d.RequestID+" → "+d.OptionID))
+			m.log("  " + styleGreen.Render("approved") + styleMuted.Render("  "+d.OptionID))
 		}
 
 	case "run_complete":
 		var d struct {
 			StopReason string `json:"stopReason"`
+			PRURL      string `json:"prUrl"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log("")
-			m.log(ts + styleGreen.Render("✓ Done") + styleMuted.Render("  "+d.StopReason))
+			hdr := m.turnHeader("done", styleGreen, tsStr)
+			entry := "\n" + hdr
+			if d.StopReason != "" && d.StopReason != "end_turn" {
+				entry += "\n" + styleMuted.Render("   "+d.StopReason)
+			}
+			m.log(entry)
+			if d.PRURL != "" {
+				m.log("   " + styleCyan.Render("PR: ") + d.PRURL)
+			}
+			notifBody := m.sessionDisplayName()
+			if d.StopReason != "" {
+				notifBody += " — " + d.StopReason
+			}
+			if !m.replayingHistory {
+				go sendNotification("Agent finished", notifBody)
+			}
 		}
 
 	case "status":
@@ -1550,22 +1888,242 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Status string `json:"status"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil && d.Status != "" {
-			m.log(styleMuted.Render("  ∙ " + d.Status))
+			m.log(styleMuted.Render("   status: " + d.Status))
 		}
 
 	case "error":
 		var d WSError
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log(ts + styleRed.Render("✗ Error: ") + d.Message)
+			m.log("  " + styleRed.Render("error") + styleMuted.Render("  "+d.Message))
 		}
 	}
+}
+
+// ── message formatting helpers ─────────────────────────────────────────────────
+
+// msgLeftBar prefixes each line with a coloured ┃ bar — used for "you" turns.
+func msgLeftBar(text string, barColor lipgloss.Color) string {
+	bar := lipgloss.NewStyle().Foreground(barColor).Render("┃") + " "
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		lines[i] = " " + bar + styleText.Render(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// toolKindIcon maps a tool kind string to an opencode-style display icon and accent colour.
+func toolKindIcon(kind string) (string, lipgloss.Color) {
+	k := strings.ToLower(kind)
+	switch {
+	case strings.Contains(k, "bash") || strings.Contains(k, "exec") || k == "run_command" || k == "execute":
+		return "$", colOrange
+	case strings.Contains(k, "write") || strings.Contains(k, "create"):
+		return "←", colGreen
+	case strings.Contains(k, "edit") || strings.Contains(k, "patch") || strings.Contains(k, "modify"):
+		return "≈", colCyan
+	case strings.Contains(k, "read") || strings.Contains(k, "view") || strings.Contains(k, "cat"):
+		return "→", colMuted
+	case strings.Contains(k, "glob") || strings.Contains(k, "find") || strings.Contains(k, "list"):
+		return "✱", colMuted
+	case strings.Contains(k, "grep") || strings.Contains(k, "search"):
+		return "✱", colCyan
+	case strings.Contains(k, "web") || strings.Contains(k, "fetch") || strings.Contains(k, "browser") || strings.Contains(k, "url"):
+		return "%", colCyan
+	case strings.Contains(k, "task") || strings.Contains(k, "agent"):
+		return "│", colCyan
+	default:
+		return "⚙", colMuted
+	}
+}
+
+func boolLabel(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
+func (m *tuiModel) renderRichTextBlock(text string, width int, toolOutput bool) string {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return ""
+	}
+	if isLikelyDiff(t) {
+		return m.renderDiffBlock(t, width)
+	}
+	return m.renderMarkdownBlock(t, width, toolOutput)
+}
+
+func (m *tuiModel) renderMarkdownBlock(text string, width int, toolOutput bool) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	maxLines := len(lines)
+	if toolOutput && m.compactBlocks {
+		maxLines = min(maxLines, 14)
+	}
+
+	var out []string
+	inCode := false
+	codeLang := ""
+	codeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("251")).Background(lipgloss.Color("236"))
+	for i := 0; i < maxLines; i++ {
+		line := lines[i]
+		trim := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trim, "```") {
+			inCode = !inCode
+			codeLang = strings.TrimSpace(strings.TrimPrefix(trim, "```"))
+			if inCode && codeLang != "" {
+				out = append(out, styleMuted.Render("code: "+codeLang))
+			}
+			continue
+		}
+
+		if inCode {
+			wrapped := wrapWords(line, max(12, width), "")
+			for _, wl := range strings.Split(wrapped, "\n") {
+				out = append(out, codeStyle.Render(" "+wl))
+			}
+			continue
+		}
+
+		if strings.HasPrefix(trim, "#") {
+			level := 0
+			for level < len(trim) && trim[level] == '#' {
+				level++
+			}
+			head := strings.TrimSpace(trim[level:])
+			if head == "" {
+				continue
+			}
+			sty := styleAccent
+			if level >= 3 {
+				sty = styleCyan
+			}
+			out = append(out, sty.Render(strings.ToUpper(trimForLine(head, max(12, width)))))
+			continue
+		}
+
+		if strings.HasPrefix(trim, "- ") || strings.HasPrefix(trim, "* ") {
+			item := strings.TrimSpace(trim[2:])
+			item = m.applyInlineMarkdown(item)
+			out = append(out, styleMuted.Render("• ")+styleText.Render(wrapWords(item, max(12, width-2), "")))
+			continue
+		}
+
+		rendered := line
+		if m.renderMarkdown {
+			rendered = m.applyInlineMarkdown(line)
+		}
+		if strings.TrimSpace(rendered) == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, styleText.Render(wrapWords(rendered, max(12, width), "")))
+	}
+
+	if maxLines < len(lines) {
+		out = append(out, styleMuted.Render(fmt.Sprintf("[+%d lines]", len(lines)-maxLines)))
+	}
+	return strings.Join(out, "\n")
+}
+
+func (m *tuiModel) applyInlineMarkdown(line string) string {
+	if !m.renderMarkdown {
+		return line
+	}
+	line = boldRe.ReplaceAllStringFunc(line, func(match string) string {
+		sub := boldRe.FindStringSubmatch(match)
+		if len(sub) != 2 {
+			return match
+		}
+		return lipgloss.NewStyle().Bold(true).Render(sub[1])
+	})
+	line = inlineCodeRe.ReplaceAllStringFunc(line, func(match string) string {
+		sub := inlineCodeRe.FindStringSubmatch(match)
+		if len(sub) != 2 {
+			return match
+		}
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("238")).Render(" " + sub[1] + " ")
+	})
+	return line
+}
+
+func (m *tuiModel) renderDiffBlock(diff string, width int) string {
+	lines := strings.Split(strings.ReplaceAll(diff, "\r\n", "\n"), "\n")
+	maxLines := len(lines)
+	if m.compactBlocks {
+		maxLines = min(maxLines, 24)
+	}
+	var out []string
+	for i := 0; i < maxLines; i++ {
+		l := lines[i]
+		switch {
+		case strings.HasPrefix(l, "diff --git"), strings.HasPrefix(l, "index "):
+			out = append(out, styleMuted.Render(trimForLine(l, max(12, width))))
+		case strings.HasPrefix(l, "@@"):
+			out = append(out, styleCyan.Render(trimForLine(l, max(12, width))))
+		case strings.HasPrefix(l, "+++"), strings.HasPrefix(l, "---"):
+			out = append(out, styleAccent.Render(trimForLine(l, max(12, width))))
+		case strings.HasPrefix(l, "+"):
+			out = append(out, styleGreen.Render(trimForLine(l, max(12, width))))
+		case strings.HasPrefix(l, "-"):
+			out = append(out, styleRed.Render(trimForLine(l, max(12, width))))
+		default:
+			out = append(out, styleText.Render(trimForLine(l, max(12, width))))
+		}
+	}
+	if maxLines < len(lines) {
+		out = append(out, styleMuted.Render(fmt.Sprintf("[+%d diff lines]", len(lines)-maxLines)))
+	}
+	return strings.Join(out, "\n")
+}
+
+func isLikelyDiff(text string) bool {
+	s := strings.TrimSpace(text)
+	if strings.Contains(s, "\ndiff --git ") || strings.HasPrefix(s, "diff --git ") {
+		return true
+	}
+	if strings.Contains(s, "\n@@ ") || strings.HasPrefix(s, "@@ ") {
+		return true
+	}
+	if strings.Contains(s, "\n+++ ") && strings.Contains(s, "\n--- ") {
+		return true
+	}
+	return false
+}
+
+// ── macOS notifications ───────────────────────────────────────────────────────
+
+// sendNotification fires a macOS notification with sound via osascript.
+// Runs in the background so it never blocks the TUI render loop.
+func sendNotification(title, body string) {
+	script := fmt.Sprintf(`display notification %q with title %q sound name "Default"`, body, title)
+	_ = exec.Command("osascript", "-e", script).Start()
+}
+
+// sessionDisplayName returns the human-readable name for the currently
+// active session — its Title if set, otherwise the base of its working dir.
+func (m *tuiModel) sessionDisplayName() string {
+	for _, s := range m.sessions {
+		if s.ID == m.activeSessionID {
+			if s.Title != "" {
+				return s.Title
+			}
+			return filepath.Base(s.WorkingDir)
+		}
+	}
+	return "session"
 }
 
 // ── layout helpers ────────────────────────────────────────────────────────────
 
 func (m *tuiModel) resize() {
-	leftW := max(46, m.width*42/100)
-	rightW := max(50, m.width-leftW)
+	leftW := max(22, m.width*19/100)
+	rightW := m.width - leftW
+	if rightW < 50 {
+		rightW = 50
+		leftW = m.width - rightW
+	}
 	vw := max(24, rightW-8)
 	m.viewport.Width = vw
 	// Viewport height is set in View() where the actual banner height is known.
@@ -1574,10 +2132,34 @@ func (m *tuiModel) resize() {
 
 func (m *tuiModel) rebuildViewport() {
 	atBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	m.viewport.SetContent(m.renderViewportContent())
 	if atBottom {
 		m.viewport.GotoBottom()
 	}
+}
+
+func (m *tuiModel) renderViewportContent() string {
+	w := m.chatWidth()
+	bg := lipgloss.NewStyle().Background(colPanel)
+	var out []string
+	for _, entry := range m.logs {
+		lines := strings.Split(entry, "\n")
+		for _, line := range lines {
+			out = append(out, bg.Render(padToWidth(line, w)))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func padToWidth(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lw := lipgloss.Width(s)
+	if lw >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-lw)
 }
 
 func (m *tuiModel) log(s string) {
@@ -1713,14 +2295,14 @@ func spinnerTickCmd() tea.Cmd {
 
 // ── renderMissionControl ──────────────────────────────────────────────────────
 
-func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style, availH int) string {
+func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style, availH int, listW int) string {
 	if len(m.sessions) == 0 {
 		return styleMuted.Render("  No sessions yet\n\n") +
 			styleText.Render("  Press ") + styleCyan.Render("n") + styleText.Render(" to start a new session\n") +
 			styleText.Render("  Press ") + styleCyan.Render("?") + styleText.Render(" for help")
 	}
 
-	linesPerSession := 3 // 2 content lines + 1 separator
+	linesPerSession := 4 // 3 content lines + 1 separator
 	maxSessions := max(1, availH/linesPerSession)
 	start := 0
 	if m.selected >= maxSessions {
@@ -1746,16 +2328,35 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		if s.Model != "" {
 			backendModel += ":" + trimForLine(s.Model, 16)
 		}
+		titleText := defaultString(s.Title, defaultString(s.CurrentPrompt, defaultString(s.LastMessage, "—")))
+		fullPath := homeTildePath(s.WorkingDir)
 
-		subtitle := trimForLine(defaultString(s.Title, defaultString(s.CurrentPrompt, defaultString(s.LastMessage, "—"))), 48)
+		// Build inline badges for plan/skip modes.
+		var badges string
+		if s.PlanMode {
+			badges += " " + styleViolet.Render("[P]")
+		}
+		if s.SkipPermissions {
+			badges += " " + styleOrange.Render("[S]")
+		}
 
+		stateLabel := state
+		switch state {
+		case "working":
+			stateLabel = "working"
+			if elapsed := m.sessionStateStart[s.ID]; !elapsed.IsZero() {
+				stateLabel += " " + formatElapsed(time.Since(elapsed))
+			}
+		case "waiting-input":
+			stateLabel = "waiting"
+		}
+		topLine := trimForLine(prefix+s.ID+"  "+stateLabel+"  "+backendModel, max(10, listW))
+		botLine := trimForLine("  "+fullPath, max(10, listW))
+		sep := styleSep.Render(strings.Repeat("─", listW))
 		if isSelected {
-			topLine := selectedStyle.Render(" " + prefix + s.ID + "  " + state + "  " + backendModel + " ")
-			botLine := selectedStyle.Render("   " + shortPath(s.WorkingDir) + "  " + subtitle + " ")
-			sep := styleSep.Render(strings.Repeat("─", 42))
-			out = append(out, topLine, botLine, sep)
+			titleLine := trimForLine("  "+titleText, max(10, listW))
+			out = append(out, selectedStyle.Render(topLine), selectedStyle.Render(titleLine), selectedStyle.Render(botLine), sep)
 		} else {
-			// Animated spinner for active states.
 			var stateTag string
 			switch state {
 			case "working":
@@ -1769,18 +2370,17 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			case "starting":
 				stateTag = styleCyan.Render(spinnerFrames[m.spinnerFrame] + " starting")
 			case "waiting-input":
-				stateTag = styleYellow.Render("⚠ waiting-input")
+				stateTag = styleYellow.Render("waiting")
 			default:
 				stateTag = stateStyle(state).Render(state)
 			}
-
-			topLine := prefix + s.ID + "  " + stateTag + "  " + styleMuted.Render(backendModel)
-			botLine := "   " + styleMuted.Render(shortPath(s.WorkingDir)+"  "+subtitle)
-			sep := styleSep.Render(strings.Repeat("─", 42))
+			topLine := prefix + s.ID + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
+			titleLine := styleText.Render(trimForLine("  "+titleText, max(10, listW)))
+			botLine := styleMuted.Render(trimForLine("  "+fullPath, max(10, listW)))
 			if isActive {
-				topLine = activeStyle.Render(topLine)
+				topLine = activeStyle.Render(prefix+s.ID) + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
 			}
-			out = append(out, topLine, botLine, sep)
+			out = append(out, trimForLine(topLine, max(10, listW))+badges, titleLine, botLine, sep)
 		}
 	}
 
@@ -1821,6 +2421,65 @@ func shortPath(path string) string {
 	return path
 }
 
+func (m *tuiModel) moveCursorWordLeft() {
+	runes := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos <= 0 {
+		m.input.SetCursor(0)
+		return
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+	for pos > 0 && isWordBoundaryRune(runes[pos-1]) {
+		pos--
+	}
+	for pos > 0 && !isWordBoundaryRune(runes[pos-1]) {
+		pos--
+	}
+	m.input.SetCursor(pos)
+}
+
+func (m *tuiModel) moveCursorWordRight() {
+	runes := []rune(m.input.Value())
+	pos := m.input.Position()
+	n := len(runes)
+	if pos >= n {
+		m.input.SetCursor(n)
+		return
+	}
+	for pos < n && isWordBoundaryRune(runes[pos]) {
+		pos++
+	}
+	for pos < n && !isWordBoundaryRune(runes[pos]) {
+		pos++
+	}
+	m.input.SetCursor(pos)
+}
+
+func isWordBoundaryRune(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n' || r == '/' || r == '\\' || r == ':' || r == '.' || r == '-' || r == '_' || r == ',' || r == ';' || r == '(' || r == ')' || r == '[' || r == ']'
+}
+
+func homeTildePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	home = strings.TrimSuffix(home, "/")
+	if path == home {
+		return "~"
+	}
+	if strings.HasPrefix(path, home+"/") {
+		return "~/" + strings.TrimPrefix(path, home+"/")
+	}
+	return path
+}
+
 func defaultString(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback
@@ -1834,6 +2493,45 @@ func trimForLine(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-1] + "…"
+}
+
+// wrapWords word-wraps text to maxWidth, prefixing every output line with indent.
+// Blank lines in the source are preserved as empty lines in the output.
+func wrapWords(text string, maxWidth int, indent string) string {
+	lineW := maxWidth - len(indent)
+	if lineW < 10 {
+		lineW = 10
+	}
+	var result []string
+	for _, para := range strings.Split(text, "\n") {
+		if strings.TrimSpace(para) == "" {
+			result = append(result, "")
+			continue
+		}
+		words := strings.Fields(para)
+		var line strings.Builder
+		lineLen := 0
+		for _, word := range words {
+			wl := len(word)
+			if lineLen == 0 {
+				line.WriteString(word)
+				lineLen = wl
+			} else if lineLen+1+wl <= lineW {
+				line.WriteByte(' ')
+				line.WriteString(word)
+				lineLen += 1 + wl
+			} else {
+				result = append(result, indent+line.String())
+				line.Reset()
+				line.WriteString(word)
+				lineLen = wl
+			}
+		}
+		if line.Len() > 0 {
+			result = append(result, indent+line.String())
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 func formatElapsed(d time.Duration) string {

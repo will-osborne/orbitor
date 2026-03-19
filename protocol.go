@@ -283,5 +283,6 @@ type WSSessionInfo struct {
 	PendingPermission bool      `json:"pendingPermission"`
 	Title             string    `json:"title,omitempty"`
 	Summary           string    `json:"summary,omitempty"`
+	PRURL             string    `json:"prUrl,omitempty"`
 	CreatedAt         time.Time `json:"createdAt"`
 }
