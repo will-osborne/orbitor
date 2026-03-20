@@ -1456,6 +1456,11 @@ func (s *Session) Interrupt() {
 	if s.queue != nil {
 		s.queue.Clear()
 	}
+	// Send SIGINT to the agent process immediately so it stops regardless of
+	// whether the ACP notification is processed in time.
+	if s.process != nil && s.process.Process != nil {
+		_ = s.process.Process.Signal(syscall.SIGINT)
+	}
 	if s.acp != nil && s.ACPSession != "" {
 		_ = s.acp.Notify("session/interrupt", map[string]string{"sessionId": s.ACPSession})
 	}

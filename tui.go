@@ -744,6 +744,14 @@ type tuiModel struct {
 
 	// sidebar visibility
 	hideSidebar bool
+
+	// cached max rows available for the input editor; set each View() cycle
+	// so Update() can eagerly resize the textarea and keep scroll correct.
+	inputMaxH int
+
+	// interactive permission-request overlay
+	permRequest  *WSPermissionRequest
+	permSelected int
 }
 
 func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
@@ -757,7 +765,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 	in.CharLimit = 32000
 	in.ShowLineNumbers = false
 	in.Prompt = "❯ "
-	in.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", string([]rune{shiftEnterPrivate})), key.WithHelp("shift+enter", "newline"))
+	in.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", string([]rune{shiftEnterPrivate}), "ctrl+j"), key.WithHelp("shift+enter/ctrl+j", "newline"))
 	in.KeyMap.WordBackward = key.NewBinding(key.WithKeys("alt+left", "ctrl+left", "alt+b"), key.WithHelp("ctrl+left", "word backward"))
 	in.KeyMap.WordForward = key.NewBinding(key.WithKeys("alt+right", "ctrl+right", "alt+f"), key.WithHelp("ctrl+right", "word forward"))
 	in.KeyMap.LineStart = key.NewBinding(key.WithKeys("home", "ctrl+a"), key.WithHelp("home", "line start"))
@@ -799,7 +807,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter newline  ·  Ctrl+V attach/paste  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter/Ctrl+J newline  ·  Ctrl+V attach/paste  ·  n new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -841,18 +849,9 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 
-	// Enable keyboard protocols so terminals send distinct sequences for
-	// Shift+Enter and Alt/Option+Enter.
-	//
-	// \x1b[>4;2m  – xterm modifyOtherKeys level 2: terminals like xterm and
-	//               older iTerm2 will send \x1b[27;mod;13~ for modified Enter.
-	// \x1b[=1u    – Kitty keyboard protocol "disambiguate" flag: modern
-	//               terminals (Ghostty, WezTerm, newer iTerm2, etc.) send
-	//               \x1b[13;mod u for modified Enter and \x1b[13u for plain
-	//               Enter. Unsupported terminals ignore this harmlessly.
-	//
-	// shiftEnterFilter handles all of the resulting sequences.
-	fmt.Print("\x1b[>4;2m\x1b[=1u")
+	// Keyboard protocol enable sequences are sent from Init() after the
+	// alt screen is active (so they apply to the alt-screen keyboard stack).
+	// Disable sequences are sent here on exit to restore the terminal.
 	defer fmt.Print("\x1b[>4;0m\x1b[=0u")
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(shiftEnterFilter))
@@ -998,6 +997,98 @@ func (m *tuiModel) wizardCreate() (tea.Model, tea.Cmd) {
 	return m, createSessionCmd(m.api, wd, backend, model, skip, plan)
 }
 
+// ── permission-request overlay ────────────────────────────────────────────────
+
+func (m *tuiModel) updatePermRequest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	d := m.permRequest
+	switch msg.String() {
+	case "ctrl+c":
+		m.closeConn()
+		return m, tea.Quit
+	case "esc":
+		m.permRequest = nil
+		return m, nil
+	case "up", "k":
+		if m.permSelected > 0 {
+			m.permSelected--
+		}
+		return m, nil
+	case "down", "j":
+		if m.permSelected < len(d.Options)-1 {
+			m.permSelected++
+		}
+		return m, nil
+	case "enter":
+		opt := d.Options[m.permSelected]
+		m.permRequest = nil
+		return m, sendWSCmd(m, map[string]any{
+			"type":      "permission_response",
+			"requestId": d.RequestID,
+			"optionId":  opt.OptionID,
+		})
+	}
+	// number keys 1–9 for quick selection
+	if len(msg.String()) == 1 && msg.String() >= "1" && msg.String() <= "9" {
+		idx := int(msg.String()[0]-'1')
+		if idx < len(d.Options) {
+			opt := d.Options[idx]
+			m.permRequest = nil
+			return m, sendWSCmd(m, map[string]any{
+				"type":      "permission_response",
+				"requestId": d.RequestID,
+				"optionId":  opt.OptionID,
+			})
+		}
+	}
+	return m, nil
+}
+
+func (m *tuiModel) renderPermRequest() string {
+	d := m.permRequest
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colYellow)
+	selOpt := lipgloss.NewStyle().Foreground(colGreen).Bold(true)
+	dimOpt := lipgloss.NewStyle().Foreground(colText)
+	kindStyle := lipgloss.NewStyle().Foreground(colMuted)
+
+	var lines []string
+	lines = append(lines, titleStyle.Render("  ⏸ Permission Required"))
+	lines = append(lines, "")
+	lines = append(lines, "  "+styleText.Render(d.Title))
+	if d.Command != "" {
+		lines = append(lines, "")
+		lines = append(lines, styleMuted.Render("  $ ")+styleText.Render(d.Command))
+	}
+	lines = append(lines, "")
+	for i, o := range d.Options {
+		prefix := "  "
+		if len(d.Options) <= 9 {
+			prefix = fmt.Sprintf("  %d. ", i+1)
+		}
+		name := o.Name
+		kind := ""
+		if o.Kind != "" {
+			kind = "  " + kindStyle.Render(o.Kind)
+		}
+		if i == m.permSelected {
+			lines = append(lines, selOpt.Render(prefix+"▶ "+name)+kind)
+		} else {
+			lines = append(lines, dimOpt.Render(prefix+"  "+name)+kind)
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, styleMuted.Render("  ↑/↓=select  Enter=confirm  Esc=dismiss"))
+
+	panel := lipgloss.NewStyle().
+		Background(colPanel).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(colYellow).
+		Padding(0, 1).
+		Width(60).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
 func (m *tuiModel) renderHelp() string {
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colAccent)
 	head := lipgloss.NewStyle().Foreground(colCyan).Bold(true)
@@ -1033,7 +1124,7 @@ func (m *tuiModel) renderHelp() string {
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
-		row("Shift+Enter", "insert newline in prompt"),
+		row("Shift+Enter / Ctrl+J", "insert newline in prompt"),
 		row("Alt+Enter", "send prompt to cloned session"),
 		row("Ctrl+V", "paste clipboard image or file path"),
 		row("Hold Space", "push-to-talk dictation"),
@@ -1157,12 +1248,26 @@ func (m *tuiModel) renderWizard() string {
 
 func (m *tuiModel) Init() tea.Cmd {
 	return tea.Batch(
+		// Enable keyboard enhancement protocols so that Shift+Enter and
+		// Alt+Enter send distinct escape sequences. Written directly to stdout
+		// here (after alt-screen entry) so the sequences apply to the
+		// alt-screen keyboard stack, not the main screen.
+		// \x1b[>4;2m – xterm modifyOtherKeys level 2
+		// \x1b[=1u   – Kitty keyboard protocol disambiguate flag
+		enableKittyKeyboardCmd(),
 		refreshSessionsCmd(m.api),
 		waitExternalCmd(m.extCh),
 		tickCmd(),
 		spinnerTickCmd(),
 		zooTickCmd(),
 	)
+}
+
+func enableKittyKeyboardCmd() tea.Cmd {
+	return func() tea.Msg {
+		os.Stdout.WriteString("\x1b[>4;2m\x1b[=1u")
+		return nil
+	}
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -1455,6 +1560,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizardActive {
 			return m.updateWizard(msg)
 		}
+		// When a permission request is pending, route all key events to it.
+		if m.permRequest != nil {
+			return m.updatePermRequest(msg)
+		}
 		// Robust fallback for terminals that encode word-nav as Alt+arrow.
 		if msg.Type == tea.KeyLeft && msg.Alt {
 			m.moveCursorWordLeft()
@@ -1711,10 +1820,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case "shift+enter", string([]rune{shiftEnterPrivate}):
-			m.insertAtCursor("\n")
-			return m, nil
-
 		case "enter":
 			raw := m.input.Value()
 			if strings.TrimSpace(raw) == "" {
@@ -1770,6 +1875,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	// Eagerly resize the textarea so its internal scroll offset is
+	// recalculated with the correct height before the next View() call.
+	// Without this, inserting a newline when height=1 causes the textarea to
+	// scroll the first line out of view before View() can widen the box.
+	if m.inputMaxH > 0 {
+		m.input.SetHeight(m.promptEditorHeight(m.inputMaxH - 1))
+	}
 	return m, cmd
 }
 
@@ -1782,6 +1894,10 @@ func (m *tuiModel) View() string {
 
 	if m.wizardActive {
 		return m.renderWizard()
+	}
+
+	if m.permRequest != nil {
+		return m.renderPermRequest()
 	}
 
 	if m.showHelp {
@@ -1893,6 +2009,7 @@ func (m *tuiModel) View() string {
 		thinkingH = 3
 	}
 	inputMaxH := max(3, bodyH-detailsH-thinkingH-6)
+	m.inputMaxH = inputMaxH
 	inputEditorH := m.promptEditorHeight(inputMaxH - 1)
 	m.input.SetHeight(inputEditorH)
 	inputH := inputEditorH + 1
@@ -1955,7 +2072,7 @@ func (m *tuiModel) View() string {
 
 	var hint string
 	if m.activeSessionID != "" {
-		hint = "Enter=send(queue)  ·  Shift+Enter=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
+		hint = "Enter=send(queue)  ·  Shift+Enter/Ctrl+J=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
 	} else {
 		hint = "Enter=connect  ·  Shift+Enter=new line  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
 	}
@@ -2537,30 +2654,31 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			}
 			m.log(m.renderToolChatBubble("assistant · tool", tsStr, strings.Join(metaParts, "\n"), d.Content, colOrange, false))
 			m.isThinking = true
-			m.pushThinking("tool: " + trimForLine(defaultString(d.Title, d.Kind), 70))
 		}
 
 	case "tool_result":
 		var d WSToolResult
 		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
 			m.log(m.renderFeedSection("tool result", styleGreen, m.renderRichTextBlock(d.Content, w, true)))
-			m.pushThinking("tool result")
 		}
 
 	case "permission_request":
 		var d WSPermissionRequest
 		if json.Unmarshal(msg.Data, &d) == nil {
-			m.log("")
-			m.log("  " + styleYellow.Render("⏸ permission required") + styleMuted.Render("  "+d.Title))
-			if d.Command != "" {
-				m.log(styleMuted.Render("    $ ") + styleText.Render(d.Command))
-			}
-			for _, o := range d.Options {
-				m.log("    " + styleCyan.Render("["+o.OptionID+"]") + "  " + styleText.Render(o.Name) + styleMuted.Render("  "+o.Kind))
-			}
-			m.log(styleMuted.Render("    /allow " + d.RequestID + " <optionId>"))
 			if !m.replayingHistory {
+				m.permRequest = &d
+				m.permSelected = 0
 				go sendNotification("Permission needed", m.sessionDisplayName()+" is waiting for approval")
+			} else {
+				// During history replay just log it inline; no interactive overlay.
+				m.log("")
+				m.log("  " + styleYellow.Render("⏸ permission required") + styleMuted.Render("  "+d.Title))
+				if d.Command != "" {
+					m.log(styleMuted.Render("    $ ") + styleText.Render(d.Command))
+				}
+				for _, o := range d.Options {
+					m.log("    " + styleCyan.Render("["+o.OptionID+"]") + "  " + styleText.Render(o.Name) + styleMuted.Render("  "+o.Kind))
+				}
 			}
 			m.isThinking = true
 		}
@@ -2571,6 +2689,10 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			OptionID  string `json:"optionId"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
+			// Clear the overlay if it's still showing (e.g. resolved from another client).
+			if m.permRequest != nil && m.permRequest.RequestID == d.RequestID {
+				m.permRequest = nil
+			}
 			m.log("  " + styleGreen.Render("✓ approved") + styleMuted.Render("  "+d.OptionID))
 			m.isThinking = false
 		}
@@ -4150,12 +4272,10 @@ func (m *tuiModel) selectedSessionID() string {
 func (m *tuiModel) startPTTCapture() tea.Cmd {
 	return func() tea.Msg {
 		if runtime.GOOS == "darwin" && !m.pttDisableNativeLive {
-			m.extCh <- infoMsg{text: "Dictation debug: attempting native live dictation"}
-			msg := m.startDarwinStreamingPTTCapture()
+				msg := m.startDarwinStreamingPTTCapture()
 			if msg.err == nil {
 				return msg
 			}
-			m.extCh <- infoMsg{text: "Dictation debug: native live dictation startup failed: " + msg.err.Error()}
 			legacy := m.startLegacyPTTCapture()
 			legacy.disableNative = true
 			legacy.disableNote = nativeDictationFallbackNote(msg.err)
@@ -4197,7 +4317,6 @@ func (m *tuiModel) startDarwinStreamingPTTCapture() sttStartedMsg {
 	if err != nil {
 		return sttStartedMsg{err: err}
 	}
-	m.extCh <- infoMsg{text: "Dictation debug: native helper path " + helperPath}
 	cmd := exec.Command(helperPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -4213,9 +4332,6 @@ func (m *tuiModel) startDarwinStreamingPTTCapture() sttStartedMsg {
 	}
 	if err := cmd.Start(); err != nil {
 		return sttStartedMsg{err: err}
-	}
-	if cmd.Process != nil {
-		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper started pid=%d", cmd.Process.Pid)}
 	}
 	go m.consumeDarwinSpeechStream(cmd, stdout, stderr)
 	return sttStartedMsg{proc: cmd, stdin: stdin, streaming: true}
@@ -4235,9 +4351,6 @@ func (m *tuiModel) stopPTTCapture() tea.Cmd {
 		m.pttProcInput = nil
 		if m.pttStreaming {
 			m.pttReleaseAt = time.Now()
-			if proc != nil && proc.Process != nil {
-				m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: sending stop to native helper pid=%d", proc.Process.Pid)}
-			}
 			if procInput != nil {
 				_, _ = io.WriteString(procInput, "stop\n")
 				_ = procInput.Close()
@@ -4295,10 +4408,6 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 	defer stdout.Close()
 	defer stderr.Close()
 
-	pid := 0
-	if cmd != nil && cmd.Process != nil {
-		pid = cmd.Process.Pid
-	}
 	stderrDone := make(chan string, 1)
 	go func() {
 		b, _ := io.ReadAll(stderr)
@@ -4315,19 +4424,15 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 		}
 		var evt darwinSpeechEvent
 		if err := json.Unmarshal([]byte(line), &evt); err != nil {
-			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper emitted non-JSON stdout (pid=%d): %s", pid, truncateDebugText(line, 160))}
 			continue
 		}
 		switch evt.Type {
 		case "ready":
-			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper ready (pid=%d)", pid)}
 			continue
 		case "partial":
-			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native partial chars=%d", len([]rune(strings.TrimSpace(evt.Text))))}
 			m.extCh <- sttPartialMsg{text: evt.Text, external: true}
 		case "final":
 			terminalSeen = true
-			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native final chars=%d", len([]rune(strings.TrimSpace(evt.Text))))}
 			delay := time.Duration(0)
 			if !m.pttReleaseAt.IsZero() {
 				delay = time.Since(m.pttReleaseAt)
@@ -4339,7 +4444,6 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 			if msg == "" {
 				msg = "native dictation failed"
 			}
-			m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper error event (pid=%d): %s", pid, truncateDebugText(msg, 200))}
 			err := fmt.Errorf("%s", msg)
 			m.extCh <- sttResultMsg{
 				err:           err,
@@ -4352,15 +4456,6 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
 	stderrText := <-stderrDone
-	if scanErr != nil {
-		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native stdout scan error (pid=%d): %s", pid, scanErr)}
-	}
-	if stderrText != "" {
-		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper stderr (pid=%d): %s", pid, truncateDebugText(stderrText, 240))}
-	}
-	if waitErr != nil {
-		m.extCh <- infoMsg{text: fmt.Sprintf("Dictation debug: native helper exit (pid=%d): %s", pid, describeProcessFailure(waitErr))}
-	}
 	if terminalSeen {
 		return
 	}
@@ -4412,15 +4507,6 @@ func describeProcessFailure(err error) string {
 	}
 }
 
-func truncateDebugText(text string, limit int) string {
-	text = strings.TrimSpace(text)
-	if limit <= 0 || len([]rune(text)) <= limit {
-		return text
-	}
-	runes := []rune(text)
-	return string(runes[:limit]) + "..."
-}
-
 func ensureDarwinSpeechHelperBinary() (string, error) {
 	if runtime.GOOS != "darwin" {
 		return "", fmt.Errorf("native streaming dictation is only available on macOS")
@@ -4454,8 +4540,33 @@ func ensureDarwinSpeechHelperBinary() (string, error) {
 		return binaryPath, nil
 	}
 
+	plistPath := filepath.Join(dir, "orbitor-native-dictation-Info.plist")
+	const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.orbitor.native-dictation</string>
+	<key>CFBundleName</key>
+	<string>orbitor-native-dictation</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Orbitor uses the microphone for voice dictation.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Orbitor uses speech recognition to transcribe your voice input.</string>
+</dict>
+</plist>
+`
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
+		return "", err
+	}
+
 	tmpPath := binaryPath + ".tmp"
-	cmd := exec.Command(swiftcPath, sourcePath, "-o", tmpPath)
+	cmd := exec.Command(swiftcPath, sourcePath,
+		"-Xlinker", "-sectcreate",
+		"-Xlinker", "__TEXT",
+		"-Xlinker", "__info_plist",
+		"-Xlinker", plistPath,
+		"-o", tmpPath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -4463,7 +4574,14 @@ func ensureDarwinSpeechHelperBinary() (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
+		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("compile native dictation helper failed: %s", msg)
+	}
+	// swiftc embeds the output filename as the code signing identifier, so the .tmp suffix
+	// ends up baked in. Re-sign with the correct identifier before rename so that macOS TCC
+	// can track microphone/speech permissions under a stable identity.
+	if codesignPath, csErr := exec.LookPath("codesign"); csErr == nil {
+		_ = exec.Command(codesignPath, "--sign", "-", "--force", "--identifier", "orbitor-native-dictation", tmpPath).Run()
 	}
 	if err := os.Rename(tmpPath, binaryPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -4507,7 +4625,16 @@ final class DictationDriver {
     private var task: SFSpeechRecognitionTask?
     private var stopRequested = false
     private var terminalSent = false
-    private var lastText = ""
+    // Text committed from segments that auto-finalized due to long pauses.
+    private var committedText = ""
+    // Text from the current in-progress recognition segment.
+    private var segmentText = ""
+
+    private func combinedText() -> String {
+        if committedText.isEmpty { return segmentText }
+        if segmentText.isEmpty { return committedText }
+        return committedText + " " + segmentText
+    }
 
     func run() {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -4521,12 +4648,17 @@ final class DictationDriver {
             }
         }
 
-        SFSpeechRecognizer.requestAuthorization { status in
-            DispatchQueue.main.async {
-                guard status == .authorized else {
-                    self.fail("speech recognition permission " + authLabel(status))
-                    return
-                }
+        // Do not call requestAuthorization or requestAccess — on macOS 14+ those calls
+        // crash with SIGABRT from the TCC framework when invoked from a subprocess context,
+        // even with a properly embedded Info.plist.  Mic and speech-recognition access flow
+        // through the responsible process (e.g. the terminal app that launched orbitor);
+        // if that process has the required permissions the audio engine and recognizer will
+        // work without explicit authorization.  For denied/restricted states we fail cleanly.
+        DispatchQueue.main.async {
+            let speechStatus = SFSpeechRecognizer.authorizationStatus()
+            if speechStatus == .denied || speechStatus == .restricted {
+                self.fail("speech recognition permission " + authLabel(speechStatus))
+            } else {
                 self.startRecognition()
             }
         }
@@ -4539,17 +4671,6 @@ final class DictationDriver {
             fail("speech recognizer unavailable")
             return
         }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if #available(macOS 10.15, *) {
-            request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
-        }
-        request.taskHint = .dictation
-        if #available(macOS 13.0, *) {
-            request.addsPunctuation = true
-        }
-        self.request = request
 
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
@@ -4567,25 +4688,58 @@ final class DictationDriver {
         }
 
         emit(type: "ready")
+        startNewRecognitionTask()
+    }
 
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+    // Creates a fresh recognition task on a new request. The audio tap writes into
+    // self.request, so updating that pointer redirects audio without reinstalling the tap.
+    private func startNewRecognitionTask() {
+        guard !stopRequested, !terminalSent, let recognizer = recognizer else { return }
+
+        task?.cancel()
+        segmentText = ""
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        if #available(macOS 10.15, *) {
+            req.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
+        }
+        req.taskHint = .dictation
+        if #available(macOS 13.0, *) {
+            req.addsPunctuation = true
+        }
+        request = req
+
+        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
 
             if let result = result {
                 let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty {
-                    self.lastText = text
-                    if self.stopRequested && result.isFinal {
-                        self.finish(text)
+                self.segmentText = text
+                let combined = self.combinedText()
+
+                if result.isFinal {
+                    if self.stopRequested {
+                        self.finish(combined)
                         return
                     }
-                    emit(type: "partial", text: text)
+                    // Auto-finalized due to long pause: commit and restart so subsequent
+                    // speech appends rather than replaces the accumulated text.
+                    if !text.isEmpty {
+                        self.committedText = combined
+                    }
+                    self.startNewRecognitionTask()
+                    return
+                }
+
+                if !combined.isEmpty {
+                    emit(type: "partial", text: combined)
                 }
             }
 
             if let error = error {
                 if self.stopRequested {
-                    self.finish(self.lastText)
+                    self.finish(self.combinedText())
                 } else {
                     self.fail(error.localizedDescription)
                 }
@@ -4602,7 +4756,7 @@ final class DictationDriver {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             if !self.terminalSent {
-                self.finish(self.lastText)
+                self.finish(self.combinedText())
             }
         }
     }
@@ -4889,7 +5043,7 @@ func (m *tuiModel) updatePlaceholder() {
 		case "working":
 			m.input.Placeholder = "Session is busy — Ctrl+\\ to interrupt..."
 		case "waiting-input":
-			m.input.Placeholder = "Session needs permission — /allow <requestId> <optionId>"
+			m.input.Placeholder = "Session needs permission — press any key to open approval dialog"
 		default:
 			m.input.Placeholder = "Type a prompt and press Enter..."
 		}
