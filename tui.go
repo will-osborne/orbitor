@@ -1260,7 +1260,22 @@ func (m *tuiModel) Init() tea.Cmd {
 		tickCmd(),
 		spinnerTickCmd(),
 		zooTickCmd(),
+		prewarmDarwinSpeechHelperCmd(),
 	)
+}
+
+// prewarmDarwinSpeechHelperCmd compiles the native dictation helper in the
+// background at startup so the first dictation attempt is instant. Errors are
+// silently ignored — the helper will try again (and surface the error) when
+// dictation is actually invoked.
+func prewarmDarwinSpeechHelperCmd() tea.Cmd {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	return func() tea.Msg {
+		_, _ = ensureDarwinSpeechHelperBinary()
+		return nil
+	}
 }
 
 func enableKittyKeyboardCmd() tea.Cmd {
@@ -1444,6 +1459,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			default:
 				m.logSystem("Dictation inserted")
 			}
+		} else if msg.external {
+			// Native streaming path returned empty — audio engine ran but nothing was
+			// transcribed. Most commonly a TCC permission issue after a binary update.
+			m.logSystem("No speech detected — if this persists, check Microphone and Speech Recognition permissions for your terminal in System Settings > Privacy & Security, then run: rm -rf ~/.orbitor/bin")
 		}
 		m.resetPTTTrigger()
 		if msg.external {
@@ -1706,18 +1725,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "pgdown":
 			m.viewport.HalfPageDown()
 			return m, nil
-
-		case "g":
-			if m.input.Value() == "" {
-				m.viewport.GotoTop()
-				return m, nil
-			}
-
-		case "G":
-			if m.input.Value() == "" {
-				m.viewport.GotoBottom()
-				return m, nil
-			}
 
 		case "ctrl+.", "ctrl+\\":
 			if m.activeSessionID != "" {
@@ -2210,7 +2217,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll  g/G=top/bottom")
+		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -4533,8 +4540,17 @@ func ensureDarwinSpeechHelperBinary() (string, error) {
 		}
 		compile = true
 	}
-	if _, err := os.Stat(binaryPath); err != nil {
+	if helperStat, err := os.Stat(binaryPath); err != nil {
 		compile = true
+	} else if selfPath, selfErr := os.Executable(); selfErr == nil {
+		// Re-compile if the orbitor binary is newer than the cached helper — this
+		// ensures a Homebrew update triggers a fresh compile+codesign so that macOS
+		// TCC associates the new binary identity with the helper.
+		if selfStat, selfErr := os.Stat(selfPath); selfErr == nil {
+			if selfStat.ModTime().After(helperStat.ModTime()) {
+				compile = true
+			}
+		}
 	}
 	if !compile {
 		return binaryPath, nil

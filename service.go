@@ -112,11 +112,7 @@ func ServiceLogs() {
 
 // serviceInstallDarwin installs the launchd plist and loads it.
 func serviceInstallDarwin() {
-	binaryPath, err := os.Executable()
-	if err != nil {
-		fmt.Printf("Error detecting executable path: %v\n", err)
-		binaryPath = "orbitor"
-	}
+	binaryPath := resolveServiceBinaryPath()
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -194,11 +190,7 @@ func serviceUninstallDarwin() {
 
 // serviceInstallLinux installs the systemd user unit and enables it.
 func serviceInstallLinux() {
-	binaryPath, err := os.Executable()
-	if err != nil {
-		fmt.Printf("Error detecting executable path: %v\n", err)
-		binaryPath = "orbitor"
-	}
+	binaryPath := resolveServiceBinaryPath()
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -264,6 +256,25 @@ func serviceUninstallLinux() {
 	fmt.Println("Reloading systemd daemon...")
 	runCmd("systemctl", "--user", "daemon-reload")
 	fmt.Println("orbitor server service uninstalled.")
+}
+
+// resolveServiceBinaryPath returns a stable path for the orbitor binary suitable for
+// embedding in a launchd plist or systemd unit. When installed via Homebrew, os.Executable
+// returns the versioned Cellar path (e.g. /opt/homebrew/Cellar/orbitor/1.2.3/bin/orbitor)
+// which is deleted on upgrade, causing the service to die and not restart. We detect that
+// case and return the stable opt symlink (/opt/homebrew/bin/orbitor) instead.
+func resolveServiceBinaryPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "orbitor"
+	}
+	// If running directly from a Homebrew Cellar, look up the stable PATH entry.
+	if strings.Contains(exe, "/Cellar/") {
+		if stable, err := exec.LookPath("orbitor"); err == nil {
+			return stable
+		}
+	}
+	return exe
 }
 
 // runCmd runs a command, printing its combined output. Errors are reported but not fatal.
