@@ -67,6 +67,13 @@ type Session struct {
 	subAgentsMu sync.RWMutex
 	subAgents   []SubAgentInfo
 
+	// bgContMu guards the background-continuation debounce timer.
+	// After run_complete, if background sub-agents are still running, their
+	// completion triggers a silent continuation prompt so Claude can respond
+	// with the results without waiting for the user to send a new message.
+	bgContMu    sync.Mutex
+	bgContTimer *time.Timer
+
 	// agentTextCh batches frequent agent_text chunks to reduce broadcast frequency
 	agentTextCh    chan string
 	agentTextDone  chan struct{}
@@ -132,6 +139,37 @@ func (s *Session) completeSubAgent(toolCallID string) {
 			return
 		}
 	}
+}
+
+// scheduleBackgroundContinuation debounces a silent follow-up prompt after
+// background sub-agents complete post-run_complete. The follow-up is sent to
+// the ACP backend so Claude can generate a text response about the results
+// (which would otherwise only appear when the user sends the next prompt).
+func (s *Session) scheduleBackgroundContinuation() {
+	s.summaryMu.RLock()
+	running := s.isRunning
+	s.summaryMu.RUnlock()
+	if running {
+		return // Main prompt still active — don't schedule
+	}
+	s.bgContMu.Lock()
+	defer s.bgContMu.Unlock()
+	if s.bgContTimer != nil {
+		s.bgContTimer.Stop()
+	}
+	// Debounce 2 s: if multiple sub-agents complete close together, only send
+	// one follow-up prompt after the last one settles.
+	s.bgContTimer = time.AfterFunc(2*time.Second, func() {
+		s.summaryMu.RLock()
+		running := s.isRunning
+		s.summaryMu.RUnlock()
+		if running {
+			return // A user prompt arrived before the timer fired
+		}
+		if s.queue != nil {
+			s.queue.Enqueue("\u200b") // zero-width space = silent continuation
+		}
+	})
 }
 
 type SessionManager struct {
@@ -732,6 +770,16 @@ func (s *Session) finishACPSetup(workingDir string) {
 
 	s.queue = NewPromptQueue(func(item PromptItem) {
 		defer close(item.Done)
+		// The zero-width space sentinel (\u200b) is an auto-generated continuation
+		// prompt sent after background sub-agents complete. It is silent: no
+		// prompt_sent broadcast, no persistence, and it sends a minimal "." to
+		// Claude so it can respond with the background task results.
+		isContinuation := item.Text == "\u200b"
+		acpText := item.Text
+		if isContinuation {
+			acpText = "."
+		}
+
 		s.summaryMu.Lock()
 		s.lastMessage = ""
 		s.currentTool = ""
@@ -739,24 +787,26 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.isRunning = true
 		s.summaryMu.Unlock()
 		s.persistSession()
-		promptPayload := map[string]string{"text": item.Text}
-		s.hub.Broadcast("prompt_sent", promptPayload)
-		// Broadcast updated queue depth (decremented since this item just dequeued).
-		s.hub.Broadcast("queue_update", map[string]int{"depth": s.queue.QueueDepth()})
 		var promptID int64
-		if s.store != nil {
-			id, err := s.store.InsertPrompt(s.ID, item.Text)
-			if err == nil {
-				promptID = id
+		if !isContinuation {
+			promptPayload := map[string]string{"text": item.Text}
+			s.hub.Broadcast("prompt_sent", promptPayload)
+			// Broadcast updated queue depth (decremented since this item just dequeued).
+			s.hub.Broadcast("queue_update", map[string]int{"depth": s.queue.QueueDepth()})
+			if s.store != nil {
+				id, err := s.store.InsertPrompt(s.ID, item.Text)
+				if err == nil {
+					promptID = id
+				}
+				_ = s.store.SaveMessageJSON(s.ID, "prompt_sent", promptPayload)
 			}
-			_ = s.store.SaveMessageJSON(s.ID, "prompt_sent", promptPayload)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		s.interruptMu.Lock()
 		s.interruptCancel = cancel
 		s.interruptMu.Unlock()
-		result, err := s.acp.SessionPromptContext(ctx, acpSessionID, item.Text)
+		result, err := s.acp.SessionPromptContext(ctx, acpSessionID, acpText)
 		s.interruptMu.Lock()
 		s.interruptCancel = nil
 		s.interruptMu.Unlock()
@@ -783,7 +833,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.flushAgentText()
 		completePayload := map[string]string{"stopReason": result.StopReason, "prUrl": prURL}
 		s.hub.Broadcast("run_complete", completePayload)
-		if s.eventHub != nil {
+		if s.eventHub != nil && !isContinuation {
 			sessionName := filepath.Base(s.WorkingDir)
 			title := "Agent finished"
 			body := sessionName + " — " + result.StopReason
@@ -825,7 +875,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 			}
 			go s.fcm.Send(title, body, fcmData)
 		}
-		if s.store != nil {
+		if s.store != nil && !isContinuation {
 			_ = s.store.SaveMessageJSON(s.ID, "run_complete", completePayload)
 			if promptID != 0 {
 				_ = s.store.UpdatePromptStatus(promptID, "done")
@@ -1029,6 +1079,13 @@ func (s *Session) Close() {
 }
 
 func (s *Session) teardown() {
+	s.bgContMu.Lock()
+	if s.bgContTimer != nil {
+		s.bgContTimer.Stop()
+		s.bgContTimer = nil
+	}
+	s.bgContMu.Unlock()
+
 	if s.queue != nil {
 		s.queue.Close()
 	}
@@ -1193,6 +1250,11 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 				subStatus = "running"
 			}
 			s.updateSubAgent(tc.ToolCallID, tc.Title, subStatus)
+			// When a background sub-agent completes after the main turn, schedule
+			// a silent follow-up so Claude can reply with the results.
+			if tc.Status == "completed" || tc.Status == "failed" {
+				s.scheduleBackgroundContinuation()
+			}
 		}
 		// Try rich content array first, then fall back to rawInput for context.
 		content := formatToolContent(tc.Content)
@@ -1230,6 +1292,7 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 		s.summaryMu.Unlock()
 		s.persistSession()
 		s.completeSubAgent(tr.ToolCallID)
+		s.scheduleBackgroundContinuation()
 		content := formatToolContent(tr.Result)
 		if content == "" && len(tr.Result) > 0 {
 			content = string(tr.Result)
