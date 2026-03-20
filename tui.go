@@ -4487,7 +4487,7 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 
 func nativeDictationFallbackNote(err error) string {
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "abort trap") {
-		return "Native live dictation crashed; falling back to local file transcription for this session. Check microphone and speech permissions in macOS."
+		return "Native live dictation crashed (likely Speech Recognition permission not granted). Enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition, then try again. Falling back to local file transcription for this session."
 	}
 	return "Native live dictation unavailable; falling back to local file transcription for this session."
 }
@@ -4664,18 +4664,27 @@ final class DictationDriver {
             }
         }
 
-        // Do not call requestAuthorization or requestAccess — on macOS 14+ those calls
-        // crash with SIGABRT from the TCC framework when invoked from a subprocess context,
-        // even with a properly embedded Info.plist.  Mic and speech-recognition access flow
-        // through the responsible process (e.g. the terminal app that launched orbitor);
-        // if that process has the required permissions the audio engine and recognizer will
-        // work without explicit authorization.  For denied/restricted states we fail cleanly.
         DispatchQueue.main.async {
             let speechStatus = SFSpeechRecognizer.authorizationStatus()
-            if speechStatus == .denied || speechStatus == .restricted {
-                self.fail("speech recognition permission " + authLabel(speechStatus))
-            } else {
+            switch speechStatus {
+            case .authorized:
                 self.startRecognition()
+            case .notDetermined:
+                // Permission has never been granted. requestAuthorization may crash with
+                // SIGABRT on macOS 14+ in a subprocess context — if it does, the Go side
+                // detects the crash and falls back to legacy dictation with an error message
+                // prompting the user to grant Speech Recognition in System Settings.
+                SFSpeechRecognizer.requestAuthorization { newStatus in
+                    DispatchQueue.main.async {
+                        if newStatus == .authorized {
+                            self.startRecognition()
+                        } else {
+                            self.fail("speech recognition permission " + authLabel(newStatus) + " — enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition")
+                        }
+                    }
+                }
+            default:
+                self.fail("speech recognition permission " + authLabel(speechStatus) + " — enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition")
             }
         }
 
