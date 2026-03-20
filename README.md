@@ -197,7 +197,20 @@ The Orbitor mobile app lets you monitor sessions, read output, send prompts, and
 3. Tap a session to open the chat view
 4. Tap the permission banner to approve or deny requests
 
-Push notifications are sent when a session completes a run or needs your attention (requires Firebase configuration on the server — see `config/config.yaml`).
+Push notifications are sent when a session completes a run or needs your attention.
+
+### Push notification setup (self-hosted)
+
+The pre-built APK is configured to use the maintainer's Firebase project. If you're self-hosting and want push notifications, you'll need to wire up your own Firebase project:
+
+1. Create a project at [console.firebase.google.com](https://console.firebase.google.com)
+2. Add an Android app with package name matching `mobile/android/app/build.gradle.kts`
+3. Download `google-services.json` and replace `mobile/android/app/google-services.json`
+4. In Project Settings → Service Accounts, generate a new private key and save the JSON file on your server
+5. Set `firebase.service_account_path` in your `config/config.yaml` to point at that file
+6. Rebuild the APK: `cd mobile && flutter build apk --release`
+
+> **Note:** This is intentionally manual for now. A future release will replace this with a self-hostable push relay (e.g. [ntfy](https://ntfy.sh)) that requires no Firebase account or APK rebuild.
 
 ### Mobile development
 
