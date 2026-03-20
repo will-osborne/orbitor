@@ -807,7 +807,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter/Ctrl+J newline  ·  Ctrl+V attach/paste  ·  n new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter/Ctrl+J newline  ·  Ctrl+V attach/paste  ·  Ctrl+N new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -1106,7 +1106,7 @@ func (m *tuiModel) renderHelp() string {
 		row("↑/↓", "scroll chat feed"),
 		row("Tab/Shift+Tab", "cycle sessions"),
 		row("Enter (empty input)", "connect to selected session"),
-		row("n", "new session wizard"),
+		row("Ctrl+N", "new session wizard"),
 		row("z", "toggle agent zoo view"),
 		row("e", "expand/collapse sub-agents"),
 		row("Ctrl+D", "delete selected session"),
@@ -1808,7 +1808,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resize()
 			return m, nil
 
-		case "n":
+		case "ctrl+n":
 			if m.input.Value() == "" {
 				m.openWizard()
 				return m, nil
@@ -2217,7 +2217,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
+		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -3832,7 +3832,7 @@ func (m *tuiModel) sessionVisualLines(idx int) int {
 func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Style, availH int, listW int) string {
 	if len(m.sessions) == 0 {
 		return styleMuted.Render("  No sessions yet\n\n") +
-			styleText.Render("  Press ") + styleCyan.Render("n") + styleText.Render(" to start a new session\n") +
+			styleText.Render("  Press ") + styleCyan.Render("Ctrl+N") + styleText.Render(" to start a new session\n") +
 			styleText.Render("  Press ") + styleCyan.Render("?") + styleText.Render(" for help")
 	}
 
@@ -4340,7 +4340,21 @@ func (m *tuiModel) startDarwinStreamingPTTCapture() sttStartedMsg {
 	if err := cmd.Start(); err != nil {
 		return sttStartedMsg{err: err}
 	}
-	go m.consumeDarwinSpeechStream(cmd, stdout, stderr)
+	// Wait for the binary to signal ready (or fail) before returning.
+	// This catches permission failures synchronously so the caller can
+	// fall back to legacy dictation without requiring a second space-hold.
+	readyCh := make(chan error, 1)
+	go m.consumeDarwinSpeechStream(cmd, stdout, stderr, readyCh)
+	select {
+	case startErr := <-readyCh:
+		if startErr != nil {
+			_ = cmd.Process.Kill()
+			return sttStartedMsg{err: startErr}
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		return sttStartedMsg{err: fmt.Errorf("native dictation startup timeout")}
+	}
 	return sttStartedMsg{proc: cmd, stdin: stdin, streaming: true}
 }
 
@@ -4411,7 +4425,7 @@ type darwinSpeechEvent struct {
 	Message string `json:"message,omitempty"`
 }
 
-func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser, stderr io.ReadCloser) {
+func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser, stderr io.ReadCloser, readyCh chan<- error) {
 	defer stdout.Close()
 	defer stderr.Close()
 
@@ -4420,6 +4434,15 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 		b, _ := io.ReadAll(stderr)
 		stderrDone <- strings.TrimSpace(string(b))
 	}()
+
+	readySignaled := false
+	signalReady := func(err error) {
+		if readySignaled {
+			return
+		}
+		readySignaled = true
+		readyCh <- err
+	}
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -4435,6 +4458,7 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 		}
 		switch evt.Type {
 		case "ready":
+			signalReady(nil)
 			continue
 		case "partial":
 			m.extCh <- sttPartialMsg{text: evt.Text, external: true}
@@ -4452,6 +4476,13 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 				msg = "native dictation failed"
 			}
 			err := fmt.Errorf("%s", msg)
+			// If ready hasn't been signaled yet, this is a startup failure
+			// (e.g. permission denied). Signal the caller so it can fall back
+			// to legacy dictation synchronously.
+			if !readySignaled {
+				signalReady(err)
+				return
+			}
 			m.extCh <- sttResultMsg{
 				err:           err,
 				disableNative: true,
@@ -4467,6 +4498,10 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 		return
 	}
 	if scanErr != nil {
+		if !readySignaled {
+			signalReady(scanErr)
+			return
+		}
 		m.extCh <- sttResultMsg{err: scanErr, external: true}
 		return
 	}
@@ -4476,6 +4511,10 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 			msg = waitErr.Error()
 		}
 		err := fmt.Errorf("native dictation failed: %s", msg)
+		if !readySignaled {
+			signalReady(err)
+			return
+		}
 		m.extCh <- sttResultMsg{
 			err:           err,
 			disableNative: true,
@@ -4486,8 +4525,12 @@ func (m *tuiModel) consumeDarwinSpeechStream(cmd *exec.Cmd, stdout io.ReadCloser
 }
 
 func nativeDictationFallbackNote(err error) string {
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "abort trap") {
-		return "Native live dictation crashed (likely Speech Recognition permission not granted). Enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition, then try again. Falling back to local file transcription for this session."
+	if err == nil {
+		return "Native live dictation unavailable; falling back to local file transcription for this session."
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "abort trap") || strings.Contains(msg, "permission") || strings.Contains(msg, "not-determined") || strings.Contains(msg, "denied") {
+		return "Speech Recognition not authorized — enable it for your terminal in System Settings > Privacy & Security > Speech Recognition, then try again. Falling back to local file transcription for this session."
 	}
 	return "Native live dictation unavailable; falling back to local file transcription for this session."
 }
@@ -5055,7 +5098,7 @@ func (m *tuiModel) tryCompleteModel(reverse bool) bool {
 
 func (m *tuiModel) updatePlaceholder() {
 	if len(m.sessions) == 0 {
-		m.input.Placeholder = "Press n to create a new session..."
+		m.input.Placeholder = "Press Ctrl+N to create a new session..."
 		return
 	}
 	if m.activeSessionID == "" {
