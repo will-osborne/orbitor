@@ -1,4 +1,0 @@
-# WhatsApp configuration (uses whatsmeow — personal WhatsApp via QR pairing)
-whatsapp:
-  default_recipient: "+1234567890" # optional default phone number for send-apk
-  db_path: "whatsmeow.db"          # optional, defaults to whatsmeow.db

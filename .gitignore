@@ -45,3 +45,9 @@ key.properties
 
 # macOS
 .DS_Store
+
+# IDE
+.idea/
+
+# Git worktrees (local only, managed by Claude Code)
+.worktrees/
