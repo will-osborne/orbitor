@@ -1443,7 +1443,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.resetPTTTrigger()
-			m.logSystem("Dictation failed: " + msg.err.Error())
+			// disableNative errors are already described by the disableNote logged above.
+			if !msg.disableNative {
+				m.logSystem("Dictation failed: " + msg.err.Error())
+			}
 			if msg.external {
 				return m, waitExternalCmd(m.extCh)
 			}
@@ -4713,21 +4716,11 @@ final class DictationDriver {
             case .authorized:
                 self.startRecognition()
             case .notDetermined:
-                // Permission has never been granted. requestAuthorization may crash with
-                // SIGABRT on macOS 14+ in a subprocess context — if it does, the Go side
-                // detects the crash and falls back to legacy dictation with an error message
-                // prompting the user to grant Speech Recognition in System Settings.
-                SFSpeechRecognizer.requestAuthorization { newStatus in
-                    DispatchQueue.main.async {
-                        if newStatus == .authorized {
-                            self.startRecognition()
-                        } else {
-                            self.fail("speech recognition permission " + authLabel(newStatus) + " — enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition")
-                        }
-                    }
-                }
+                // requestAuthorization crashes with SIGABRT on macOS 14+ when called from
+                // a subprocess context. Fail cleanly with instructions instead.
+                self.fail("speech-recognition-not-determined")
             default:
-                self.fail("speech recognition permission " + authLabel(speechStatus) + " — enable Speech Recognition for your terminal in System Settings > Privacy & Security > Speech Recognition")
+                self.fail("speech-recognition-" + authLabel(speechStatus))
             }
         }
 
