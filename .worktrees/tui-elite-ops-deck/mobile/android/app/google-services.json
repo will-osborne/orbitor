@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "951013228801",
+    "project_id": "orbitor-d0feb",
+    "storage_bucket": "orbitor-d0feb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:951013228801:android:8f1181bec3bfd5e3a7db00",
+        "android_client_info": {
+          "package_name": "com.orbitor"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBMZKPkzXqu0j4rRfmzK7kiS_Gd6oaDrEU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

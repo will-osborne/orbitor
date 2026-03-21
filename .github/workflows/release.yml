@@ -18,11 +18,9 @@ jobs:
           - runner: macos-latest
             goos: darwin
             goarch: arm64
-            whisper: true
-          - runner: macos-13          # Intel runner for native amd64 build
+          - runner: macos-13
             goos: darwin
             goarch: amd64
-            whisper: true
           - runner: ubuntu-latest
             goos: linux
             goarch: amd64
@@ -30,6 +28,16 @@ jobs:
             goos: linux
             goarch: arm64
             cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            whisper_cmake_extra: >-
+              -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc
+              -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+              -DCMAKE_SYSTEM_NAME=Linux
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64
+              -DCMAKE_INSTALL_PREFIX=/tmp/whisper-arm64
+            whisper_install_prefix: /tmp/whisper-arm64
+            cgo_cflags: -I/tmp/whisper-arm64/include
+            cgo_ldflags: -L/tmp/whisper-arm64/lib
 
     steps:
       - uses: actions/checkout@v4
@@ -39,13 +47,40 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install cross-compiler (Linux ARM64 only)
-        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install whisper-cpp (macOS only)
-        if: matrix.whisper == true
+      - name: Install whisper-cpp (macOS)
+        if: matrix.goos == 'darwin'
         run: brew install whisper-cpp
+
+      - name: Install cross-compiler and cmake (Linux ARM64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+
+      - name: Build whisper-cpp from source (Linux AMD64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
+          cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_ACCELERATE=OFF
+          cmake --build /tmp/whisper-src/build -j$(nproc)
+          sudo cmake --install /tmp/whisper-src/build
+
+      - name: Build whisper-cpp from source (Linux ARM64 cross-compile)
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
+          cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.whisper_cmake_extra }} \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_ACCELERATE=OFF
+          cmake --build /tmp/whisper-src/build -j$(nproc)
+          cmake --install /tmp/whisper-src/build
 
       - name: Build
         env:
@@ -53,13 +88,13 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 1
           CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          CGO_CFLAGS: ${{ matrix.cgo_cflags }}
+          CGO_LDFLAGS: ${{ matrix.cgo_ldflags }}
         run: |
-          TAGS=""
-          if [ "${{ matrix.whisper }}" = "true" ]; then
-            TAGS="-tags cgo_whisper"
-          fi
-          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
-            $TAGS -o orbitor-${{ matrix.goos }}-${{ matrix.goarch }} .
+          go build -tags cgo_whisper -trimpath \
+            -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o orbitor-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
