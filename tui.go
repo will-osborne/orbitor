@@ -600,6 +600,7 @@ type sttStartedMsg struct {
 	disableNative bool
 	disableNote   string
 	err           error
+	localSession  *localSTTSession // non-nil when using local whisper STT
 }
 type sttPartialMsg struct {
 	text     string
@@ -748,6 +749,9 @@ type tuiModel struct {
 	// cached max rows available for the input editor; set each View() cycle
 	// so Update() can eagerly resize the textarea and keep scroll correct.
 	inputMaxH int
+
+	// active local whisper STT session (non-nil while PTT is active on the local path)
+	pttLocalSession *localSTTSession
 
 	// interactive permission-request overlay
 	permRequest  *WSPermissionRequest
@@ -1261,6 +1265,7 @@ func (m *tuiModel) Init() tea.Cmd {
 		spinnerTickCmd(),
 		zooTickCmd(),
 		prewarmDarwinSpeechHelperCmd(),
+		prewarmLocalSTTModelCmd(),
 	)
 }
 
@@ -1525,6 +1530,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pttProcInput = msg.stdin
 		m.pttAudioPath = msg.audioPath
 		m.pttStreaming = msg.streaming
+		m.pttLocalSession = msg.localSession
 		m.pttReleaseAt = time.Time{}
 		m.pttActive = true
 		m.pttBusy = true
@@ -3503,6 +3509,7 @@ func (m *tuiModel) resetPTTTrigger() {
 	m.resetPTTSpaceRun()
 	m.pttStarting = false
 	m.pttStreaming = false
+	m.pttLocalSession = nil
 	m.pttReleaseAt = time.Time{}
 	m.pttTriggerCaptured = false
 	m.pttTriggerValue = ""
@@ -4281,8 +4288,13 @@ func (m *tuiModel) selectedSessionID() string {
 
 func (m *tuiModel) startPTTCapture() tea.Cmd {
 	return func() tea.Msg {
+		// Try local whisper STT first — cross-platform, zero extra dependencies.
+		if sess, err := startLocalSTTSession(m.extCh); err == nil {
+			return sttStartedMsg{localSession: sess, streaming: true}
+		}
+		// Fall back to Darwin native (SFSpeechRecognizer) then legacy ffmpeg+whisper.
 		if runtime.GOOS == "darwin" && !m.pttDisableNativeLive {
-				msg := m.startDarwinStreamingPTTCapture()
+			msg := m.startDarwinStreamingPTTCapture()
 			if msg.err == nil {
 				return msg
 			}
@@ -4368,6 +4380,15 @@ func (m *tuiModel) stopPTTCapture() tea.Cmd {
 		}
 		m.pttActive = false
 		m.pttSpaceRun = 0
+
+		// Local whisper STT path — stop the session in a goroutine; it will
+		// send sttResultMsg via extCh when the final inference completes.
+		if localSess := m.pttLocalSession; localSess != nil {
+			m.pttLocalSession = nil
+			go localSess.stop()
+			return nil
+		}
+
 		proc := m.pttProc
 		procInput := m.pttProcInput
 		audioPath := m.pttAudioPath
