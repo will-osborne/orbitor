@@ -23,6 +23,13 @@ import (
 // prURLRe matches GitHub pull request URLs in any text/output.
 var prURLRe = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pull/\d+`)
 
+// runCompleteCmd is sent to the coalescer to drain any buffered agent text and
+// then broadcast run_complete, guaranteeing strict ordering between the two.
+type runCompleteCmd struct {
+	payload any
+	done    chan struct{}
+}
+
 type Session struct {
 	ID              string
 	WorkingDir      string
@@ -75,9 +82,10 @@ type Session struct {
 	bgContTimer *time.Timer
 
 	// agentTextCh batches frequent agent_text chunks to reduce broadcast frequency
-	agentTextCh    chan string
-	agentTextDone  chan struct{}
-	agentTextFlush chan chan struct{} // request a synchronous flush of the text buffer
+	agentTextCh            chan string
+	agentTextDone          chan struct{}
+	agentTextFlush         chan chan struct{}   // request a synchronous flush of the text buffer
+	agentTextRunCompleteCh chan runCompleteCmd // drain text then broadcast run_complete atomically
 
 	store      *Store      // persistence hook
 	allocPort  func() int  // returns a fresh port number (from SessionManager)
@@ -652,6 +660,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.agentTextCh = make(chan string, 256)
 		s.agentTextDone = make(chan struct{})
 		s.agentTextFlush = make(chan chan struct{})
+		s.agentTextRunCompleteCh = make(chan runCompleteCmd, 1)
 		go func() {
 			// flush interval and buffer size tuned to balance responsiveness and UI load
 			ticker := time.NewTicker(100 * time.Millisecond)
@@ -698,6 +707,25 @@ func (s *Session) finishACPSetup(workingDir string) {
 					}
 					flushBuf()
 					close(done)
+				case rc := <-s.agentTextRunCompleteCh:
+					// Drain remaining text, flush it, then broadcast run_complete.
+					// This guarantees run_complete is never sent before the last
+					// agent_text chunk — fixing the ordering race with the coalescer.
+				drainLoopRC:
+					for {
+						select {
+						case t, ok := <-s.agentTextCh:
+							if !ok {
+								break drainLoopRC
+							}
+							buf.WriteString(t)
+						default:
+							break drainLoopRC
+						}
+					}
+					flushBuf()
+					s.hub.Broadcast("run_complete", rc.payload)
+					close(rc.done)
 				}
 			}
 		}()
@@ -830,9 +858,29 @@ func (s *Session) finishACPSetup(workingDir string) {
 		prURL := s.prURL
 		s.summaryMu.Unlock()
 		s.persistSession()
-		s.flushAgentText()
 		completePayload := map[string]string{"stopReason": result.StopReason, "prUrl": prURL}
-		s.hub.Broadcast("run_complete", completePayload)
+		// Route run_complete through the coalescer so it is strictly ordered
+		// after all agent_text chunks already queued. This prevents clients
+		// from receiving run_complete before the last text has been flushed.
+		if s.agentTextRunCompleteCh != nil {
+			rcDone := make(chan struct{})
+			select {
+			case s.agentTextRunCompleteCh <- runCompleteCmd{payload: completePayload, done: rcDone}:
+				select {
+				case <-rcDone:
+				case <-time.After(500 * time.Millisecond):
+					log.Printf("session %s: run_complete drain timed out, broadcasting directly", s.ID)
+					s.hub.Broadcast("run_complete", completePayload)
+				}
+			default:
+				// Channel full (shouldn't happen in normal flow); fall back.
+				s.flushAgentText()
+				s.hub.Broadcast("run_complete", completePayload)
+			}
+		} else {
+			s.flushAgentText()
+			s.hub.Broadcast("run_complete", completePayload)
+		}
 		if s.eventHub != nil && !isContinuation {
 			sessionName := filepath.Base(s.WorkingDir)
 			title := "Agent finished"
