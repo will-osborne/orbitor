@@ -1,3 +1,5 @@
+//go:build cgo_whisper
+
 package main
 
 import (

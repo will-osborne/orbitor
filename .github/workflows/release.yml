@@ -18,10 +18,11 @@ jobs:
           - runner: macos-latest
             goos: darwin
             goarch: arm64
-          - runner: macos-latest   # ARM runner, cross-compile to amd64 via clang -arch x86_64
+            whisper: true
+          - runner: macos-13          # Intel runner for native amd64 build
             goos: darwin
             goarch: amd64
-            cc: clang -arch x86_64
+            whisper: true
           - runner: ubuntu-latest
             goos: linux
             goarch: amd64
@@ -42,6 +43,10 @@ jobs:
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install whisper-cpp (macOS only)
+        if: matrix.whisper == true
+        run: brew install whisper-cpp
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -49,8 +54,12 @@ jobs:
           CGO_ENABLED: 1
           CC: ${{ matrix.cc }}
         run: |
+          TAGS=""
+          if [ "${{ matrix.whisper }}" = "true" ]; then
+            TAGS="-tags cgo_whisper"
+          fi
           go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
-            -o orbitor-${{ matrix.goos }}-${{ matrix.goarch }} .
+            $TAGS -o orbitor-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
