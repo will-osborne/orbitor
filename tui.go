@@ -324,6 +324,17 @@ type undoStack struct {
 	redoable []fileChangeSnapshot
 }
 
+// ── pending notification ─────────────────────────────────────────────────────
+
+// pendingNotification tracks a run_complete event waiting for the AI summary
+// to become available before firing the desktop notification.
+type pendingNotification struct {
+	sessionID  string
+	stopReason string
+	prURL      string
+	createdAt  time.Time
+}
+
 // ── sub-agent feed blocks ────────────────────────────────────────────────────
 
 // subAgentBlock tracks the log indices belonging to a single sub-agent
@@ -980,6 +991,9 @@ type tuiModel struct {
 	permRequest  *WSPermissionRequest
 	permSelected int
 
+	// pending desktop notifications awaiting AI summary from session refresh
+	pendingNotifs map[string]pendingNotification // sessionID → notification
+
 	// command palette
 	palette commandPalette
 
@@ -1044,6 +1058,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		toolCallCache:      make(map[string]WSToolCall),
 		subAgentBlocks:     make(map[string]*subAgentBlock),
 		subAgentExpanded:   make(map[string]bool),
+		pendingNotifs:      make(map[string]pendingNotification),
 		expandedSessions:  make(map[string]bool),
 		palette:           newCommandPalette(),
 		undoStacks:        make(map[string]*undoStack),
@@ -2288,6 +2303,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.updatePlaceholder()
+		m.flushPendingNotifications()
 		return m, nil
 
 	case attachMsg:
@@ -3984,12 +4000,13 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			if d.PRURL != "" {
 				m.log(styleCyan.Render("  PR: ") + d.PRURL)
 			}
-			notifBody := m.sessionDisplayName()
-			if d.StopReason != "" {
-				notifBody += " — " + d.StopReason
-			}
 			if !m.replayingHistory {
-				go sendNotification("Agent finished", notifBody)
+				m.pendingNotifs[m.activeSessionID] = pendingNotification{
+					sessionID:  m.activeSessionID,
+					stopReason: d.StopReason,
+					prURL:      d.PRURL,
+					createdAt:  time.Now(),
+				}
 			}
 			// Capture post-run git snapshot for undo tracking.
 			if !m.replayingHistory && m.activeSessionID != "" {
@@ -4288,6 +4305,53 @@ func isLikelyDiff(text string) bool {
 func sendNotification(title, body string) {
 	script := fmt.Sprintf(`display notification %q with title %q sound name "Default"`, body, title)
 	_ = exec.Command("osascript", "-e", script).Start()
+}
+
+const pendingNotifTimeout = 12 * time.Second
+
+// flushPendingNotifications checks pending run_complete notifications against
+// the current session data. If a session now has an AI-generated summary,
+// fire an enriched notification. After a timeout, fire with basic info.
+func (m *tuiModel) flushPendingNotifications() {
+	if len(m.pendingNotifs) == 0 {
+		return
+	}
+
+	// Build a lookup of current sessions by ID.
+	sessionByID := make(map[string]WSSessionInfo, len(m.sessions))
+	for _, s := range m.sessions {
+		sessionByID[s.ID] = s
+	}
+
+	for id, pn := range m.pendingNotifs {
+		s, exists := sessionByID[id]
+		timedOut := time.Since(pn.createdAt) > pendingNotifTimeout
+		hasSummary := exists && s.Summary != ""
+
+		if hasSummary || timedOut {
+			title := "Agent finished"
+			name := "session"
+			if exists {
+				name = defaultString(s.Title, filepath.Base(s.WorkingDir))
+			}
+
+			var body string
+			if hasSummary {
+				body = name + "\n" + s.Summary
+			} else {
+				body = name
+				if pn.stopReason != "" {
+					body += " — " + pn.stopReason
+				}
+			}
+			if pn.prURL != "" {
+				body += "\nPR: " + pn.prURL
+			}
+
+			go sendNotification(title, body)
+			delete(m.pendingNotifs, id)
+		}
+	}
 }
 
 // sessionDisplayName returns the human-readable name for the currently
