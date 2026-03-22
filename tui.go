@@ -756,6 +756,17 @@ type tuiModel struct {
 	// interactive permission-request overlay
 	permRequest  *WSPermissionRequest
 	permSelected int
+
+	// mouse hover state (-1 = none)
+	hoverSession int
+
+	// layout geometry cached each View() for mouse hit-testing
+	layoutTopBarH    int
+	layoutBannerH    int
+	layoutLeftW      int
+	layoutBodyH      int
+	layoutSessionStart int // first visible session index
+	layoutSessionEnd   int // one past last visible session index
 }
 
 func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan bool) error {
@@ -798,6 +809,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		sessionLastMessage: make(map[string]string),
 		toolCallCache:      make(map[string]WSToolCall),
 		expandedSessions:  make(map[string]bool),
+		hoverSession:      -1,
 		historyPos:        0,
 		agentBlockIdx:     -1,
 		renderMarkdown:    true,
@@ -858,7 +870,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 	// Disable sequences are sent here on exit to restore the terminal.
 	defer fmt.Print("\x1b[>4;0m\x1b[=0u")
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(shiftEnterFilter))
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithFilter(shiftEnterFilter))
 	_, err = p.Run()
 	return err
 }
@@ -1126,6 +1138,13 @@ func (m *tuiModel) renderHelp() string {
 		row("Ctrl+. / Ctrl+\\", "abort running session"),
 		row("Ctrl+← / Ctrl+→", "move by word"),
 		"",
+		head.Render("  Mouse"),
+		row("Click session", "select session"),
+		row("Double-click session", "connect to session"),
+		row("Hover session", "highlight session"),
+		row("Click wizard/perm option", "select option"),
+		row("Scroll wheel", "scroll feed or sessions"),
+		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
 		row("Shift+Enter / Ctrl+J", "insert newline in prompt"),
@@ -1292,6 +1311,298 @@ func enableKittyKeyboardCmd() tea.Cmd {
 
 // ── Update ────────────────────────────────────────────────────────────────────
 
+// handleMouse processes mouse events for click and hover interactions.
+func (m *tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	x, y := msg.X, msg.Y
+
+	// ── scroll wheel (always active) ─────────────────────────────────────
+	if msg.Button == tea.MouseButtonWheelUp {
+		if !m.hideSidebar && x < m.layoutLeftW {
+			// scroll sessions: select previous
+			if m.selected > 0 {
+				m.selected--
+			}
+		} else {
+			m.viewport.ScrollUp(3)
+		}
+		return m, nil
+	}
+	if msg.Button == tea.MouseButtonWheelDown {
+		if !m.hideSidebar && x < m.layoutLeftW {
+			if m.selected < len(m.sessions)-1 {
+				m.selected++
+			}
+		} else {
+			m.viewport.ScrollDown(3)
+		}
+		return m, nil
+	}
+
+	// ── wizard overlay ───────────────────────────────────────────────────
+	if m.wizardActive {
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			return m.handleWizardClick(x, y)
+		}
+		return m, nil
+	}
+
+	// ── permission overlay ───────────────────────────────────────────────
+	if m.permRequest != nil {
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			return m.handlePermClick(x, y)
+		}
+		return m, nil
+	}
+
+	// ── zoo view ─────────────────────────────────────────────────────────
+	if m.showZoo {
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			return m.handleZooClick(x, y)
+		}
+		return m, nil
+	}
+
+	// ── main view: session sidebar click / hover ─────────────────────────
+	if !m.hideSidebar && x < m.layoutLeftW {
+		bodyTop := m.layoutTopBarH + m.layoutBannerH
+		// +2 accounts for the panel border (1) + "sessions" header (1)
+		sessionAreaTop := bodyTop + 2
+		localY := y - sessionAreaTop
+
+		if localY >= 0 && len(m.sessions) > 0 {
+			// Walk visible sessions to find which one was hit
+			row := 0
+			hitIdx := -1
+			for i := m.layoutSessionStart; i < m.layoutSessionEnd; i++ {
+				lines := m.sessionVisualLines(i)
+				if localY >= row && localY < row+lines {
+					hitIdx = i
+					break
+				}
+				row += lines
+			}
+
+			if msg.Action == tea.MouseActionMotion {
+				if hitIdx >= 0 {
+					m.hoverSession = hitIdx
+				} else {
+					m.hoverSession = -1
+				}
+				return m, nil
+			}
+
+			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && hitIdx >= 0 {
+				m.hoverSession = -1
+				if hitIdx == m.selected {
+					// Click on already-selected session → connect to it
+					return m, attachSessionCmd(m.api, m.sessions[hitIdx].ID, m.extCh)
+				}
+				m.selected = hitIdx
+				return m, nil
+			}
+		}
+	} else {
+		// Clear hover when mouse leaves sidebar
+		if m.hoverSession != -1 {
+			m.hoverSession = -1
+		}
+	}
+
+	return m, nil
+}
+
+// handleWizardClick maps a click in the wizard overlay to a field/option selection.
+func (m *tuiModel) handleWizardClick(x, y int) (tea.Model, tea.Cmd) {
+	const wizW = 60
+	// The wizard is centered; compute its bounding box.
+	panelLeft := (m.width - wizW) / 2
+	panelRight := panelLeft + wizW
+	if x < panelLeft || x > panelRight {
+		return m, nil
+	}
+
+	// Lines inside the panel (0-indexed from panel top):
+	// 0: border
+	// 1: "  New Session"
+	// 2: ""
+	// 3: "  Working Directory"
+	// 4: input
+	// 5: ""
+	// 6: "  Backend"
+	// 7+: backend options ...
+	// Then model, skip, mode sections follow.
+	//
+	// We compute the panel vertical center and offset from there.
+	models := m.wizardCurrentModels()
+
+	// Determine total content lines to find panel top
+	contentH := 2 + 2 + (1 + len(wizardBackends)) + 1 + (1 + len(models)) + 1 + (1 + len(wizardSkipOptions)) + 1 + (1 + len(wizardModeOptions)) + 1 + 1
+	panelTop := (m.height - contentH) / 2
+	localY := y - panelTop - 1 // -1 for border
+
+	if localY < 0 {
+		return m, nil
+	}
+
+	line := 0
+
+	// Title + blank
+	line += 2
+
+	// Working Directory section (label + input)
+	if localY >= line && localY < line+2 {
+		m.wizardFocus = 0
+		m.wizardDirInput.Focus()
+		return m, nil
+	}
+	line += 3 // label + input + blank
+
+	// Backend section
+	if localY == line {
+		m.wizardFocus = 1
+		m.wizardDirInput.Blur()
+		return m, nil
+	}
+	line++ // label
+	for i := range wizardBackends {
+		if localY == line+i {
+			m.wizardFocus = 1
+			m.wizardDirInput.Blur()
+			m.wizardBackend = i
+			m.wizardModel = 0
+			return m, nil
+		}
+	}
+	line += len(wizardBackends) + 1 // options + blank
+
+	// Model section
+	if localY == line {
+		m.wizardFocus = 2
+		m.wizardDirInput.Blur()
+		return m, nil
+	}
+	line++
+	for i := range models {
+		if localY == line+i {
+			m.wizardFocus = 2
+			m.wizardDirInput.Blur()
+			m.wizardModel = i
+			return m, nil
+		}
+	}
+	line += len(models) + 1
+
+	// Skip Permissions section
+	if localY == line {
+		m.wizardFocus = 3
+		m.wizardDirInput.Blur()
+		return m, nil
+	}
+	line++
+	for i := range wizardSkipOptions {
+		if localY == line+i {
+			m.wizardFocus = 3
+			m.wizardDirInput.Blur()
+			m.wizardSkip = i
+			return m, nil
+		}
+	}
+	line += len(wizardSkipOptions) + 1
+
+	// Mode section
+	if localY == line {
+		m.wizardFocus = 4
+		m.wizardDirInput.Blur()
+		return m, nil
+	}
+	line++
+	for i := range wizardModeOptions {
+		if localY == line+i {
+			m.wizardFocus = 4
+			m.wizardDirInput.Blur()
+			m.wizardMode = i
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+// handlePermClick maps a click in the permission overlay to an option.
+func (m *tuiModel) handlePermClick(x, y int) (tea.Model, tea.Cmd) {
+	d := m.permRequest
+	const panelW = 60
+	panelLeft := (m.width - panelW) / 2
+	panelRight := panelLeft + panelW
+	if x < panelLeft || x > panelRight {
+		return m, nil
+	}
+
+	// Content lines:
+	// 0: border
+	// 1: "  ⏸ Permission Required"
+	// 2: ""
+	// 3: title
+	// 4: "" (if command present)
+	// 5: command (if present)
+	// 6: ""
+	// 7+: options
+	headerLines := 4 // title + blank + title text + blank
+	if d.Command != "" {
+		headerLines += 2 // blank + command
+	}
+
+	contentH := headerLines + len(d.Options) + 2 // + blank + hint
+	panelTop := (m.height - contentH) / 2
+	localY := y - panelTop - 1 // -1 for border
+
+	optStart := headerLines
+	optIdx := localY - optStart
+	if optIdx >= 0 && optIdx < len(d.Options) {
+		opt := d.Options[optIdx]
+		m.permRequest = nil
+		return m, sendWSCmd(m, map[string]any{
+			"type":      "permission_response",
+			"requestId": d.RequestID,
+			"optionId":  opt.OptionID,
+		})
+	}
+
+	return m, nil
+}
+
+// handleZooClick selects or connects to an agent in the zoo view based on click position.
+func (m *tuiModel) handleZooClick(x, y int) (tea.Model, tea.Cmd) {
+	if len(m.sessions) == 0 {
+		return m, nil
+	}
+
+	// Zoo bots are rendered at specific canvas positions. Find the closest bot.
+	bestIdx := -1
+	bestDist := 999999
+	for i, bot := range m.zooBots {
+		dx := x - int(bot.x)
+		dy := y - int(bot.y)
+		dist := dx*dx + dy*dy
+		if dist < bestDist {
+			bestDist = dist
+			bestIdx = i
+		}
+	}
+
+	// Only select if click is reasonably close to a bot (within ~10 cells)
+	if bestIdx >= 0 && bestDist <= 100 {
+		if m.selected == bestIdx {
+			// Double-click effect: connect to the session
+			m.showZoo = false
+			return m, attachSessionCmd(m.api, m.sessions[bestIdx].ID, m.extCh)
+		}
+		m.selected = bestIdx
+	}
+
+	return m, nil
+}
+
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -1301,13 +1612,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.viewport.ScrollUp(3)
-		case tea.MouseButtonWheelDown:
-			m.viewport.ScrollDown(3)
-		}
-		return m, nil
+		return m.handleMouse(msg)
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
@@ -1968,6 +2273,7 @@ func (m *tuiModel) View() string {
 	}
 	topBar := topLine + "\n" + styleSep.Render(strings.Repeat("─", m.width))
 	topBarH := lipgloss.Height(topBar)
+	m.layoutTopBarH = topBarH
 
 	// ── optional banners ──────────────────────────────────────────────────────
 	var banners []string
@@ -2002,6 +2308,7 @@ func (m *tuiModel) View() string {
 	for _, b := range banners {
 		bannerH += lipgloss.Height(b)
 	}
+	m.layoutBannerH = bannerH
 
 	// ── status bar ────────────────────────────────────────────────────────────
 	statusLeft := fmt.Sprintf("  %s  ·  n=new  z=zoo  tab=cycle  ctrl+d=del  ?=help", m.api.baseURL)
@@ -2030,6 +2337,9 @@ func (m *tuiModel) View() string {
 	m.input.SetHeight(inputEditorH)
 	inputH := inputEditorH + 1
 	feedH := max(6, bodyH-detailsH-thinkingH-inputH)
+
+	m.layoutLeftW = leftW
+	m.layoutBodyH = bodyH
 
 	// ── left panel (sessions) ─────────────────────────────────────────────────
 	var left string
@@ -3871,17 +4181,23 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		end++
 	}
 
+	m.layoutSessionStart = start
+	m.layoutSessionEnd = end
+
 	var out []string
 	for i := start; i < end; i++ {
 		s := m.sessions[i]
 		state := sessionStateLabel(s)
 		isSelected := i == m.selected
+		isHover := i == m.hoverSession && !isSelected
 		isActive := s.ID == m.activeSessionID
 		expanded := m.expandedSessions[s.ID]
 
 		prefix := "  "
 		if isSelected {
 			prefix = "▶ "
+		} else if isHover {
+			prefix = "» "
 		} else if isActive {
 			prefix = "● "
 		}
@@ -3928,6 +4244,10 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 		if isSelected {
 			titleLine := trimForLine("  "+titleText, max(10, listW))
 			out = append(out, selectedStyle.Render(topLine)+subAgentBadge, selectedStyle.Render(titleLine), selectedStyle.Render(botLine), sep)
+		} else if isHover {
+			hoverStyle := lipgloss.NewStyle().Foreground(colText).Underline(true)
+			titleLine := trimForLine("  "+titleText, max(10, listW))
+			out = append(out, hoverStyle.Render(topLine)+subAgentBadge, hoverStyle.Render(titleLine), styleMuted.Render(botLine), sep)
 		} else {
 			var stateTag string
 			switch state {
