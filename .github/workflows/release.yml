@@ -18,9 +18,16 @@ jobs:
           - runner: macos-latest
             goos: darwin
             goarch: arm64
-          - runner: macos-13
+          - runner: macos-latest
             goos: darwin
             goarch: amd64
+            build_whisper_from_source: true
+            whisper_cmake_extra: >-
+              -DCMAKE_OSX_ARCHITECTURES=x86_64
+              -DCMAKE_INSTALL_PREFIX=/tmp/whisper-amd64
+            whisper_install_prefix: /tmp/whisper-amd64
+            cgo_cflags: -I/tmp/whisper-amd64/include -target x86_64-apple-macos11
+            cgo_ldflags: -L/tmp/whisper-amd64/lib -target x86_64-apple-macos11
           - runner: ubuntu-latest
             goos: linux
             goarch: amd64
@@ -47,9 +54,21 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install whisper-cpp (macOS)
-        if: matrix.goos == 'darwin'
+      - name: Install whisper-cpp (macOS brew)
+        if: matrix.goos == 'darwin' && !matrix.build_whisper_from_source
         run: brew install whisper-cpp
+
+      - name: Build whisper-cpp from source (macOS cross-compile)
+        if: matrix.goos == 'darwin' && matrix.build_whisper_from_source
+        run: |
+          git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
+          cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.whisper_cmake_extra }} \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DWHISPER_BUILD_TESTS=OFF
+          cmake --build /tmp/whisper-src/build -j$(sysctl -n hw.ncpu)
+          cmake --install /tmp/whisper-src/build
 
       - name: Install cross-compiler and cmake (Linux ARM64)
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'

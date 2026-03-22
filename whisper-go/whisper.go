@@ -9,9 +9,13 @@ import (
 // CGO
 
 /*
-#cgo darwin pkg-config: whisper ggml
-#cgo darwin LDFLAGS: -lm -lstdc++ -framework Accelerate -framework Metal -framework Foundation -framework CoreGraphics
-#cgo linux LDFLAGS: -lwhisper -lggml -lggml-base -lggml-cpu -lm -lstdc++ -fopenmp
+#cgo LDFLAGS: -lwhisper -lggml -lggml-base -lm -lstdc++
+#cgo linux LDFLAGS: -lggml-cpu -fopenmp
+#cgo darwin,arm64 CFLAGS: -I/opt/homebrew/include
+#cgo darwin,arm64 LDFLAGS: -L/opt/homebrew/lib
+#cgo darwin,amd64 CFLAGS: -I/usr/local/include
+#cgo darwin,amd64 LDFLAGS: -L/usr/local/lib
+#cgo darwin LDFLAGS: -framework Accelerate -framework Metal -framework Foundation -framework CoreGraphics
 #include <whisper.h>
 #include <stdlib.h>
 
