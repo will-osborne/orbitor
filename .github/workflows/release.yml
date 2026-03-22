@@ -67,6 +67,7 @@ jobs:
           git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
           cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             ${{ matrix.whisper_cmake_extra }} \
             -DWHISPER_BUILD_EXAMPLES=OFF \
             -DWHISPER_BUILD_TESTS=OFF
@@ -83,6 +84,7 @@ jobs:
           git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
           cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             -DWHISPER_BUILD_EXAMPLES=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
             -DGGML_METAL=OFF \
@@ -96,6 +98,7 @@ jobs:
           git clone --depth 1 -b v1.8.4 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-src
           cmake -S /tmp/whisper-src -B /tmp/whisper-src/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             ${{ matrix.whisper_cmake_extra }} \
             -DWHISPER_BUILD_EXAMPLES=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
