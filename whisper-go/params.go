@@ -8,8 +8,7 @@ import (
 // CGO
 
 /*
-#cgo darwin,arm64 CFLAGS: -I/opt/homebrew/include
-#cgo darwin,amd64 CFLAGS: -I/usr/local/include
+#cgo darwin pkg-config: whisper ggml
 #include <whisper.h>
 */
 import "C"
