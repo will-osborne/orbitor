@@ -24,6 +24,7 @@ jobs:
             build_whisper_from_source: true
             whisper_cmake_extra: >-
               -DCMAKE_OSX_ARCHITECTURES=x86_64
+              -DGGML_NATIVE=OFF
               -DCMAKE_INSTALL_PREFIX=/tmp/whisper-amd64
             whisper_install_prefix: /tmp/whisper-amd64
             cgo_cflags: -I/tmp/whisper-amd64/include -target x86_64-apple-macos11
