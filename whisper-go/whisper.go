@@ -9,8 +9,9 @@ import (
 // CGO
 
 /*
-#cgo LDFLAGS: -lwhisper -lggml -lggml-base -lm -lstdc++
-#cgo linux LDFLAGS: -lggml-cpu -fopenmp
+#cgo LDFLAGS: -lwhisper -lggml -lggml-cpu -lggml-base -lm -lstdc++
+#cgo linux LDFLAGS: -fopenmp
+#cgo darwin LDFLAGS: -lggml-blas -lggml-metal
 #cgo darwin,arm64 CFLAGS: -I/opt/homebrew/include
 #cgo darwin,arm64 LDFLAGS: -L/opt/homebrew/lib
 #cgo darwin,amd64 CFLAGS: -I/usr/local/include
