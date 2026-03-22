@@ -306,6 +306,38 @@ func currentThemeName(idx int) string {
 	return tuiThemes[idx].Name
 }
 
+// ── undo/redo types ──────────────────────────────────────────────────────────
+
+// fileChangeSnapshot stores a git diff patch that can be reversed (undo) or
+// reapplied (redo). Each snapshot represents the file-level changes made
+// during a single agent run.
+type fileChangeSnapshot struct {
+	patch     string    // unified diff output from git diff HEAD
+	files     []string  // affected file paths
+	timestamp time.Time // when the snapshot was captured
+	message   string    // human-readable description
+}
+
+// undoStack tracks file change snapshots per session for undo/redo support.
+type undoStack struct {
+	undoable []fileChangeSnapshot
+	redoable []fileChangeSnapshot
+}
+
+// ── sub-agent feed blocks ────────────────────────────────────────────────────
+
+// subAgentBlock tracks the log indices belonging to a single sub-agent
+// invocation so they can be collapsed/expanded in the feed.
+type subAgentBlock struct {
+	toolCallID   string
+	title        string    // human-readable title from the tool_call
+	status       string    // "running", "completed", "failed"
+	summaryIdx   int       // index in m.logs where the collapsible summary lives
+	childIndices []int     // indices in m.logs of all child messages within this sub-agent
+	startedAt    time.Time
+	completedAt  time.Time
+}
+
 // ── spinner ───────────────────────────────────────────────────────────────────
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -628,6 +660,192 @@ type whisperCLI struct {
 type tickMsg time.Time
 type spinnerTickMsg time.Time
 
+// ── file picker ───────────────────────────────────────────────────────────────
+
+type filePicker struct {
+	active     bool
+	query      string   // text typed after @
+	atPosition int      // rune position of the @ in the input value
+	files      []string // all files from git ls-files (relative paths)
+	filtered   []string // fuzzy-matched subset
+	selected   int      // index in filtered list
+	maxVisible int      // max items to show (10)
+	sessionID  string   // session ID the files were loaded for
+	workingDir string   // working directory the files were loaded for
+	loading    bool     // true while async file load is in progress
+}
+
+type filePickerFilesMsg struct {
+	files      []string
+	sessionID  string
+	workingDir string
+}
+
+// filePickerLoadCmd runs git ls-files in the session's working directory.
+func filePickerLoadCmd(sessionID, workingDir string) tea.Cmd {
+	return func() tea.Msg {
+		files := filePickerListFiles(workingDir)
+		return filePickerFilesMsg{files: files, sessionID: sessionID, workingDir: workingDir}
+	}
+}
+
+// filePickerListFiles returns relative file paths from the working directory.
+// It tries git ls-files first, then falls back to a bounded directory walk.
+func filePickerListFiles(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	// Try git ls-files first (fast, respects .gitignore).
+	cmd := exec.Command("git", "ls-files")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err == nil {
+		var files []string
+		sc := bufio.NewScanner(bytes.NewReader(out))
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line != "" {
+				files = append(files, line)
+			}
+		}
+		if len(files) > 0 {
+			return files
+		}
+	}
+	// Fallback: bounded directory walk (max 5000 files, max depth 8).
+	const maxFiles = 5000
+	const maxDepth = 8
+	var files []string
+	baseLen := len(strings.Split(filepath.Clean(dir), string(os.PathSeparator)))
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if name == ".git" || name == "node_modules" || name == ".next" || name == "__pycache__" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			depth := len(strings.Split(filepath.Clean(path), string(os.PathSeparator))) - baseLen
+			if depth > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		files = append(files, rel)
+		if len(files) >= maxFiles {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return files
+}
+
+// filePickerFuzzyMatch returns files that match the query as a subsequence,
+// sorted by score (exact prefix > path basename match > subsequence).
+func filePickerFuzzyMatch(files []string, query string, limit int) []string {
+	if query == "" {
+		// Show all files up to limit, preferring shorter paths.
+		if len(files) <= limit {
+			return files
+		}
+		return files[:limit]
+	}
+	queryLower := strings.ToLower(query)
+	type scored struct {
+		path  string
+		score int
+	}
+	var matches []scored
+	for _, f := range files {
+		fLower := strings.ToLower(f)
+		base := strings.ToLower(filepath.Base(f))
+		// Check subsequence match.
+		if !isSubsequence(queryLower, fLower) {
+			continue
+		}
+		score := 0
+		// Exact prefix of full path.
+		if strings.HasPrefix(fLower, queryLower) {
+			score += 100
+		}
+		// Exact prefix of basename.
+		if strings.HasPrefix(base, queryLower) {
+			score += 80
+		}
+		// Contains the query as a substring.
+		if strings.Contains(fLower, queryLower) {
+			score += 50
+		}
+		// Basename contains the query as a substring.
+		if strings.Contains(base, queryLower) {
+			score += 40
+		}
+		// Prefer shorter paths.
+		score -= len(f) / 10
+		matches = append(matches, scored{path: f, score: score})
+	}
+	// Sort by score descending, then alphabetically.
+	for i := 0; i < len(matches); i++ {
+		for j := i + 1; j < len(matches); j++ {
+			if matches[j].score > matches[i].score ||
+				(matches[j].score == matches[i].score && matches[j].path < matches[i].path) {
+				matches[i], matches[j] = matches[j], matches[i]
+			}
+		}
+	}
+	result := make([]string, 0, min(limit, len(matches)))
+	for i := 0; i < len(matches) && i < limit; i++ {
+		result = append(result, matches[i].path)
+	}
+	return result
+}
+
+func isSubsequence(needle, haystack string) bool {
+	ni := 0
+	for hi := 0; hi < len(haystack) && ni < len(needle); hi++ {
+		if haystack[hi] == needle[ni] {
+			ni++
+		}
+	}
+	return ni == len(needle)
+}
+
+// filePickerDetect checks the textarea value and cursor position and returns
+// (active, query, atPosition). It only activates when @ is preceded by
+// whitespace or is at the start of the line, and the cursor is within the
+// @ token (no whitespace between @ and cursor).
+func filePickerDetect(value string, cursorPos int) (bool, string, int) {
+	runes := []rune(value)
+	if cursorPos < 0 || cursorPos > len(runes) {
+		return false, "", 0
+	}
+	// Walk backwards from cursor to find the @ character.
+	// Stop if we hit whitespace (no active @ mention at cursor).
+	pos := cursorPos - 1
+	for pos >= 0 {
+		r := runes[pos]
+		if r == '@' {
+			// Found @. Check that it's at start or preceded by whitespace.
+			if pos > 0 && !unicode.IsSpace(runes[pos-1]) {
+				return false, "", 0
+			}
+			query := string(runes[pos+1 : cursorPos])
+			return true, query, pos
+		}
+		if unicode.IsSpace(r) {
+			// Hit whitespace before finding @.
+			return false, "", 0
+		}
+		pos--
+	}
+	return false, "", 0
+}
+
 // ── model ─────────────────────────────────────────────────────────────────────
 
 type tuiModel struct {
@@ -718,6 +936,11 @@ type tuiModel struct {
 	// toolCallCache tracks kind/title by toolCallID for history replay merging.
 	toolCallCache map[string]WSToolCall
 
+	// sub-agent collapsible feed blocks
+	activeSubAgentStack []string                 // stack of sub-agent toolCallIDs (supports nesting)
+	subAgentBlocks      map[string]*subAgentBlock // toolCallID → block metadata
+	subAgentExpanded    map[string]bool           // toolCallID → expanded in feed
+
 	// push-to-talk speech-to-text (space hold)
 	pttLastSpace          time.Time
 	pttActive             bool
@@ -756,6 +979,17 @@ type tuiModel struct {
 	// interactive permission-request overlay
 	permRequest  *WSPermissionRequest
 	permSelected int
+
+	// command palette
+	palette commandPalette
+
+	// undo/redo — per-session undo stacks and pre-run baseline tracking
+	undoStacks   map[string]*undoStack // session ID → undo stack
+	preRunDiff   map[string]string     // session ID → git diff HEAD output before a run
+	preRunCommit map[string]string     // session ID → HEAD commit hash before a run
+
+	// @ file picker
+	picker filePicker
 
 	// mouse hover state (-1 = none)
 	hoverSession int
@@ -808,13 +1042,20 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		sessionUnread:      make(map[string]bool),
 		sessionLastMessage: make(map[string]string),
 		toolCallCache:      make(map[string]WSToolCall),
+		subAgentBlocks:     make(map[string]*subAgentBlock),
+		subAgentExpanded:   make(map[string]bool),
 		expandedSessions:  make(map[string]bool),
+		palette:           newCommandPalette(),
+		undoStacks:        make(map[string]*undoStack),
+		preRunDiff:        make(map[string]string),
+		preRunCommit:      make(map[string]string),
 		hoverSession:      -1,
 		historyPos:        0,
 		agentBlockIdx:     -1,
 		renderMarkdown:    true,
 		compactBlocks:     true,
 		thinkingLines:     []string{"idle"},
+		picker:            filePicker{maxVisible: 10},
 	}
 	if pref, err := readThemePreference(); err == nil && pref != "" {
 		if idx := themeIndexByName(pref); idx >= 0 {
@@ -1135,6 +1376,11 @@ func (m *tuiModel) renderHelp() string {
 		row("Ctrl+M", "toggle markdown rendering"),
 		row("Ctrl+B", "toggle compact/full blocks"),
 		row("Ctrl+T", "cycle theme"),
+		row("Ctrl+P", "command palette"),
+		row("Ctrl+S", "toggle sidebar"),
+		row("Ctrl+Z", "undo file changes"),
+		row("Ctrl+Y", "redo file changes"),
+		row("Ctrl+G", "expand/collapse sub-agent blocks"),
 		row("Ctrl+. / Ctrl+\\", "abort running session"),
 		row("Ctrl+← / Ctrl+→", "move by word"),
 		"",
@@ -1143,7 +1389,13 @@ func (m *tuiModel) renderHelp() string {
 		row("Double-click session", "connect to session"),
 		row("Hover session", "highlight session"),
 		row("Click wizard/perm option", "select option"),
+		row("Click sub-agent header", "expand/collapse sub-agent"),
 		row("Scroll wheel", "scroll feed or sessions"),
+		"",
+		head.Render("  Sub-Agents"),
+		row("Ctrl+G", "expand/collapse all sub-agent blocks"),
+		row("Click ▸/▾ in feed", "toggle individual sub-agent"),
+		row("e", "expand sub-agents in sidebar"),
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
@@ -1168,6 +1420,8 @@ func (m *tuiModel) renderHelp() string {
 		row("/markdown [on|off]", "toggle markdown rendering"),
 		row("/blocks [compact|full]", "toggle block density"),
 		row("/theme [name]", "switch tui theme"),
+		row("/undo", "undo last file changes"),
+		row("/redo", "redo undone changes"),
 		row("/delete [id]", "delete a session"),
 		row("/quit", "exit"),
 		"",
@@ -1180,6 +1434,283 @@ func (m *tuiModel) renderHelp() string {
 		BorderForeground(colBorder).
 		Padding(0, 1).
 		Width(56).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+// ── command palette ──────────────────────────────────────────────────────────
+
+type paletteAction struct {
+	name string
+	hint string
+}
+
+type commandPalette struct {
+	open            bool
+	filterInput     textinput.Model
+	selected        int
+	actions         []paletteAction
+	filteredActions []paletteAction
+}
+
+func newCommandPalette() commandPalette {
+	ti := textinput.New()
+	ti.Placeholder = "Type to filter..."
+	ti.CharLimit = 100
+	ti.Focus()
+	return commandPalette{
+		filterInput: ti,
+		actions: []paletteAction{
+			{name: "New Session", hint: "Ctrl+N"},
+			{name: "Delete Session", hint: "Ctrl+D"},
+			{name: "Toggle Sidebar", hint: "Ctrl+S"},
+			{name: "Toggle Markdown", hint: "Ctrl+M"},
+			{name: "Toggle Blocks", hint: "Ctrl+B"},
+			{name: "Cycle Theme", hint: "Ctrl+T"},
+			{name: "Toggle Help", hint: "?"},
+			{name: "Toggle AI Zoo", hint: "z"},
+			{name: "Expand Sub-agents", hint: "e"},
+			{name: "Interrupt Session", hint: "Ctrl+\\"},
+			{name: "Refresh Sessions", hint: "Ctrl+R"},
+			{name: "Clear Feed", hint: "Ctrl+L"},
+			{name: "Fork Session", hint: "Alt+Enter"},
+			{name: "Toggle Plan Mode", hint: ""},
+			{name: "Toggle Skip Permissions", hint: ""},
+			{name: "Undo File Changes", hint: "Ctrl+Z"},
+			{name: "Redo File Changes", hint: "Ctrl+Y"},
+		},
+	}
+}
+
+func (p *commandPalette) activate() {
+	p.open = true
+	p.filterInput.SetValue("")
+	p.filterInput.Focus()
+	p.selected = 0
+	p.refilter()
+}
+
+func (p *commandPalette) close() {
+	p.open = false
+	p.filterInput.Blur()
+}
+
+func (p *commandPalette) refilter() {
+	query := strings.ToLower(strings.TrimSpace(p.filterInput.Value()))
+	if query == "" {
+		p.filteredActions = make([]paletteAction, len(p.actions))
+		copy(p.filteredActions, p.actions)
+	} else {
+		p.filteredActions = nil
+		for _, a := range p.actions {
+			if strings.Contains(strings.ToLower(a.name), query) {
+				p.filteredActions = append(p.filteredActions, a)
+			}
+		}
+	}
+	if p.selected >= len(p.filteredActions) {
+		p.selected = max(0, len(p.filteredActions)-1)
+	}
+}
+
+func (m *tuiModel) openPalette() {
+	m.palette.activate()
+}
+
+func (m *tuiModel) closePalette() {
+	m.palette.close()
+}
+
+func (m *tuiModel) updatePalette(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.closeConn()
+		return m, tea.Quit
+	case "esc", "ctrl+p":
+		m.closePalette()
+		return m, nil
+	case "up":
+		if m.palette.selected > 0 {
+			m.palette.selected--
+		}
+		return m, nil
+	case "down":
+		if m.palette.selected < len(m.palette.filteredActions)-1 {
+			m.palette.selected++
+		}
+		return m, nil
+	case "enter":
+		if len(m.palette.filteredActions) == 0 {
+			m.closePalette()
+			return m, nil
+		}
+		action := m.palette.filteredActions[m.palette.selected]
+		m.closePalette()
+		return m.executePaletteAction(action.name)
+	}
+	// Forward to the text input for filtering.
+	var cmd tea.Cmd
+	m.palette.filterInput, cmd = m.palette.filterInput.Update(msg)
+	m.palette.refilter()
+	return m, cmd
+}
+
+func (m *tuiModel) executePaletteAction(name string) (tea.Model, tea.Cmd) {
+	switch name {
+	case "New Session":
+		if m.input.Value() == "" {
+			m.openWizard()
+		}
+		return m, nil
+	case "Delete Session":
+		if len(m.sessions) == 0 {
+			return m, nil
+		}
+		m.deleteConfirmID = m.sessions[m.selected].ID
+		return m, nil
+	case "Toggle Sidebar":
+		m.hideSidebar = !m.hideSidebar
+		m.resize()
+		return m, nil
+	case "Toggle Markdown":
+		m.renderMarkdown = !m.renderMarkdown
+		m.logSystem("Markdown rendering: " + boolLabel(m.renderMarkdown))
+		m.rebuildViewport()
+		return m, nil
+	case "Toggle Blocks":
+		m.compactBlocks = !m.compactBlocks
+		if m.compactBlocks {
+			m.logSystem("Block mode: compact")
+		} else {
+			m.logSystem("Block mode: full")
+		}
+		return m, nil
+	case "Cycle Theme":
+		m.themeIdx = (m.themeIdx + 1) % len(tuiThemes)
+		applyTheme(tuiThemes[m.themeIdx])
+		if err := writeThemePreference(tuiThemes[m.themeIdx].Name); err != nil {
+			m.logSystem("theme persistence warning: " + err.Error())
+		}
+		m.logSystem("Theme: " + tuiThemes[m.themeIdx].Name)
+		m.rebuildViewport()
+		return m, nil
+	case "Toggle Help":
+		m.showHelp = !m.showHelp
+		return m, nil
+	case "Toggle AI Zoo":
+		m.showZoo = true
+		return m, nil
+	case "Expand Sub-agents":
+		if len(m.sessions) > 0 {
+			id := m.sessions[m.selected].ID
+			m.expandedSessions[id] = !m.expandedSessions[id]
+		}
+		return m, nil
+	case "Interrupt Session":
+		if m.activeSessionID != "" {
+			return m, sendWSCmd(m, map[string]any{"type": "interrupt"})
+		}
+		return m, nil
+	case "Refresh Sessions":
+		return m, refreshSessionsCmd(m.api)
+	case "Clear Feed":
+		m.logs = nil
+		m.clearSubAgentState()
+		m.rebuildViewport()
+		return m, nil
+	case "Fork Session":
+		raw := m.input.Value()
+		if strings.TrimSpace(raw) == "" || m.activeSessionID == "" {
+			return m, nil
+		}
+		m.input.SetValue("")
+		m.syncInputChrome()
+		m.historyPos = 0
+		m.historyLive = ""
+		if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != raw {
+			m.inputHistory = append(m.inputHistory, raw)
+			if len(m.inputHistory) > 100 {
+				m.inputHistory = m.inputHistory[1:]
+			}
+		}
+		return m, clonePromptCmd(m.api, m.activeSessionID, raw)
+	case "Toggle Plan Mode":
+		if len(m.sessions) == 0 {
+			m.logSystem("No sessions available")
+			return m, nil
+		}
+		target := m.sessions[m.selected]
+		return m, updateSessionCmd(m.api, target.ID, target.SkipPermissions, !target.PlanMode, nil)
+	case "Toggle Skip Permissions":
+		if len(m.sessions) == 0 {
+			m.logSystem("No sessions available")
+			return m, nil
+		}
+		target := m.sessions[m.selected]
+		return m, updateSessionCmd(m.api, target.ID, !target.SkipPermissions, target.PlanMode, nil)
+	case "Undo File Changes":
+		if cmd := m.performUndo(); cmd != nil {
+			return m, cmd
+		}
+		return m, nil
+	case "Redo File Changes":
+		if cmd := m.performRedo(); cmd != nil {
+			return m, cmd
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *tuiModel) renderPalette() string {
+	const paletteW = 52
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	hintStyle := lipgloss.NewStyle().Foreground(colMuted)
+	normalStyle := lipgloss.NewStyle().Foreground(colText)
+	selStyle := lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+
+	var lines []string
+	lines = append(lines, titleStyle.Render("  Command Palette"))
+	lines = append(lines, "")
+	lines = append(lines, "  "+m.palette.filterInput.View())
+	lines = append(lines, "")
+
+	if len(m.palette.filteredActions) == 0 {
+		lines = append(lines, hintStyle.Render("  No matching commands"))
+	} else {
+		maxVisible := min(len(m.palette.filteredActions), max(5, m.height-10))
+		// Scroll window around selected item.
+		start := 0
+		if m.palette.selected >= maxVisible {
+			start = m.palette.selected - maxVisible + 1
+		}
+		end := min(start+maxVisible, len(m.palette.filteredActions))
+
+		for i := start; i < end; i++ {
+			a := m.palette.filteredActions[i]
+			nameStr := a.name
+			hintStr := ""
+			if a.hint != "" {
+				hintStr = "  " + hintStyle.Render(a.hint)
+			}
+			if i == m.palette.selected {
+				lines = append(lines, "  "+selStyle.Render("> "+nameStr)+hintStr)
+			} else {
+				lines = append(lines, "    "+normalStyle.Render(nameStr)+hintStr)
+			}
+		}
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, hintStyle.Render("  Up/Down=navigate  Enter=select  Esc=close"))
+
+	panel := lipgloss.NewStyle().
+		Background(colPanel).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(colBorder).
+		Padding(0, 1).
+		Width(paletteW).
 		Render(strings.Join(lines, "\n"))
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
@@ -1406,9 +1937,82 @@ func (m *tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.hoverSession != -1 {
 			m.hoverSession = -1
 		}
+
+		// Click in the feed area — check if it hit a sub-agent summary line.
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if tcID := m.hitTestSubAgentSummary(y); tcID != "" {
+				m.toggleSubAgentBlock(tcID)
+				return m, nil
+			}
+		}
 	}
 
 	return m, nil
+}
+
+// hitTestSubAgentSummary checks if the given screen Y coordinate corresponds
+// to a sub-agent summary line in the viewport and returns its toolCallID.
+func (m *tuiModel) hitTestSubAgentSummary(screenY int) string {
+	// The feed viewport starts after: topBar + banners + details panel header area.
+	// We need the viewport's screen-relative Y offset. The feed box is in the
+	// right column, below the details panel.
+	// Rather than compute the exact pixel offset, we use the viewport's own
+	// scroll offset: viewport line = screenY - feedScreenTop.
+	// For simplicity, we build a mapping from viewport line → log index.
+
+	if len(m.subAgentBlocks) == 0 {
+		return ""
+	}
+
+	// Build hidden set for collapsed children.
+	hidden := make(map[int]bool)
+	for tcID, block := range m.subAgentBlocks {
+		if !m.subAgentExpanded[tcID] {
+			for _, idx := range block.childIndices {
+				hidden[idx] = true
+			}
+		}
+	}
+
+	// Build summaryIndices set for quick lookup.
+	summaryToTC := make(map[int]string)
+	for tcID, block := range m.subAgentBlocks {
+		summaryToTC[block.summaryIdx] = tcID
+	}
+
+	// Walk visible logs, counting rendered lines, to find which log index
+	// the clicked viewport line corresponds to.
+	viewportLine := m.viewport.YOffset + (screenY - m.viewportScreenTop())
+	if viewportLine < 0 {
+		return ""
+	}
+
+	line := 0
+	for i, entry := range m.logs {
+		if hidden[i] {
+			continue
+		}
+		entryLines := strings.Count(entry, "\n") + 1 + 1 // +1 for content, +1 for blank line after
+		if viewportLine >= line && viewportLine < line+entryLines {
+			if tcID, ok := summaryToTC[i]; ok {
+				return tcID
+			}
+			return ""
+		}
+		line += entryLines
+	}
+	return ""
+}
+
+// viewportScreenTop returns the screen Y coordinate where the feed viewport starts.
+func (m *tuiModel) viewportScreenTop() int {
+	// topBar + banners + details panel (with border)
+	detailsH := 8
+	if m.layoutBodyH < 20 {
+		detailsH = 6
+	}
+	// +2 for the detail panel border/chrome, +1 for feed header
+	return m.layoutTopBarH + m.layoutBannerH + detailsH + 2 + 1
 }
 
 // handleWizardClick maps a click in the wizard overlay to a field/option selection.
@@ -1616,6 +2220,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		// Update running sub-agent summaries so the spinner animates.
+		for _, block := range m.subAgentBlocks {
+			if block.status == "running" && block.summaryIdx >= 0 && block.summaryIdx < len(m.logs) {
+				m.logs[block.summaryIdx] = m.renderSubAgentSummary(block)
+			}
+		}
 		if m.pttActive && time.Since(m.pttLastSpace) > pttReleaseDebounce {
 			return m, tea.Batch(m.stopPTTCapture(), spinnerTickCmd())
 		}
@@ -1882,6 +2492,37 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitExternalCmd(m.extCh)
 
+	case filePickerFilesMsg:
+		m.picker.loading = false
+		if msg.sessionID == m.picker.sessionID && msg.workingDir == m.picker.workingDir {
+			m.picker.files = msg.files
+			m.picker.filtered = filePickerFuzzyMatch(m.picker.files, m.picker.query, m.picker.maxVisible)
+			m.picker.selected = 0
+		}
+		return m, nil
+
+	case undoResultMsg:
+		if msg.err != nil {
+			// On failure, restore the snapshot to the stack it came from.
+			stack := m.sessionUndoStack(msg.sessionID)
+			if msg.wasUndo {
+				stack.undoable = append(stack.undoable, msg.snapshot)
+			} else {
+				stack.redoable = append(stack.redoable, msg.snapshot)
+			}
+			m.logSystem(msg.err.Error())
+		} else {
+			// On success, move the snapshot to the opposite stack.
+			stack := m.sessionUndoStack(msg.sessionID)
+			if msg.wasUndo {
+				stack.redoable = append(stack.redoable, msg.snapshot)
+			} else {
+				stack.undoable = append(stack.undoable, msg.snapshot)
+			}
+			m.logSystem(msg.text)
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.String() != "tab" && msg.String() != "shift+tab" {
 			m.resetModelCompletion()
@@ -1897,6 +2538,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.permRequest != nil {
 			return m.updatePermRequest(msg)
 		}
+		// When command palette is open, route all key events to it.
+		if m.palette.open {
+			return m.updatePalette(msg)
+		}
 		// Robust fallback for terminals that encode word-nav as Alt+arrow.
 		if msg.Type == tea.KeyLeft && msg.Alt {
 			m.moveCursorWordLeft()
@@ -1905,6 +2550,30 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyRight && msg.Alt {
 			m.moveCursorWordRight()
 			return m, nil
+		}
+
+		// When file picker is active, intercept navigation keys.
+		if m.picker.active {
+			switch msg.String() {
+			case "up":
+				if m.picker.selected > 0 {
+					m.picker.selected--
+				}
+				return m, nil
+			case "down":
+				if m.picker.selected < len(m.picker.filtered)-1 {
+					m.picker.selected++
+				}
+				return m, nil
+			case "tab", "enter":
+				if len(m.picker.filtered) > 0 && m.picker.selected < len(m.picker.filtered) {
+					m.filePickerComplete()
+				}
+				return m, nil
+			case "esc":
+				m.picker.active = false
+				return m, nil
+			}
 		}
 
 		// Toggle help overlay with ? only when input is empty.
@@ -1944,6 +2613,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+l":
 			m.logs = nil
+			m.clearSubAgentState()
 			m.rebuildViewport()
 			return m, nil
 
@@ -2107,6 +2777,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case "ctrl+g":
+			m.toggleSubAgentExpansion()
+			return m, nil
+
 		case "ctrl+t":
 			m.themeIdx = (m.themeIdx + 1) % len(tuiThemes)
 			applyTheme(tuiThemes[m.themeIdx])
@@ -2118,8 +2792,24 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+p":
+			m.openPalette()
+			return m, nil
+
+		case "ctrl+s":
 			m.hideSidebar = !m.hideSidebar
 			m.resize()
+			return m, nil
+
+		case "ctrl+z":
+			if cmd := m.performUndo(); cmd != nil {
+				return m, cmd
+			}
+			return m, nil
+
+		case "ctrl+y":
+			if cmd := m.performRedo(); cmd != nil {
+				return m, cmd
+			}
 			return m, nil
 
 		case "ctrl+n":
@@ -2203,6 +2893,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.inputMaxH > 0 {
 		m.input.SetHeight(m.promptEditorHeight(m.inputMaxH - 1))
 	}
+	// Detect @ mentions for the file picker after every textarea change.
+	pickerCmd := m.filePickerSync()
+	if pickerCmd != nil {
+		cmd = tea.Batch(cmd, pickerCmd)
+	}
 	return m, cmd
 }
 
@@ -2223,6 +2918,10 @@ func (m *tuiModel) View() string {
 
 	if m.showHelp {
 		return m.renderHelp()
+	}
+
+	if m.palette.open {
+		return m.renderPalette()
 	}
 
 	if m.showZoo {
@@ -2331,12 +3030,24 @@ func (m *tuiModel) View() string {
 	if bodyH < 18 {
 		thinkingH = 3
 	}
-	inputMaxH := max(3, bodyH-detailsH-thinkingH-6)
+	// Reserve space for file picker popup when active.
+	pickerH := 0
+	if m.picker.active && (len(m.picker.filtered) > 0 || m.picker.loading) {
+		pickerH = min(len(m.picker.filtered)+2, m.picker.maxVisible+2) // +2 for header+border
+		if m.picker.loading && len(m.picker.filtered) == 0 {
+			pickerH = 3
+		}
+		if len(m.picker.files) > len(m.picker.filtered) && m.picker.query != "" {
+			pickerH++ // "N more" line
+		}
+		pickerH += 2 // top and bottom border
+	}
+	inputMaxH := max(3, bodyH-detailsH-thinkingH-pickerH-6)
 	m.inputMaxH = inputMaxH
 	inputEditorH := m.promptEditorHeight(inputMaxH - 1)
 	m.input.SetHeight(inputEditorH)
 	inputH := inputEditorH + 1
-	feedH := max(6, bodyH-detailsH-thinkingH-inputH)
+	feedH := max(6, bodyH-detailsH-thinkingH-inputH-pickerH)
 
 	m.layoutLeftW = leftW
 	m.layoutBodyH = bodyH
@@ -2410,7 +3121,14 @@ func (m *tuiModel) View() string {
 		m.input.View() + "\n" + styleMuted.Render("  "+hint),
 	)
 
-	right := lipgloss.JoinVertical(lipgloss.Left, detailBox, feedBox, thinkingBox, inputBox)
+	pickerPopup := m.renderFilePicker(rightW)
+	var rightParts []string
+	rightParts = append(rightParts, detailBox, feedBox, thinkingBox)
+	if pickerPopup != "" {
+		rightParts = append(rightParts, pickerPopup)
+	}
+	rightParts = append(rightParts, inputBox)
+	right := lipgloss.JoinVertical(lipgloss.Left, rightParts...)
 	var mainRow string
 	if m.hideSidebar {
 		mainRow = right
@@ -2533,10 +3251,12 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /blocks [compact|full]")
 		m.logSystem("  /theme [name]")
 		m.logSystem("  /themes")
+		m.logSystem("  /undo")
+		m.logSystem("  /redo")
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=sidebar  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
+		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=command palette  ctrl+s=sidebar  ctrl+z=undo  ctrl+y=redo  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -2768,6 +3488,10 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 			targetID = fields[1]
 		}
 		return deleteSessionCmd(m.api, targetID)
+	case "/undo":
+		return m.performUndo()
+	case "/redo":
+		return m.performRedo()
 	case "/quit", "/exit":
 		m.closeConn()
 		return tea.Quit
@@ -2798,6 +3522,7 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 		// Clear the feed and rebuild from the authoritative DB history.
 		// This handles both initial connect and reconnect cleanly.
 		m.logs = nil
+		m.clearSubAgentState()
 		m.agentBlockIdx = -1
 		m.replayingHistory = true
 		for _, it := range h.Messages {
@@ -2890,6 +3615,177 @@ func (m *tuiModel) renderFeedSection(title string, titleStyle lipgloss.Style, bo
 	return titleLine + "\n" + block
 }
 
+// ── sub-agent scope helpers ───────────────────────────────────────────────────
+
+// activeSubAgent returns the toolCallID of the innermost active sub-agent, or "".
+func (m *tuiModel) activeSubAgent() string {
+	if len(m.activeSubAgentStack) == 0 {
+		return ""
+	}
+	return m.activeSubAgentStack[len(m.activeSubAgentStack)-1]
+}
+
+// pushSubAgent enters a new sub-agent scope.
+func (m *tuiModel) pushSubAgent(toolCallID string) {
+	m.activeSubAgentStack = append(m.activeSubAgentStack, toolCallID)
+}
+
+// popSubAgent exits the sub-agent scope for the given toolCallID.
+// Handles out-of-order completion by removing from anywhere in the stack.
+func (m *tuiModel) popSubAgent(toolCallID string) {
+	for i := len(m.activeSubAgentStack) - 1; i >= 0; i-- {
+		if m.activeSubAgentStack[i] == toolCallID {
+			m.activeSubAgentStack = append(m.activeSubAgentStack[:i], m.activeSubAgentStack[i+1:]...)
+			return
+		}
+	}
+}
+
+// trackChildLog records a log index as belonging to the current active sub-agent.
+func (m *tuiModel) trackChildLog(idx int) {
+	if sa := m.activeSubAgent(); sa != "" {
+		if block, ok := m.subAgentBlocks[sa]; ok {
+			block.childIndices = append(block.childIndices, idx)
+		}
+	}
+}
+
+// logInSubAgent appends to m.logs and tracks the index as a sub-agent child if applicable.
+func (m *tuiModel) logInSubAgent(s string) {
+	idx := len(m.logs)
+	m.logs = append(m.logs, s)
+	if len(m.logs) > 4000 {
+		m.trimLogsWithSubAgents()
+	}
+	m.trackChildLog(idx)
+	if !m.replayingHistory {
+		m.rebuildViewport()
+	}
+}
+
+// clearSubAgentState resets all sub-agent tracking (for feed clear / session switch).
+func (m *tuiModel) clearSubAgentState() {
+	m.activeSubAgentStack = nil
+	m.subAgentBlocks = make(map[string]*subAgentBlock)
+	// Keep subAgentExpanded so user's toggle preference persists.
+}
+
+// toggleSubAgentExpansion toggles expansion of all sub-agent blocks in the feed.
+func (m *tuiModel) toggleSubAgentExpansion() {
+	if len(m.subAgentBlocks) == 0 {
+		return
+	}
+	// Determine if we should expand all or collapse all.
+	// If any are expanded, collapse all; otherwise expand all.
+	anyExpanded := false
+	for tcID := range m.subAgentBlocks {
+		if m.subAgentExpanded[tcID] {
+			anyExpanded = true
+			break
+		}
+	}
+	for tcID, block := range m.subAgentBlocks {
+		m.subAgentExpanded[tcID] = !anyExpanded
+		if block.summaryIdx >= 0 && block.summaryIdx < len(m.logs) {
+			m.logs[block.summaryIdx] = m.renderSubAgentSummary(block)
+		}
+	}
+	m.rebuildViewport()
+}
+
+// toggleSubAgentBlock toggles expansion of a single sub-agent block by toolCallID.
+func (m *tuiModel) toggleSubAgentBlock(toolCallID string) {
+	block, ok := m.subAgentBlocks[toolCallID]
+	if !ok {
+		return
+	}
+	m.subAgentExpanded[toolCallID] = !m.subAgentExpanded[toolCallID]
+	if block.summaryIdx >= 0 && block.summaryIdx < len(m.logs) {
+		m.logs[block.summaryIdx] = m.renderSubAgentSummary(block)
+	}
+	m.rebuildViewport()
+}
+
+// renderSubAgentSummary renders the collapsible one-line summary for a sub-agent block.
+func (m *tuiModel) renderSubAgentSummary(block *subAgentBlock) string {
+	expanded := m.subAgentExpanded[block.toolCallID]
+
+	var icon string
+	var iconStyle lipgloss.Style
+	switch block.status {
+	case "running":
+		icon = spinnerFrames[m.spinnerFrame]
+		iconStyle = styleOrange
+	case "completed":
+		icon = "✓"
+		iconStyle = styleGreen
+	case "failed":
+		icon = "✗"
+		iconStyle = styleRed
+	default:
+		icon = "●"
+		iconStyle = styleMuted
+	}
+
+	chevron := "▸" // collapsed
+	if expanded {
+		chevron = "▾"
+	}
+
+	steps := len(block.childIndices)
+	elapsed := ""
+	if !block.startedAt.IsZero() {
+		if block.status == "running" {
+			elapsed = formatElapsed(time.Since(block.startedAt))
+		} else if !block.completedAt.IsZero() {
+			elapsed = formatElapsed(block.completedAt.Sub(block.startedAt))
+		}
+	}
+
+	w := m.chatWidth()
+	summary := fmt.Sprintf(" %s %s sub-agent: %s", chevron, icon, block.title)
+	meta := fmt.Sprintf("  %d steps", steps)
+	if elapsed != "" {
+		meta += "  " + elapsed
+	}
+
+	line := iconStyle.Render(summary) + styleMuted.Render(meta)
+	sep := styleSep.Render(strings.Repeat("─", max(1, w)))
+
+	if expanded {
+		return sep + "\n" + line
+	}
+	return sep + "\n" + line + "\n" + sep
+}
+
+// trimLogsWithSubAgents trims m.logs to 4000 entries while adjusting all
+// sub-agent block indices to account for the removed prefix.
+func (m *tuiModel) trimLogsWithSubAgents() {
+	if len(m.logs) <= 4000 {
+		return
+	}
+	trimCount := len(m.logs) - 4000
+	m.logs = m.logs[trimCount:]
+
+	// Adjust all sub-agent block indices.
+	for tcID, block := range m.subAgentBlocks {
+		block.summaryIdx -= trimCount
+		if block.summaryIdx < 0 {
+			// Summary was trimmed away; remove the entire block.
+			delete(m.subAgentBlocks, tcID)
+			continue
+		}
+		newChildren := block.childIndices[:0]
+		for _, idx := range block.childIndices {
+			adjusted := idx - trimCount
+			if adjusted >= 0 {
+				newChildren = append(newChildren, adjusted)
+			}
+		}
+		block.childIndices = newChildren
+	}
+}
+
 // ── renderMessage ─────────────────────────────────────────────────────────────
 
 func (m *tuiModel) renderMessage(msg WSMessage) {
@@ -2911,8 +3807,10 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			m.agentBlockTime = time.Now()
 			m.agentBlockText = d.Text
 			m.logs = append(m.logs, m.renderChatBubble("assistant", tsStr, d.Text, colAccent, false))
+			// Track this new log entry as a sub-agent child if applicable.
+			m.trackChildLog(m.agentBlockIdx)
 			if len(m.logs) > 4000 {
-				m.logs = m.logs[len(m.logs)-4000:]
+				m.trimLogsWithSubAgents()
 				m.agentBlockIdx = -1 // index lost after trim; start fresh next chunk
 			}
 		}
@@ -2944,6 +3842,10 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			m.log(m.renderChatBubble("you", tsStr, d.Text, colCyan, true))
 			m.isThinking = true
 			m.pushThinking("prompt sent")
+			// Capture pre-run git baseline for undo tracking.
+			if !m.replayingHistory && m.activeSessionID != "" {
+				m.capturePreRunBaseline(m.activeSessionID)
+			}
 		}
 
 	case "tool_call":
@@ -2972,20 +3874,65 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			toolName := defaultString(d.Kind, "tool")
 			callTitle := defaultString(d.Title, toolName)
 			status := defaultString(d.Status, "running")
+
+			// Detect sub-agent spawn: insert a collapsible summary and enter scope.
+			if isSubAgentKind(toolName) {
+				if _, exists := m.subAgentBlocks[d.ToolCallID]; !exists {
+					block := &subAgentBlock{
+						toolCallID: d.ToolCallID,
+						title:      callTitle,
+						status:     "running",
+						summaryIdx: len(m.logs),
+						startedAt:  time.Now(),
+					}
+					m.subAgentBlocks[d.ToolCallID] = block
+					m.pushSubAgent(d.ToolCallID)
+					m.logs = append(m.logs, m.renderSubAgentSummary(block))
+					if !m.replayingHistory {
+						m.rebuildViewport()
+					}
+					m.isThinking = true
+					break
+				}
+			}
+
 			icon, _ := toolKindIcon(toolName)
 			metaParts := []string{
 				fmt.Sprintf("**Tool:** `%s`", toolName),
 				fmt.Sprintf("**Call:** %s %s", icon, callTitle),
 				fmt.Sprintf("**Status:** `%s`", status),
 			}
-			m.log(m.renderToolChatBubble("assistant · tool", tsStr, strings.Join(metaParts, "\n"), d.Content, colOrange, false))
+			m.logInSubAgent(m.renderToolChatBubble("assistant · tool", tsStr, strings.Join(metaParts, "\n"), d.Content, colOrange, false))
 			m.isThinking = true
 		}
 
 	case "tool_result":
 		var d WSToolResult
-		if json.Unmarshal(msg.Data, &d) == nil && d.Content != "" {
-			m.log(m.renderFeedSection("tool result", styleGreen, m.renderRichTextBlock(d.Content, w, true)))
+		if json.Unmarshal(msg.Data, &d) == nil {
+			// Check if this result completes a sub-agent.
+			if block, ok := m.subAgentBlocks[d.ToolCallID]; ok {
+				block.status = "completed"
+				block.completedAt = time.Now()
+				m.popSubAgent(d.ToolCallID)
+				// Add the result content as a child if non-empty.
+				if d.Content != "" {
+					idx := len(m.logs)
+					m.logs = append(m.logs, m.renderFeedSection("tool result", styleGreen, m.renderRichTextBlock(d.Content, w, true)))
+					block.childIndices = append(block.childIndices, idx)
+				}
+				// Update the summary line to reflect completion.
+				if block.summaryIdx >= 0 && block.summaryIdx < len(m.logs) {
+					m.logs[block.summaryIdx] = m.renderSubAgentSummary(block)
+				}
+				if !m.replayingHistory {
+					m.rebuildViewport()
+				}
+				break
+			}
+			// Regular (non-sub-agent) tool result.
+			if d.Content != "" {
+				m.logInSubAgent(m.renderFeedSection("tool result", styleGreen, m.renderRichTextBlock(d.Content, w, true)))
+			}
 		}
 
 	case "permission_request":
@@ -3043,6 +3990,10 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			}
 			if !m.replayingHistory {
 				go sendNotification("Agent finished", notifBody)
+			}
+			// Capture post-run git snapshot for undo tracking.
+			if !m.replayingHistory && m.activeSessionID != "" {
+				m.capturePostRunSnapshot(m.activeSessionID)
 			}
 			m.isThinking = false
 			m.pushThinking("run complete")
@@ -3386,8 +4337,22 @@ func (m *tuiModel) rebuildViewport() {
 func (m *tuiModel) renderViewportContent() string {
 	w := m.chatWidth()
 	bg := lipgloss.NewStyle().Background(colPanel).Foreground(colText)
+
+	// Build set of hidden log indices from collapsed sub-agent blocks.
+	hidden := make(map[int]bool)
+	for tcID, block := range m.subAgentBlocks {
+		if !m.subAgentExpanded[tcID] {
+			for _, idx := range block.childIndices {
+				hidden[idx] = true
+			}
+		}
+	}
+
 	var out []string
-	for _, entry := range m.logs {
+	for i, entry := range m.logs {
+		if hidden[i] {
+			continue
+		}
 		lines := strings.Split(entry, "\n")
 		for _, line := range lines {
 			out = append(out, bg.Render(padToWidth(line, w)))
@@ -3427,7 +4392,7 @@ func clampSliceTail(in []string, n int) []string {
 func (m *tuiModel) log(s string) {
 	m.logs = append(m.logs, s)
 	if len(m.logs) > 4000 {
-		m.logs = m.logs[len(m.logs)-4000:]
+		m.trimLogsWithSubAgents()
 	}
 	if !m.replayingHistory {
 		m.rebuildViewport()
@@ -4134,6 +5099,247 @@ func spinnerTickCmd() tea.Cmd {
 	return tea.Tick(spinnerTickInterval, func(t time.Time) tea.Msg {
 		return spinnerTickMsg(t)
 	})
+}
+
+// ── undo/redo git helpers ─────────────────────────────────────────────────────
+
+// undoResultMsg is the tea.Msg returned by async undo/redo git operations.
+type undoResultMsg struct {
+	text      string
+	err       error
+	snapshot  fileChangeSnapshot // the snapshot that was operated on
+	wasUndo   bool               // true = undo, false = redo
+	sessionID string
+}
+
+// gitDiffHead runs `git diff HEAD` in the given directory and returns the output.
+func gitDiffHead(dir string) (string, error) {
+	cmd := exec.Command("git", "diff", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git diff HEAD: %w", err)
+	}
+	return string(out), nil
+}
+
+// gitRevParseHead runs `git rev-parse HEAD` in the given directory.
+func gitRevParseHead(dir string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// gitDiffBetween runs `git diff <from> <to>` to capture committed changes.
+func gitDiffBetween(dir, from, to string) (string, error) {
+	cmd := exec.Command("git", "diff", from, to)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git diff %s %s: %w", from, to, err)
+	}
+	return string(out), nil
+}
+
+// gitApplyPatch applies a unified diff patch in the given directory.
+// If reverse is true, it applies the patch in reverse (undo).
+func gitApplyPatch(dir, patch string, reverse bool) error {
+	args := []string{"apply", "--whitespace=nowarn"}
+	if reverse {
+		args = append(args, "--reverse")
+	}
+	args = append(args, "-")
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(patch)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git apply: %s (%w)", strings.TrimSpace(stderr.String()), err)
+	}
+	return nil
+}
+
+// parseDiffFiles extracts the list of file paths from a unified diff.
+func parseDiffFiles(patch string) []string {
+	var files []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "+++ b/") {
+			f := strings.TrimPrefix(line, "+++ b/")
+			if !seen[f] {
+				seen[f] = true
+				files = append(files, f)
+			}
+		} else if strings.HasPrefix(line, "--- a/") {
+			f := strings.TrimPrefix(line, "--- a/")
+			if f != "/dev/null" && !seen[f] {
+				seen[f] = true
+				files = append(files, f)
+			}
+		}
+	}
+	return files
+}
+
+// sessionUndoStack returns (or creates) the undo stack for a session.
+func (m *tuiModel) sessionUndoStack(sessionID string) *undoStack {
+	if st, ok := m.undoStacks[sessionID]; ok {
+		return st
+	}
+	st := &undoStack{}
+	m.undoStacks[sessionID] = st
+	return st
+}
+
+// capturePreRunBaseline saves the current git state before a prompt run begins.
+func (m *tuiModel) capturePreRunBaseline(sessionID string) {
+	s, ok := m.findSessionByID(sessionID)
+	if !ok || s.WorkingDir == "" {
+		return
+	}
+	diff, _ := gitDiffHead(s.WorkingDir)
+	m.preRunDiff[sessionID] = diff
+	commit, _ := gitRevParseHead(s.WorkingDir)
+	m.preRunCommit[sessionID] = commit
+}
+
+// capturePostRunSnapshot compares the current git state against the pre-run
+// baseline and pushes any new changes onto the session's undo stack.
+func (m *tuiModel) capturePostRunSnapshot(sessionID string) {
+	s, ok := m.findSessionByID(sessionID)
+	if !ok || s.WorkingDir == "" {
+		return
+	}
+
+	// Capture committed changes (if HEAD moved during the run).
+	var committedPatch string
+	if preCommit, ok := m.preRunCommit[sessionID]; ok && preCommit != "" {
+		curCommit, err := gitRevParseHead(s.WorkingDir)
+		if err == nil && curCommit != preCommit {
+			committedPatch, _ = gitDiffBetween(s.WorkingDir, preCommit, curCommit)
+		}
+	}
+
+	// Capture uncommitted (working tree) changes relative to HEAD.
+	postDiff, _ := gitDiffHead(s.WorkingDir)
+
+	// Calculate the net new uncommitted changes.
+	preDiff := m.preRunDiff[sessionID]
+	var uncommittedPatch string
+	if postDiff != preDiff {
+		uncommittedPatch = postDiff
+	}
+
+	// Clean up baseline tracking.
+	delete(m.preRunDiff, sessionID)
+	delete(m.preRunCommit, sessionID)
+
+	hasPatch := committedPatch != "" || uncommittedPatch != ""
+	if !hasPatch {
+		return
+	}
+
+	// Store the uncommitted patch for undo. If only committed changes exist,
+	// store those for informational purposes.
+	patch := uncommittedPatch
+	if patch == "" {
+		patch = committedPatch
+	}
+
+	files := parseDiffFiles(patch)
+	if len(files) == 0 {
+		return
+	}
+
+	desc := fmt.Sprintf("%d file(s) changed", len(files))
+	if len(files) <= 3 {
+		desc = strings.Join(files, ", ")
+	}
+
+	stack := m.sessionUndoStack(sessionID)
+	stack.undoable = append(stack.undoable, fileChangeSnapshot{
+		patch:     patch,
+		files:     files,
+		timestamp: time.Now(),
+		message:   desc,
+	})
+	// Clear redo stack when new changes are made.
+	stack.redoable = nil
+}
+
+// performUndo applies the top undo snapshot in reverse and moves it to redo.
+func (m *tuiModel) performUndo() tea.Cmd {
+	if m.activeSessionID == "" {
+		m.logSystem("Nothing to undo (no active session)")
+		return nil
+	}
+	s, ok := m.findSessionByID(m.activeSessionID)
+	if !ok || s.WorkingDir == "" {
+		m.logSystem("Nothing to undo (session has no working directory)")
+		return nil
+	}
+	stack := m.sessionUndoStack(m.activeSessionID)
+	if len(stack.undoable) == 0 {
+		m.logSystem("Nothing to undo")
+		return nil
+	}
+
+	snap := stack.undoable[len(stack.undoable)-1]
+	stack.undoable = stack.undoable[:len(stack.undoable)-1]
+	dir := s.WorkingDir
+	sid := m.activeSessionID
+
+	return func() tea.Msg {
+		if err := gitApplyPatch(dir, snap.patch, true); err != nil {
+			return undoResultMsg{err: fmt.Errorf("undo failed: %w", err), snapshot: snap, wasUndo: true, sessionID: sid}
+		}
+		return undoResultMsg{
+			text:      fmt.Sprintf("Undid changes: %s (%d file(s))", snap.message, len(snap.files)),
+			snapshot:  snap,
+			wasUndo:   true,
+			sessionID: sid,
+		}
+	}
+}
+
+// performRedo reapplies the top redo snapshot and moves it back to undo.
+func (m *tuiModel) performRedo() tea.Cmd {
+	if m.activeSessionID == "" {
+		m.logSystem("Nothing to redo (no active session)")
+		return nil
+	}
+	s, ok := m.findSessionByID(m.activeSessionID)
+	if !ok || s.WorkingDir == "" {
+		m.logSystem("Nothing to redo (session has no working directory)")
+		return nil
+	}
+	stack := m.sessionUndoStack(m.activeSessionID)
+	if len(stack.redoable) == 0 {
+		m.logSystem("Nothing to redo")
+		return nil
+	}
+
+	snap := stack.redoable[len(stack.redoable)-1]
+	stack.redoable = stack.redoable[:len(stack.redoable)-1]
+	dir := s.WorkingDir
+	sid := m.activeSessionID
+
+	return func() tea.Msg {
+		if err := gitApplyPatch(dir, snap.patch, false); err != nil {
+			return undoResultMsg{err: fmt.Errorf("redo failed: %w", err), snapshot: snap, wasUndo: false, sessionID: sid}
+		}
+		return undoResultMsg{
+			text:      fmt.Sprintf("Redid changes: %s (%d file(s))", snap.message, len(snap.files)),
+			snapshot:  snap,
+			wasUndo:   false,
+			sessionID: sid,
+		}
+	}
 }
 
 // ── renderMissionControl ──────────────────────────────────────────────────────
@@ -5452,4 +6658,184 @@ func (m *tuiModel) updatePlaceholder() {
 		return
 	}
 	m.input.Placeholder = "Type a prompt and press Enter..."
+}
+
+// ── file picker methods ───────────────────────────────────────────────────────
+
+// filePickerSync detects @ mentions at the cursor and activates/deactivates
+// the file picker accordingly. Returns a tea.Cmd if files need to be loaded.
+func (m *tuiModel) filePickerSync() tea.Cmd {
+	cursorPos := m.inputCursorPosition()
+	active, query, atPos := filePickerDetect(m.input.Value(), cursorPos)
+
+	if !active {
+		m.picker.active = false
+		return nil
+	}
+
+	// Find the working directory of the active or selected session.
+	var workingDir, sessionID string
+	if m.activeSessionID != "" {
+		if s, ok := m.findSessionByID(m.activeSessionID); ok {
+			workingDir = s.WorkingDir
+			sessionID = s.ID
+		}
+	}
+	if workingDir == "" && len(m.sessions) > 0 && m.selected < len(m.sessions) {
+		s := m.sessions[m.selected]
+		workingDir = s.WorkingDir
+		sessionID = s.ID
+	}
+	if workingDir == "" {
+		m.picker.active = false
+		return nil
+	}
+
+	m.picker.active = true
+	m.picker.query = query
+	m.picker.atPosition = atPos
+
+	// If files are not loaded or session changed, trigger async load.
+	var cmd tea.Cmd
+	if m.picker.sessionID != sessionID || m.picker.workingDir != workingDir || len(m.picker.files) == 0 {
+		if !m.picker.loading {
+			m.picker.sessionID = sessionID
+			m.picker.workingDir = workingDir
+			m.picker.loading = true
+			cmd = filePickerLoadCmd(sessionID, workingDir)
+		}
+	}
+
+	// Update filtered results.
+	m.picker.filtered = filePickerFuzzyMatch(m.picker.files, m.picker.query, m.picker.maxVisible)
+	if m.picker.selected >= len(m.picker.filtered) {
+		m.picker.selected = max(0, len(m.picker.filtered)-1)
+	}
+
+	// If no results and no files loading, dismiss.
+	if len(m.picker.filtered) == 0 && !m.picker.loading && len(m.picker.files) > 0 {
+		// Keep active but show "no matches" — don't dismiss yet.
+	}
+
+	return cmd
+}
+
+// filePickerComplete replaces the @query text in the textarea with the
+// selected file path.
+func (m *tuiModel) filePickerComplete() {
+	if !m.picker.active || len(m.picker.filtered) == 0 {
+		return
+	}
+	selected := m.picker.filtered[m.picker.selected]
+	runes := []rune(m.input.Value())
+	atPos := m.picker.atPosition
+	cursorPos := m.inputCursorPosition()
+
+	// Build the new value: everything before @, then @path, then everything after cursor.
+	var newVal string
+	if atPos > 0 {
+		newVal = string(runes[:atPos])
+	}
+	insertion := "@" + selected
+	newVal += insertion
+	if cursorPos < len(runes) {
+		newVal += string(runes[cursorPos:])
+	}
+
+	newCursor := atPos + len([]rune(insertion))
+	// Add a trailing space if there isn't one already.
+	if newCursor >= len([]rune(newVal)) || !unicode.IsSpace([]rune(newVal)[newCursor]) {
+		newVal = string([]rune(newVal)[:newCursor]) + " " + string([]rune(newVal)[newCursor:])
+		newCursor++
+	}
+
+	m.setInputValueAndCursor(newVal, newCursor)
+	m.picker.active = false
+}
+
+// renderFilePicker renders the file picker popup as a string block.
+// Returns empty string if the picker is not active or has no results.
+func (m *tuiModel) renderFilePicker(maxWidth int) string {
+	if !m.picker.active {
+		return ""
+	}
+	if len(m.picker.filtered) == 0 && !m.picker.loading {
+		return ""
+	}
+
+	contentW := max(20, min(maxWidth-4, 60))
+
+	var lines []string
+	if m.picker.loading && len(m.picker.filtered) == 0 {
+		lines = append(lines, styleMuted.Render("  loading files..."))
+	}
+	for i, f := range m.picker.filtered {
+		// Truncate long paths.
+		display := f
+		if len(display) > contentW-4 {
+			display = "..." + display[len(display)-(contentW-7):]
+		}
+
+		if i == m.picker.selected {
+			line := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255")).
+				Background(colSelBg).
+				Bold(true).
+				Render("  " + display + "  ")
+			// Pad to contentW.
+			padded := line + lipgloss.NewStyle().Background(colSelBg).Render(strings.Repeat(" ", max(0, contentW-lipgloss.Width(line))))
+			lines = append(lines, padded)
+		} else {
+			// Highlight matching characters in the filename.
+			highlighted := filePickerHighlight(display, m.picker.query)
+			lines = append(lines, "  "+highlighted)
+		}
+	}
+	if len(m.picker.files) > len(m.picker.filtered) && len(m.picker.filtered) > 0 {
+		more := len(m.picker.files) - len(m.picker.filtered)
+		if m.picker.query != "" {
+			// The actual number of total matches may be unknown for subsequence,
+			// but we can indicate there are more files.
+			lines = append(lines, styleMuted.Render(fmt.Sprintf("  … %d+ more files", more)))
+		}
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+
+	header := styleAccent.Render("  @ files") + styleMuted.Render("  ↑↓ select  tab/enter complete  esc dismiss")
+	body := header + "\n" + strings.Join(lines, "\n")
+
+	popup := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colAccent).
+		Background(colPanel).
+		Foreground(colText).
+		Padding(0, 0).
+		Width(contentW).
+		Render(body)
+
+	return popup
+}
+
+// filePickerHighlight renders a file path with matching characters highlighted.
+func filePickerHighlight(path, query string) string {
+	if query == "" {
+		return styleText.Render(path)
+	}
+	queryLower := strings.ToLower(query)
+	pathRunes := []rune(path)
+	queryRunes := []rune(queryLower)
+	qi := 0
+	var result strings.Builder
+	for _, r := range pathRunes {
+		if qi < len(queryRunes) && unicode.ToLower(r) == queryRunes[qi] {
+			result.WriteString(styleAccent.Render(string(r)))
+			qi++
+		} else {
+			result.WriteString(styleText.Render(string(r)))
+		}
+	}
+	return result.String()
 }
