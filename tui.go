@@ -2544,6 +2544,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Discard raw SGR mouse escape sequences that leak through when the
+		// terminal sends scroll events Bubble Tea doesn't parse (e.g. scrolling
+		// past the bottom of the viewport). These look like [<65;109;35M.
+		if s := msg.String(); len(s) > 2 && strings.HasPrefix(s, "[<") {
+			return m, nil
+		}
 		if msg.String() != "tab" && msg.String() != "shift+tab" {
 			m.resetModelCompletion()
 		}
