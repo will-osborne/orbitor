@@ -316,7 +316,6 @@ func runServerMode() {
 	<-upg.Exit()
 
 	log.Println("shutting down...")
-	closeLocalSTTModel()
 	summarizer.Stop()
 	sm.Shutdown()
 	if waClient != nil {
@@ -330,7 +329,18 @@ func runServerMode() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 
+	// Free the whisper model after all sessions are stopped so that no
+	// session can run a final inference on a freed context.
+	closeLocalSTTModel()
+
 	log.Println("bye")
+
+	// Use _exit(2) to skip C++ static destructors. The ggml-metal backend
+	// stores Metal devices in a static vector whose destructor asserts that
+	// all GPU resource sets are empty. Even after whisper_free, the
+	// destructor ordering during __cxa_finalize is unreliable. Calling
+	// _exit avoids this class of GPU-backend teardown crashes entirely.
+	hardExit()
 }
 
 // runServiceSubcommand dispatches service management commands.
