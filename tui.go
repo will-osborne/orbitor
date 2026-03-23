@@ -5159,15 +5159,21 @@ func attachSessionCmd(api *tuiAPIClient, sessionID string, extCh chan tea.Msg) t
 	}
 }
 
-// wsSetReadHeartbeat configures a read deadline and pong handler on a TUI-side
+// wsSetReadHeartbeat configures a read deadline and ping handler on a TUI-side
 // WebSocket connection so that stale connections are detected promptly. The
-// server sends periodic pings; if no pong arrives within wsPongWait the read
-// deadline fires, causing ReadMessage to fail and triggering reconnection.
+// server sends periodic pings; when the TUI receives one, the ping handler
+// extends the read deadline and sends a pong reply. If no ping or data arrives
+// within wsPongWait the read deadline fires, causing ReadMessage to fail and
+// triggering reconnection.
 func wsSetReadHeartbeat(conn *websocket.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	conn.SetPongHandler(func(string) error {
+	conn.SetPingHandler(func(appData string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
-		return nil
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(wsWriteWait))
+		if err == websocket.ErrCloseSent {
+			return nil
+		}
+		return err
 	})
 }
 
