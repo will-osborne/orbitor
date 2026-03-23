@@ -194,7 +194,31 @@ const (
 //
 // The bare-Enter cases are needed because enabling the Kitty keyboard protocol
 // (disambiguate flag) remaps plain Enter from \r to \x1b[13u.
-func shiftEnterFilter(_ tea.Model, msg tea.Msg) tea.Msg {
+// parseCSIu attempts to parse a Kitty keyboard protocol CSI u sequence.
+// Format: \x1b[<keycode>u or \x1b[<keycode>;<modifier>u
+// Returns keycode, modifier (1=none,2=shift,3=alt,5=ctrl,6=ctrl+shift,7=ctrl+alt), and ok.
+func parseCSIu(data []byte) (keycode int, modifier int, ok bool) {
+	// Must start with \x1b[ and end with u.
+	if len(data) < 4 || data[0] != '\x1b' || data[1] != '[' || data[len(data)-1] != 'u' {
+		return 0, 0, false
+	}
+	inner := string(data[2 : len(data)-1]) // e.g. "97;5" or "13"
+	parts := strings.SplitN(inner, ";", 2)
+	kc, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	mod := 1
+	if len(parts) == 2 {
+		mod, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, 0, false
+		}
+	}
+	return kc, mod, true
+}
+
+func shiftEnterFilter(model tea.Model, msg tea.Msg) tea.Msg {
 	rv := reflect.ValueOf(msg)
 	// bubbletea's unknownCSISequenceMsg is an unexported []byte type.
 	// Detect it by checking the package path + slice-of-bytes shape.
@@ -209,15 +233,66 @@ func shiftEnterFilter(_ tea.Model, msg tea.Msg) tea.Msg {
 		return msg
 	}
 	data := rv.Bytes()
-	// Kitty bare Enter (sent when the Kitty disambiguate flag is active).
-	if bytes.Equal(data, []byte("\x1b[13u")) || bytes.Equal(data, []byte("\x1b[13;1u")) {
-		return tea.KeyMsg{Type: tea.KeyEnter}
+
+	// Try generic CSI u parsing first.
+	if kc, mod, ok := parseCSIu(data); ok {
+		switch {
+		// Bare Enter or Enter with no-modifier flag.
+		case kc == 13 && (mod == 1 || mod == 0):
+			return tea.KeyMsg{Type: tea.KeyEnter}
+		// Shift+Enter.
+		case kc == 13 && mod == 2:
+			return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{shiftEnterPrivate}}
+		// Alt+Enter.
+		case kc == 13 && mod == 3:
+			return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{altEnterPrivate}}
+		// Ctrl+<letter> (modifier 5 = ctrl). Map to legacy ctrl key types.
+		case mod == 5 && kc >= 97 && kc <= 122:
+			// Ctrl+a=1, Ctrl+b=2, ... Ctrl+z=26 — maps to tea.KeyCtrlA..tea.KeyCtrlZ.
+			ctrlType := tea.KeyType(kc - 97 + int(tea.KeyCtrlA))
+			return tea.KeyMsg{Type: ctrlType}
+		// Bare Tab (keycode 9).
+		case kc == 9 && (mod == 1 || mod == 0):
+			return tea.KeyMsg{Type: tea.KeyTab}
+		// Shift+Tab.
+		case kc == 9 && mod == 2:
+			return tea.KeyMsg{Type: tea.KeyShiftTab}
+		// Bare Escape (keycode 27).
+		case kc == 27 && (mod == 1 || mod == 0):
+			return tea.KeyMsg{Type: tea.KeyEscape}
+		// Bare Backspace (keycode 127).
+		case kc == 127 && (mod == 1 || mod == 0):
+			return tea.KeyMsg{Type: tea.KeyBackspace}
+		// Ctrl+Backspace → delete word backward (same as ctrl+w).
+		case kc == 127 && mod == 5:
+			return tea.KeyMsg{Type: tea.KeyCtrlW}
+		// Bare Space (keycode 32).
+		case kc == 32 && (mod == 1 || mod == 0):
+			return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
+		}
 	}
-	if bytes.Equal(data, []byte("\x1b[13;2u")) || bytes.Equal(data, []byte("\x1b[27;2;13~")) {
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{shiftEnterPrivate}}
+
+	// xterm modifyOtherKeys format: \x1b[27;<modifier>;<keycode>~
+	if bytes.HasPrefix(data, []byte("\x1b[27;")) && bytes.HasSuffix(data, []byte("~")) {
+		inner := string(data[5 : len(data)-1])
+		parts := strings.SplitN(inner, ";", 2)
+		if len(parts) == 2 {
+			mod, err1 := strconv.Atoi(parts[0])
+			kc, err2 := strconv.Atoi(parts[1])
+			if err1 == nil && err2 == nil {
+				switch {
+				case kc == 13 && mod == 2:
+					return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{shiftEnterPrivate}}
+				case kc == 13 && mod == 3:
+					return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{altEnterPrivate}}
+				}
+			}
+		}
 	}
-	if bytes.Equal(data, []byte("\x1b[13;3u")) || bytes.Equal(data, []byte("\x1b[27;3;13~")) {
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{altEnterPrivate}}
+
+	// In debug mode, surface unhandled CSI sequences so the user can see them.
+	if m, ok := model.(*tuiModel); ok && m != nil && m.debugKeys {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(fmt.Sprintf("[CSI:%x]", data))}
 	}
 	return msg
 }
@@ -939,6 +1014,9 @@ type tuiModel struct {
 	// terminal capabilities (detected once at startup)
 	termInfo terminalInfo
 
+	// key debug mode: log raw key info instead of acting on key events
+	debugKeys bool
+
 	// help overlay
 	showHelp bool
 
@@ -1103,11 +1181,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	newlineHint := "Shift+Enter/Ctrl+J"
-	if !m.termInfo.SupportsKitty && !m.termInfo.SupportsModifyKey {
-		newlineHint = "Ctrl+J"
-	}
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  " + newlineHint + " newline  ·  Ctrl+V attach/paste  ·  Ctrl+N new session  ·  Ctrl+D delete")
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  " + m.newlineKeyHint() + " newline  ·  Ctrl+V attach/paste  ·  Ctrl+N new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -2585,6 +2659,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if s := msg.String(); len(s) > 2 && strings.HasPrefix(s, "[<") {
 			return m, nil
 		}
+		// Key debug mode: log raw key info and consume the event (except for
+		// enter so the user can still type /debug-keys to turn it off).
+		if m.debugKeys && msg.Type != tea.KeyEnter && msg.Type != tea.KeyCtrlC {
+			var runeHex string
+			for _, r := range msg.Runes {
+				runeHex += fmt.Sprintf(" U+%04X", r)
+			}
+			m.logSystem(fmt.Sprintf("[key] type=%d str=%q alt=%v runes=[%s]",
+				msg.Type, msg.String(), msg.Alt, strings.TrimSpace(runeHex)))
+			return m, nil
+		}
 		if msg.String() != "tab" && msg.String() != "shift+tab" {
 			m.resetModelCompletion()
 		}
@@ -2894,6 +2979,22 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			raw := m.input.Value()
+			// Backslash+Enter → insert newline (universal fallback for
+			// terminals that can't distinguish Shift+Enter from Enter).
+			if strings.HasSuffix(raw, "\\") {
+				pos := m.inputCursorPosition()
+				runes := []rune(raw)
+				if pos > 0 && pos <= len(runes) && runes[pos-1] == '\\' {
+					// Replace the trailing backslash with a newline.
+					newRunes := make([]rune, 0, len(runes))
+					newRunes = append(newRunes, runes[:pos-1]...)
+					newRunes = append(newRunes, '\n')
+					newRunes = append(newRunes, runes[pos:]...)
+					m.setInputValueAndCursor(string(newRunes), pos) // pos-1 (removed \) + 1 (added \n) = pos
+					m.syncInputChrome()
+					return m, nil
+				}
+			}
 			if strings.TrimSpace(raw) == "" {
 				if len(m.sessions) == 0 {
 					m.logSystem("No sessions available")
@@ -3169,10 +3270,7 @@ func (m *tuiModel) View() string {
 	)
 
 	var hint string
-	nlHint := "Shift+Enter/Ctrl+J"
-	if !m.termInfo.SupportsKitty && !m.termInfo.SupportsModifyKey {
-		nlHint = "Ctrl+J"
-	}
+	nlHint := m.newlineKeyHint()
 	if m.activeSessionID != "" {
 		hint = "Enter=send(queue)  ·  " + nlHint + "=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
 	} else {
@@ -3321,6 +3419,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
 		m.logSystem("  /setup-terminal")
+		m.logSystem("  /debug-keys")
 		m.logSystem("  /quit")
 		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=command palette  ctrl+s=sidebar  ctrl+z=undo  ctrl+y=redo  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
 		return nil
@@ -3565,6 +3664,14 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		report := terminalSetupReport()
 		for _, line := range strings.Split(strings.TrimRight(report, "\n"), "\n") {
 			m.logSystem(line)
+		}
+		return nil
+	case "/debug-keys":
+		m.debugKeys = !m.debugKeys
+		if m.debugKeys {
+			m.logSystem("Key debug ON — press any key to see raw info. Type /debug-keys to stop.")
+		} else {
+			m.logSystem("Key debug OFF")
 		}
 		return nil
 	default:

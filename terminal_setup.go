@@ -62,9 +62,12 @@ func detectTerminal() terminalInfo {
 			SupportsKitty:     true,
 			SupportsModifyKey: true,
 			NeedsMetaConfig:   runtime.GOOS == "darwin",
-			ConfigHint: `Warp supports keyboard protocols but may need Option-as-Meta on macOS:
-  Settings → Keyboard → "Option key as Meta" → enable
-  Or: Settings → Keyboard → check "Left Option key as Meta"`,
+			ConfigHint: `Warp supports the Kitty keyboard protocol (since Feb 2026).
+If Shift+Enter doesn't work, update Warp to the latest version.
+Fallback: type backslash (\) then Enter, or Ctrl+J, to insert newlines.
+
+For Alt+Enter support on macOS:
+  Settings → Keyboard → "Option key as Meta" → enable`,
 		}
 	case "iTerm.app":
 		return terminalInfo{
@@ -177,7 +180,7 @@ func terminalSetupReport() string {
 	if info.SupportsKitty || info.SupportsModifyKey {
 		b.WriteString("    Shift+Enter (newline):   ✓ works\n")
 	} else {
-		b.WriteString("    Shift+Enter (newline):   ✗ use Ctrl+J instead\n")
+		b.WriteString("    Shift+Enter (newline):   ✗ use \\+Enter or Ctrl+J instead\n")
 	}
 	if info.SupportsKitty || info.SupportsModifyKey || !info.NeedsMetaConfig {
 		b.WriteString("    Alt+Enter (fork send):   ✓ works\n")
@@ -256,7 +259,7 @@ func runTerminalSetup() {
 // newlineKeyHint returns the appropriate keybinding label based on terminal capabilities.
 func (m *tuiModel) newlineKeyHint() string {
 	if m.termInfo.SupportsKitty || m.termInfo.SupportsModifyKey {
-		return "Shift+Enter / Ctrl+J"
+		return "Shift+Enter / \\+Enter / Ctrl+J"
 	}
-	return "Ctrl+J"
+	return "\\+Enter / Ctrl+J"
 }
