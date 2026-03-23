@@ -40,6 +40,8 @@ func main() {
 		if err := runSetup(); err != nil {
 			log.Fatal(err)
 		}
+	case "setup-terminal":
+		runTerminalSetup()
 	case "service":
 		runServiceSubcommand()
 	case "procmanager":

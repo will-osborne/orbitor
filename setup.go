@@ -98,6 +98,7 @@ func runSetup() error {
 	fmt.Printf("\n✓ Config written to %s\n", configPath)
 	fmt.Println()
 	fmt.Println("Next steps:")
+	fmt.Println("  • Run 'orbitor setup-terminal' to check keyboard/terminal compatibility")
 	fmt.Println("  • Run 'orbitor' to open the TUI")
 	if isServer {
 		if !serviceInstalled {

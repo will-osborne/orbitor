@@ -936,6 +936,9 @@ type tuiModel struct {
 	wsReconnecting   bool
 	wsReconnectSince time.Time
 
+	// terminal capabilities (detected once at startup)
+	termInfo terminalInfo
+
 	// help overlay
 	showHelp bool
 
@@ -1092,6 +1095,7 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		thinkingLines:     []string{"idle"},
 		picker:            filePicker{maxVisible: 10},
 	}
+	m.termInfo = detectTerminal()
 	if pref, err := readThemePreference(); err == nil && pref != "" {
 		if idx := themeIndexByName(pref); idx >= 0 {
 			m.themeIdx = idx
@@ -1099,7 +1103,11 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 	m.logSystem("Connected to " + api.baseURL)
-	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  Shift+Enter/Ctrl+J newline  ·  Ctrl+V attach/paste  ·  Ctrl+N new session  ·  Ctrl+D delete")
+	newlineHint := "Shift+Enter/Ctrl+J"
+	if !m.termInfo.SupportsKitty && !m.termInfo.SupportsModifyKey {
+		newlineHint = "Ctrl+J"
+	}
+	m.logSystem("Tab/Shift+Tab cycle sessions  ·  ↑/↓ scroll chat  ·  Enter connect/send  ·  " + newlineHint + " newline  ·  Ctrl+V attach/paste  ·  Ctrl+N new session  ·  Ctrl+D delete")
 	m.logSystem("PgUp/PgDn scroll feed  ·  g/G top/bottom  ·  Ctrl+L clear  ·  Ctrl+R refresh  ·  Ctrl+C quit")
 	m.logSystem("/help for all commands")
 
@@ -1430,7 +1438,7 @@ func (m *tuiModel) renderHelp() string {
 		"",
 		head.Render("  Session"),
 		row("Enter (with text)", "send prompt to session"),
-		row("Shift+Enter / Ctrl+J", "insert newline in prompt"),
+		row(m.newlineKeyHint(), "insert newline in prompt"),
 		row("Alt+Enter", "send prompt to cloned session"),
 		row("Ctrl+V", "paste clipboard image or file path"),
 		row("Hold Space", "push-to-talk dictation"),
@@ -1837,9 +1845,7 @@ func (m *tuiModel) Init() tea.Cmd {
 		// Alt+Enter send distinct escape sequences. Written directly to stdout
 		// here (after alt-screen entry) so the sequences apply to the
 		// alt-screen keyboard stack, not the main screen.
-		// \x1b[>4;2m – xterm modifyOtherKeys level 2
-		// \x1b[=1u   – Kitty keyboard protocol disambiguate flag
-		enableKittyKeyboardCmd(),
+		enableKeyboardProtocolsCmd(m.termInfo),
 		refreshSessionsCmd(m.api),
 		waitExternalCmd(m.extCh),
 		tickCmd(),
@@ -1864,9 +1870,26 @@ func prewarmDarwinSpeechHelperCmd() tea.Cmd {
 	}
 }
 
-func enableKittyKeyboardCmd() tea.Cmd {
+// enableKeyboardProtocolsCmd enables keyboard enhancement protocols based on
+// what the detected terminal supports. Inside tmux, sequences are wrapped in
+// DCS passthrough so they reach the outer terminal.
+func enableKeyboardProtocolsCmd(info terminalInfo) tea.Cmd {
 	return func() tea.Msg {
-		os.Stdout.WriteString("\x1b[>4;2m\x1b[=1u")
+		var seq string
+		if info.SupportsModifyKey {
+			seq += "\x1b[>4;2m" // xterm modifyOtherKeys level 2
+		}
+		if info.SupportsKitty {
+			seq += "\x1b[=1u" // Kitty keyboard protocol disambiguate flag
+		}
+		if seq == "" {
+			return nil
+		}
+		if os.Getenv("TMUX") != "" {
+			// tmux DCS passthrough: wrap sequences so they reach the outer terminal.
+			seq = "\x1bPtmux;" + strings.ReplaceAll(seq, "\x1b", "\x1b\x1b") + "\x1b\\"
+		}
+		os.Stdout.WriteString(seq)
 		return nil
 	}
 }
@@ -3146,10 +3169,14 @@ func (m *tuiModel) View() string {
 	)
 
 	var hint string
+	nlHint := "Shift+Enter/Ctrl+J"
+	if !m.termInfo.SupportsKitty && !m.termInfo.SupportsModifyKey {
+		nlHint = "Ctrl+J"
+	}
 	if m.activeSessionID != "" {
-		hint = "Enter=send(queue)  ·  Shift+Enter/Ctrl+J=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
+		hint = "Enter=send(queue)  ·  " + nlHint + "=new line  ·  Alt+Enter=fork send  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Ctrl+./Ctrl+\\=abort  ·  ↑/↓ scroll"
 	} else {
-		hint = "Enter=connect  ·  Shift+Enter=new line  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
+		hint = "Enter=connect  ·  " + nlHint + "=new line  ·  Ctrl+V=paste image/path  ·  @/path=file mention  ·  hold Space=dictate  ·  Tab cycle sessions  ·  ↑/↓ scroll"
 	}
 	if m.isThinking {
 		hint += "  ·  agent running"
@@ -3293,6 +3320,7 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /redo")
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
+		m.logSystem("  /setup-terminal")
 		m.logSystem("  /quit")
 		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=command palette  ctrl+s=sidebar  ctrl+z=undo  ctrl+y=redo  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
 		return nil
@@ -3533,6 +3561,12 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 	case "/quit", "/exit":
 		m.closeConn()
 		return tea.Quit
+	case "/setup-terminal":
+		report := terminalSetupReport()
+		for _, line := range strings.Split(strings.TrimRight(report, "\n"), "\n") {
+			m.logSystem(line)
+		}
+		return nil
 	default:
 		m.logSystem("Unknown command, use /help")
 		return nil
