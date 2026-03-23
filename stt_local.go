@@ -43,6 +43,15 @@ func ensureLocalSTTModel() (whisper.Model, error) {
 
 // prewarmLocalSTTModelCmd loads the whisper model in the background at startup
 // so the first dictation attempt doesn't block on model loading.
+// closeLocalSTTModel frees the whisper model so the Metal/GGML backend can
+// release GPU resources before the C runtime tears down during process exit.
+// Without this, ggml_metal_device_free asserts that resource sets are empty.
+func closeLocalSTTModel() {
+	if localSTTModel != nil {
+		localSTTModel.Close()
+	}
+}
+
 func prewarmLocalSTTModelCmd() tea.Cmd {
 	return func() tea.Msg {
 		_, _ = ensureLocalSTTModel()

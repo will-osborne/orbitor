@@ -16,4 +16,6 @@ func startLocalSTTSession(_ chan tea.Msg) (*localSTTSession, error) {
 
 func (s *localSTTSession) stop() {}
 
+func closeLocalSTTModel() {}
+
 func prewarmLocalSTTModelCmd() tea.Cmd { return nil }

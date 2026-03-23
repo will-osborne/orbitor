@@ -316,6 +316,7 @@ func runServerMode() {
 	<-upg.Exit()
 
 	log.Println("shutting down...")
+	closeLocalSTTModel()
 	summarizer.Stop()
 	sm.Shutdown()
 	if waClient != nil {
