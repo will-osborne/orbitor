@@ -376,6 +376,8 @@ var (
 		"o1",
 		"o3-mini",
 		"o4-mini",
+		"claude-sonnet-4-6",
+		"claude-opus-4-6",
 	}
 	wizardClaudeModels = []string{
 		"(default)",
@@ -4328,10 +4330,20 @@ func isLikelyDiff(text string) bool {
 
 // ── macOS notifications ───────────────────────────────────────────────────────
 
-// sendNotification fires a macOS notification with sound via osascript.
-// Runs in the background so it never blocks the TUI render loop.
+// sendNotification fires a macOS notification with Bottle sound via
+// terminal-notifier, falling back to osascript. The notification is
+// auto-removed after 60 seconds. Always call from a goroutine so it
+// never blocks the TUI render loop.
 func sendNotification(title, body string) {
-	script := fmt.Sprintf(`display notification %q with title %q sound name "Default"`, body, title)
+	if tnPath, err := exec.LookPath("terminal-notifier"); err == nil {
+		group := fmt.Sprintf("orbitor-%d", time.Now().UnixNano())
+		_ = exec.Command(tnPath, "-title", title, "-message", body, "-sound", "Bottle", "-group", group).Run()
+		time.AfterFunc(60*time.Second, func() {
+			_ = exec.Command(tnPath, "-remove", group).Run()
+		})
+		return
+	}
+	script := fmt.Sprintf(`display notification %q with title %q sound name "Bottle"`, body, title)
 	_ = exec.Command("osascript", "-e", script).Start()
 }
 
