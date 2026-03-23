@@ -269,6 +269,12 @@ func shiftEnterFilter(model tea.Model, msg tea.Msg) tea.Msg {
 		// Bare Space (keycode 32).
 		case kc == 32 && (mod == 1 || mod == 0):
 			return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
+		// Alt+<letter> (modifier 3 = alt). Map to KeyRunes with Alt flag.
+		case mod == 3 && kc >= 97 && kc <= 122:
+			return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune(kc)}, Alt: true}
+		// Alt+<digit> (modifier 3 = alt).
+		case mod == 3 && kc >= 48 && kc <= 57:
+			return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune(kc)}, Alt: true}
 		}
 	}
 
@@ -295,6 +301,13 @@ func shiftEnterFilter(model tea.Model, msg tea.Msg) tea.Msg {
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(fmt.Sprintf("[CSI:%x]", data))}
 	}
 	return msg
+}
+
+// copyMsg stores a raw conversation message for the copy-friendly select view.
+type copyMsg struct {
+	role string // "you", "assistant", "tool", "system"
+	text string // raw unformatted text
+	ts   string // timestamp
 }
 
 type tuiStateFile struct {
@@ -1003,6 +1016,10 @@ type tuiModel struct {
 	agentBlockTime time.Time // timestamp captured at block start
 	agentBlockText string    // raw accumulated text (unstyled) for the block
 
+	// copy support — track raw text of recent messages for clipboard copy
+	lastAssistantText string // raw text of the most recent assistant response
+	lastUserPrompt    string // raw text of the most recent user prompt
+
 	// replayingHistory suppresses notifications while replaying stored history
 	// so that old events don't trigger a burst of notifications on open.
 	replayingHistory bool
@@ -1016,6 +1033,16 @@ type tuiModel struct {
 
 	// key debug mode: log raw key info instead of acting on key events
 	debugKeys bool
+
+	// ctrl+c double-tap to exit: first press clears input, second within 1s exits
+	lastCtrlC time.Time
+
+	// mouse selection mode: when true, mouse capture is disabled and the
+	// viewport renders plain text (no borders/chrome) for native text selection
+	mouseSelectMode bool
+
+	// copyable conversation messages — append-only, independent of logs rendering
+	copyMsgs []copyMsg
 
 	// help overlay
 	showHelp bool
@@ -1518,6 +1545,7 @@ func (m *tuiModel) renderHelp() string {
 		row("Hold Space", "push-to-talk dictation"),
 		row("Ctrl+↑/↓", "cycle prompt history"),
 		row("Ctrl+\\", "interrupt running session"),
+		row("Alt+M", "toggle mouse select mode (for copy)"),
 		row("Ctrl+R / F5", "refresh sessions"),
 		"",
 		head.Render("  Commands"),
@@ -1592,6 +1620,9 @@ func newCommandPalette() commandPalette {
 			{name: "Toggle Skip Permissions", hint: ""},
 			{name: "Undo File Changes", hint: "Ctrl+Z"},
 			{name: "Redo File Changes", hint: "Ctrl+Y"},
+			{name: "Copy Last Response", hint: "/copy"},
+			{name: "Copy Prompt", hint: "/copy prompt"},
+			{name: "Mouse Select Mode", hint: "Alt+M"},
 		},
 	}
 }
@@ -1729,6 +1760,7 @@ func (m *tuiModel) executePaletteAction(name string) (tea.Model, tea.Cmd) {
 		return m, refreshSessionsCmd(m.api)
 	case "Clear Feed":
 		m.logs = nil
+		m.copyMsgs = nil
 		m.clearSubAgentState()
 		m.rebuildViewport()
 		return m, nil
@@ -1772,6 +1804,17 @@ func (m *tuiModel) executePaletteAction(name string) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	case "Copy Last Response":
+		return m, m.handleCommand("/copy last")
+	case "Copy Prompt":
+		return m, m.handleCommand("/copy prompt")
+	case "Mouse Select Mode":
+		m.mouseSelectMode = !m.mouseSelectMode
+		m.rebuildViewport()
+		if m.mouseSelectMode {
+			return m, tea.DisableMouse
+		}
+		return m, tea.EnableMouseCellMotion
 	}
 	return m, nil
 }
@@ -2754,8 +2797,22 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "ctrl+c":
-			m.closeConn()
-			return m, tea.Quit
+			now := time.Now()
+			// If input has text, first press clears it.
+			if m.input.Value() != "" {
+				m.input.SetValue("")
+				m.syncInputChrome()
+				m.lastCtrlC = now
+				return m, nil
+			}
+			// Double-tap within 1 second exits.
+			if now.Sub(m.lastCtrlC) < time.Second {
+				m.closeConn()
+				return m, tea.Quit
+			}
+			m.lastCtrlC = now
+			m.logSystem("Press Ctrl+C again to quit")
+			return m, nil
 
 		case "ctrl+l":
 			m.logs = nil
@@ -2893,6 +2950,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "alt+d":
 			m.deleteWordForward()
 			return m, nil
+
+		case "alt+m":
+			m.mouseSelectMode = !m.mouseSelectMode
+			m.rebuildViewport()
+			if m.mouseSelectMode {
+				return m, tea.DisableMouse
+			}
+			return m, tea.EnableMouseCellMotion
 
 		case "ctrl+u":
 			m.deleteToLineStart()
@@ -3047,13 +3112,21 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	prevH := m.input.Height()
 	m.input, cmd = m.input.Update(msg)
-	// Eagerly resize the textarea so its internal scroll offset is
-	// recalculated with the correct height before the next View() call.
-	// Without this, inserting a newline when height=1 causes the textarea to
-	// scroll the first line out of view before View() can widen the box.
+	// After a keystroke that causes the textarea to grow (e.g. first wrap),
+	// resize and reset the cursor position. The textarea's internal
+	// repositionView only ensures the cursor row is visible, so after
+	// growing from height 1→2 the first line stays scrolled away because
+	// the YOffset was set before the height changed. Resetting the value
+	// and cursor via setInputValueAndCursor rebuilds the viewport from
+	// scratch with the correct height, ensuring all lines are visible.
 	if m.inputMaxH > 0 {
-		m.input.SetHeight(m.promptEditorHeight(m.inputMaxH - 1))
+		newH := m.promptEditorHeight(m.inputMaxH - 1)
+		m.input.SetHeight(newH)
+		if newH > prevH {
+			m.setInputValueAndCursor(m.input.Value(), m.inputCursorPosition())
+		}
 	}
 	// Detect @ mentions for the file picker after every textarea change.
 	pickerCmd := m.filePickerSync()
@@ -3088,6 +3161,10 @@ func (m *tuiModel) View() string {
 
 	if m.showZoo {
 		return m.renderZoo()
+	}
+
+	if m.mouseSelectMode {
+		return m.renderSelectMode()
 	}
 
 	// opencode-inspired: flat, low-contrast chrome with subtle panel tint.
@@ -3418,10 +3495,11 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 		m.logSystem("  /redo")
 		m.logSystem("  /restart")
 		m.logSystem("  /delete [id]")
+		m.logSystem("  /copy [last|prompt|all]")
 		m.logSystem("  /setup-terminal")
 		m.logSystem("  /debug-keys")
 		m.logSystem("  /quit")
-		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=command palette  ctrl+s=sidebar  ctrl+z=undo  ctrl+y=redo  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  PgUp/PgDn=scroll")
+		m.logSystem("Hotkeys: ctrl+n=new session  tab/shift+tab=cycle sessions  e=expand sub-agents  up/down=scroll chat  ctrl+up/down=prompt history  ctrl+v=paste image/path  @/path=file mention  alt+enter=fork prompt  ctrl+d=delete  ctrl+l=clear  ctrl+m=markdown  ctrl+b=blocks  ctrl+t=theme  ctrl+p=command palette  ctrl+s=sidebar  ctrl+z=undo  ctrl+y=redo  ctrl+./ctrl+\\=abort  ctrl/alt+left/right=word move  alt+m=mouse select  PgUp/PgDn=scroll")
 		return nil
 	case "/refresh":
 		return refreshSessionsCmd(m.api)
@@ -3666,6 +3744,58 @@ func (m *tuiModel) handleCommand(raw string) tea.Cmd {
 			m.logSystem(line)
 		}
 		return nil
+	case "/copy":
+		target := "last"
+		if len(fields) > 1 {
+			target = fields[1]
+		}
+		var text string
+		switch target {
+		case "last":
+			// Copy the last completed assistant response.
+			// If we're mid-stream, grab the current agent block text.
+			if m.agentBlockText != "" {
+				text = m.agentBlockText
+			} else {
+				text = m.lastAssistantText
+			}
+			if text == "" {
+				m.logSystem("No assistant response to copy")
+				return nil
+			}
+		case "prompt":
+			text = m.input.Value()
+			if text == "" {
+				m.logSystem("Prompt is empty")
+				return nil
+			}
+		case "all":
+			// Build a plain-text conversation transcript from all messages.
+			var parts []string
+			for _, cm := range m.copyMsgs {
+				parts = append(parts, cm.role+" ("+cm.ts+"): "+cm.text)
+			}
+			text = strings.Join(parts, "\n\n")
+			if text == "" {
+				m.logSystem("No conversation to copy")
+				return nil
+			}
+		default:
+			m.logSystem("Usage: /copy [last|prompt|all]")
+			return nil
+		}
+		if err := writeClipboardText(text); err != nil {
+			m.logSystem("Copy failed: " + err.Error())
+			return nil
+		}
+		runeCount := len([]rune(text))
+		preview := text
+		if runeCount > 60 {
+			preview = string([]rune(text)[:60]) + "…"
+		}
+		preview = strings.ReplaceAll(preview, "\n", "↵")
+		m.logSystem(fmt.Sprintf("Copied %d chars: %s", runeCount, preview))
+		return nil
 	case "/debug-keys":
 		m.debugKeys = !m.debugKeys
 		if m.debugKeys {
@@ -3701,6 +3831,7 @@ func (m *tuiModel) handleIncoming(payload []byte) {
 		// Clear the feed and rebuild from the authoritative DB history.
 		// This handles both initial connect and reconnect cleanly.
 		m.logs = nil
+		m.copyMsgs = nil
 		m.clearSubAgentState()
 		m.agentBlockIdx = -1
 		m.replayingHistory = true
@@ -3981,11 +4112,16 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 		if m.agentBlockIdx >= 0 && m.agentBlockIdx < len(m.logs) {
 			m.agentBlockText += d.Text
 			m.logs[m.agentBlockIdx] = m.renderChatBubble("assistant", m.agentBlockTime.Format("15:04"), m.agentBlockText, colAccent, false)
+			// Update the coalesced copyMsg entry.
+			if len(m.copyMsgs) > 0 && m.copyMsgs[len(m.copyMsgs)-1].role == "assistant" {
+				m.copyMsgs[len(m.copyMsgs)-1].text = m.agentBlockText
+			}
 		} else {
 			m.agentBlockIdx = len(m.logs)
 			m.agentBlockTime = time.Now()
 			m.agentBlockText = d.Text
 			m.logs = append(m.logs, m.renderChatBubble("assistant", tsStr, d.Text, colAccent, false))
+			m.copyMsgs = append(m.copyMsgs, copyMsg{role: "assistant", text: d.Text, ts: tsStr})
 			// Track this new log entry as a sub-agent child if applicable.
 			m.trackChildLog(m.agentBlockIdx)
 			if len(m.logs) > 4000 {
@@ -4010,6 +4146,10 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 	}
 
 	// Every other message type ends the current agent text block.
+	// Snapshot the raw assistant text before clearing.
+	if m.agentBlockIdx >= 0 && m.agentBlockText != "" {
+		m.lastAssistantText = m.agentBlockText
+	}
 	m.agentBlockIdx = -1
 
 	switch msg.Type {
@@ -4018,6 +4158,8 @@ func (m *tuiModel) renderMessage(msg WSMessage) {
 			Text string `json:"text"`
 		}
 		if json.Unmarshal(msg.Data, &d) == nil {
+			m.lastUserPrompt = d.Text
+			m.copyMsgs = append(m.copyMsgs, copyMsg{role: "you", text: d.Text, ts: tsStr})
 			m.log(m.renderChatBubble("you", tsStr, d.Text, colCyan, true))
 			m.isThinking = true
 			m.pushThinking("prompt sent")
@@ -4599,6 +4741,40 @@ func (m *tuiModel) renderViewportContent() string {
 	return strings.Join(out, "\n")
 }
 
+// renderSelectMode renders the full screen as plain text for native terminal
+// text selection. No borders, no panels, no ANSI styling — just raw
+// conversation text that can be drag-selected and copied cleanly.
+func (m *tuiModel) renderSelectMode() string {
+	w := max(40, m.width)
+	h := max(10, m.height)
+
+	var out []string
+	out = append(out, " SELECT MODE — drag to select text, Cmd+C to copy, Alt+M to exit")
+	out = append(out, "")
+	for _, cm := range m.copyMsgs {
+		header := cm.role + "  " + cm.ts
+		out = append(out, header)
+		out = append(out, strings.Repeat("-", min(len(header)+4, w)))
+		for _, line := range strings.Split(cm.text, "\n") {
+			out = append(out, line)
+		}
+		out = append(out, "")
+	}
+	if len(m.copyMsgs) == 0 {
+		out = append(out, "(no messages yet)")
+	}
+
+	// Pad or trim to fill the screen so there's no leftover TUI chrome.
+	for len(out) < h {
+		out = append(out, "")
+	}
+	if len(out) > h {
+		// Show the last h lines (most recent messages visible).
+		out = out[len(out)-h:]
+	}
+	return strings.Join(out, "\n")
+}
+
 func padToWidth(s string, w int) string {
 	if w <= 0 {
 		return s
@@ -4920,6 +5096,35 @@ func readClipboardText() (string, error) {
 		return string(out), nil
 	default:
 		return "", fmt.Errorf("clipboard paste not supported on %s", runtime.GOOS)
+	}
+}
+
+func writeClipboardText(text string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		cmd := exec.Command("pbcopy")
+		cmd.Stdin = strings.NewReader(text)
+		return cmd.Run()
+	case "linux":
+		candidates := [][]string{
+			{"wl-copy"},
+			{"xclip", "-selection", "clipboard"},
+			{"xsel", "--clipboard", "--input"},
+		}
+		for _, candidate := range candidates {
+			path, err := exec.LookPath(candidate[0])
+			if err != nil {
+				continue
+			}
+			cmd := exec.Command(path, candidate[1:]...)
+			cmd.Stdin = strings.NewReader(text)
+			if err := cmd.Run(); err == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("no clipboard command available")
+	default:
+		return fmt.Errorf("clipboard copy not supported on %s", runtime.GOOS)
 	}
 }
 

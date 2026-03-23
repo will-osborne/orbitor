@@ -38,6 +38,7 @@ type Session struct {
 	SkipPermissions bool      // pass --yolo (copilot) or --dangerously-skip-permissions (claude)
 	PlanMode        bool      // enable plan mode (mode=plan via ACP)
 	ACPSession      string    // ACP session ID returned by agent
+	ResumeSession   string    // original session ID for copilot --resume (preserved across respawns)
 	Status          string    // "starting", "ready", "error", "closed"
 	CreatedAt       time.Time // when the session was first created
 
@@ -232,6 +233,7 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					SkipPermissions: r.SkipPermissions,
 					PlanMode:        r.PlanMode,
 					ACPSession:      r.ACPSession,
+					ResumeSession:   r.ResumeSession,
 					Status:          r.Status,
 					CreatedAt:       r.CreatedAt,
 					port:            r.Port,
@@ -465,10 +467,16 @@ func (s *Session) startCopilot(workingDir string, port int) {
 			args = append(args, "--reasoning-effort", "high")
 		}
 	}
-	// If we have a persisted ACP session id, ask the agent to resume it.
-	// This allows the agent process to reattach to the previous session state.
-	if s.ACPSession != "" {
-		args = append(args, "--resume", s.ACPSession)
+	// If we have a persisted session id, ask the agent to resume it.
+	// Prefer ResumeSession (the original conversation ID preserved across
+	// respawns) over ACPSession (which may have been replaced by a new
+	// ACP-level session after a failed SessionResume).
+	resumeID := s.ResumeSession
+	if resumeID == "" {
+		resumeID = s.ACPSession
+	}
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
 	}
 	// Try spawning via local procmanager first. If unavailable, fall back to in-process spawn.
 	spawnReq := map[string]any{"sessionId": s.ID, "cmd": "copilot", "args": args}
@@ -759,6 +767,19 @@ func (s *Session) finishACPSetup(workingDir string) {
 			s.hub.Broadcast("error", WSError{Message: fmt.Sprintf("session/new failed: %v", err)})
 			return
 		}
+	}
+
+	// For copilot, preserve the original conversation ID for --resume across
+	// respawns. The CLI --resume flag handles conversation continuity even
+	// when the ACP-level SessionResume fails (e.g. after an interrupt kills
+	// the process). Without this, the ACPSession gets overwritten with a new
+	// session ID and the conversation context is lost on next respawn.
+	if s.Backend == "copilot" && s.ACPSession != "" && acpSessionID != s.ACPSession {
+		if s.ResumeSession == "" {
+			s.ResumeSession = s.ACPSession
+		}
+		log.Printf("session %s: ACP session changed %s → %s (resume preserved: %s)",
+			s.ID, s.ACPSession, acpSessionID, s.ResumeSession)
 	}
 
 	s.ACPSession = acpSessionID

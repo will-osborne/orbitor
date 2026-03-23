@@ -23,6 +23,7 @@ type SessionRecord struct {
 	SkipPermissions bool
 	PlanMode        bool
 	ACPSession      string
+	ResumeSession   string
 	Status          string
 	Port            int
 	ProcID          int64
@@ -136,6 +137,7 @@ func NewStore(path string) (*Store, error) {
 		hasSummary := false
 		hasPlanMode := false
 		hasPRURL := false
+		hasResumeSession := false
 		for rows.Next() {
 			var cid int
 			var name string
@@ -162,6 +164,9 @@ func NewStore(path string) (*Store, error) {
 				if name == "pr_url" {
 					hasPRURL = true
 				}
+				if name == "resume_session" {
+					hasResumeSession = true
+				}
 			}
 		}
 		if !hasProcID {
@@ -181,6 +186,9 @@ func NewStore(path string) (*Store, error) {
 		}
 		if !hasPRURL {
 			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN pr_url TEXT;`)
+		}
+		if !hasResumeSession {
+			_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN resume_session TEXT;`)
 		}
 	}
 
@@ -246,8 +254,8 @@ func (st *Store) UpsertSession(s *Session) error {
 		planMode = 1
 	}
 	_, err := st.db.Exec(
-		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`INSERT INTO sessions (id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, resume_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(id) DO UPDATE SET
 		   working_dir=excluded.working_dir,
 		   backend=excluded.backend,
@@ -255,6 +263,7 @@ func (st *Store) UpsertSession(s *Session) error {
 		   skip_permissions=excluded.skip_permissions,
 		   plan_mode=excluded.plan_mode,
 		   acp_session=excluded.acp_session,
+		   resume_session=excluded.resume_session,
 		   status=excluded.status,
 		   port=excluded.port,
 		   proc_id=excluded.proc_id,
@@ -264,7 +273,7 @@ func (st *Store) UpsertSession(s *Session) error {
 		   summary=excluded.summary,
 		   pr_url=excluded.pr_url,
 		   updated_at=CURRENT_TIMESTAMP;`,
-		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, planMode, s.ACPSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary, prURL,
+		s.ID, s.WorkingDir, s.Backend, s.Model, skipPerms, planMode, s.ACPSession, s.ResumeSession, s.Status, s.port, s.procID, lastMessage, currentTool, title, summary, prURL,
 	)
 	return err
 }
@@ -299,7 +308,7 @@ func (st *Store) DeleteSession(sessionID string) error {
 
 // LoadSessions returns all persisted sessions.
 func (st *Store) LoadSessions() ([]SessionRecord, error) {
-	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, created_at FROM sessions ORDER BY created_at DESC`)
+	rows, err := st.db.Query(`SELECT id, working_dir, backend, model, skip_permissions, plan_mode, acp_session, resume_session, status, port, proc_id, last_message, current_tool, title, summary, pr_url, created_at FROM sessions ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -316,13 +325,17 @@ func (st *Store) LoadSessions() ([]SessionRecord, error) {
 		var curTool sql.NullString
 		var title sql.NullString
 		var summary sql.NullString
+		var resumeSession sql.NullString
 		var prURL sql.NullString
 		var createdAt sql.NullString
-		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &planModeInt, &r.ACPSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &prURL, &createdAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.WorkingDir, &r.Backend, &r.Model, &skipPerms, &planModeInt, &r.ACPSession, &resumeSession, &r.Status, &port, &proc, &lastMsg, &curTool, &title, &summary, &prURL, &createdAt); err != nil {
 			return nil, err
 		}
 		r.SkipPermissions = skipPerms.Valid && skipPerms.Int64 != 0
 		r.PlanMode = planModeInt.Valid && planModeInt.Int64 != 0
+		if resumeSession.Valid {
+			r.ResumeSession = resumeSession.String
+		}
 		if port.Valid {
 			r.Port = int(port.Int64)
 		}
