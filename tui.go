@@ -1121,6 +1121,10 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 		}
 	}
 
+	// Reset keyboard protocol state left over from a prior crash (the
+	// disable sequences are no-ops if the protocol is not active).
+	fmt.Print("\x1b[>4;0m\x1b[=0u")
+
 	// Keyboard protocol enable sequences are sent from Init() after the
 	// alt screen is active (so they apply to the alt-screen keyboard stack).
 	// Disable sequences are sent here on exit to restore the terminal.

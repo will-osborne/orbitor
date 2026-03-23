@@ -91,12 +91,16 @@ func runTUIMode(newSession bool) {
 		if err := RunTUI(serverURL, true, backend, model, skip, plan); err != nil {
 			log.Fatalf("tui: %v", err)
 		}
+		closeLocalSTTModel()
+		hardExit()
 		return
 	}
 
 	if err := RunTUI(serverURL, false, "", "", false, false); err != nil {
 		log.Fatalf("tui: %v", err)
 	}
+	closeLocalSTTModel()
+	hardExit()
 }
 
 // runServerMode starts the HTTP server in the foreground with tableflip support.
