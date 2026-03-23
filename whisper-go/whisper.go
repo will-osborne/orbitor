@@ -52,6 +52,15 @@ static bool whisper_encoder_begin_cb(struct whisper_context* ctx, struct whisper
     return false;
 }
 
+// No-op log callback to suppress whisper/ggml stderr output.
+static void whisper_log_noop(enum ggml_log_level level, const char * text, void * user_data) {
+    (void)level; (void)text; (void)user_data;
+}
+
+static void whisper_suppress_log(void) {
+    whisper_log_set(whisper_log_noop, NULL);
+}
+
 // Get default parameters and set callbacks
 static struct whisper_full_params whisper_full_default_params_cb(struct whisper_context* ctx, enum whisper_sampling_strategy strategy) {
 	struct whisper_full_params params = whisper_full_default_params(strategy);
@@ -102,6 +111,12 @@ var (
 
 ///////////////////////////////////////////////////////////////////////////////
 // PUBLIC METHODS
+
+// Whisper_suppress_logging installs a no-op log callback so that whisper/ggml
+// model-loading output does not spew to stderr (which corrupts a TUI).
+func Whisper_suppress_logging() {
+	C.whisper_suppress_log()
+}
 
 // Allocates all memory needed for the model and loads the model from the given file.
 // Returns NULL on failure.

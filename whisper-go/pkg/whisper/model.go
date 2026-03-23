@@ -24,6 +24,9 @@ var _ Model = (*model)(nil)
 // LIFECYCLE
 
 func New(path string) (Model, error) {
+	// Suppress whisper/ggml stderr logging to avoid corrupting the TUI.
+	whisper.Whisper_suppress_logging()
+
 	model := new(model)
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
