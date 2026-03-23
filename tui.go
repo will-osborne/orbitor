@@ -829,14 +829,15 @@ func isSubsequence(needle, haystack string) bool {
 // filePickerDetect checks the textarea value and cursor position and returns
 // (active, query, atPosition). It only activates when @ is preceded by
 // whitespace or is at the start of the line, and the cursor is within the
-// @ token (no whitespace between @ and cursor).
+// @ token. An unescaped space terminates the token (dismissing the picker);
+// escaped spaces (backslash-space) are treated as literal spaces in the path.
 func filePickerDetect(value string, cursorPos int) (bool, string, int) {
 	runes := []rune(value)
 	if cursorPos < 0 || cursorPos > len(runes) {
 		return false, "", 0
 	}
 	// Walk backwards from cursor to find the @ character.
-	// Stop if we hit whitespace (no active @ mention at cursor).
+	// Stop if we hit an unescaped whitespace character.
 	pos := cursorPos - 1
 	for pos >= 0 {
 		r := runes[pos]
@@ -845,16 +846,33 @@ func filePickerDetect(value string, cursorPos int) (bool, string, int) {
 			if pos > 0 && !unicode.IsSpace(runes[pos-1]) {
 				return false, "", 0
 			}
-			query := string(runes[pos+1 : cursorPos])
+			query := filePickerUnescapeSpaces(string(runes[pos+1 : cursorPos]))
 			return true, query, pos
 		}
 		if unicode.IsSpace(r) {
-			// Hit whitespace before finding @.
+			// Check if this space is escaped with a preceding backslash.
+			if pos > 0 && runes[pos-1] == '\\' {
+				pos--
+				continue
+			}
+			// Unescaped whitespace — no active @ mention at cursor.
 			return false, "", 0
 		}
 		pos--
 	}
 	return false, "", 0
+}
+
+// filePickerUnescapeSpaces converts escaped spaces ("\ ") to literal spaces
+// in a file picker query.
+func filePickerUnescapeSpaces(s string) string {
+	return strings.ReplaceAll(s, "\\ ", " ")
+}
+
+// filePickerEscapeSpaces converts literal spaces to escaped spaces ("\ ")
+// for insertion into the textarea.
+func filePickerEscapeSpaces(s string) string {
+	return strings.ReplaceAll(s, " ", "\\ ")
 }
 
 // ── model ─────────────────────────────────────────────────────────────────────
@@ -6810,7 +6828,7 @@ func (m *tuiModel) filePickerComplete() {
 	if atPos > 0 {
 		newVal = string(runes[:atPos])
 	}
-	insertion := "@" + selected
+	insertion := "@" + filePickerEscapeSpaces(selected)
 	newVal += insertion
 	if cursorPos < len(runes) {
 		newVal += string(runes[cursorPos:])
