@@ -1125,16 +1125,8 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 						m.swapConn(conn)
 						m.activeSessionID = created.ID
 						m.logSystem("Connected to session " + created.ID)
-						go func() {
-							for {
-								_, payload, err := conn.ReadMessage()
-								if err != nil {
-									m.extCh <- wsDisconnectedMsg{conn: conn, err: err}
-									return
-								}
-								m.extCh <- wsPayloadMsg{payload: payload}
-							}
-						}()
+						wsSetReadHeartbeat(conn)
+						go wsReadLoop(conn, m.extCh)
 					}
 				}
 			}
@@ -4581,11 +4573,14 @@ func (m *tuiModel) inputCursorPosition() int {
 	value := m.input.Value()
 	lines := strings.Split(value, "\n")
 	row := clamp(m.input.Line(), 0, max(0, len(lines)-1))
-	col := m.input.LineInfo().CharOffset
 	if len(lines) == 0 {
 		return 0
 	}
-	col = clamp(col, 0, len([]rune(lines[row])))
+	// Use StartColumn + ColumnOffset to get the true rune index within the
+	// logical line. CharOffset is the display-width offset within the
+	// soft-wrapped visual line and gives the wrong position when text wraps.
+	li := m.input.LineInfo()
+	col := clamp(li.StartColumn+li.ColumnOffset, 0, len([]rune(lines[row])))
 	return inputAbsolutePosition(value, row, col)
 }
 
@@ -5158,17 +5153,36 @@ func attachSessionCmd(api *tuiAPIClient, sessionID string, extCh chan tea.Msg) t
 		if err != nil {
 			return attachMsg{sessionID: sessionID, err: err}
 		}
-		go func() {
-			for {
-				_, payload, err := conn.ReadMessage()
-				if err != nil {
-					extCh <- wsDisconnectedMsg{conn: conn, err: err}
-					return
-				}
-				extCh <- wsPayloadMsg{payload: payload}
-			}
-		}()
+		wsSetReadHeartbeat(conn)
+		go wsReadLoop(conn, extCh)
 		return attachMsg{sessionID: sessionID, conn: conn}
+	}
+}
+
+// wsSetReadHeartbeat configures a read deadline and pong handler on a TUI-side
+// WebSocket connection so that stale connections are detected promptly. The
+// server sends periodic pings; if no pong arrives within wsPongWait the read
+// deadline fires, causing ReadMessage to fail and triggering reconnection.
+func wsSetReadHeartbeat(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+}
+
+// wsReadLoop reads messages from a WebSocket connection and pushes them to the
+// external channel. Exits (and signals disconnection) when the read fails.
+func wsReadLoop(conn *websocket.Conn, extCh chan tea.Msg) {
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			extCh <- wsDisconnectedMsg{conn: conn, err: err}
+			return
+		}
+		// Any received data proves the connection is alive — extend the deadline.
+		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		extCh <- wsPayloadMsg{payload: payload}
 	}
 }
 

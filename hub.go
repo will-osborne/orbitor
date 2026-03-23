@@ -4,8 +4,19 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// wsPingInterval is how often the server sends WebSocket pings.
+	wsPingInterval = 30 * time.Second
+	// wsPongWait is how long the server waits for a pong before considering
+	// the connection dead.
+	wsPongWait = 45 * time.Second
+	// wsWriteWait is the deadline for writing a single message.
+	wsWriteWait = 10 * time.Second
 )
 
 // Hub fans out messages to all connected WebSocket clients.
@@ -146,10 +157,26 @@ func (h *Hub) Broadcast(msgType string, data any) {
 }
 
 func (c *Client) WritePump() {
-	defer c.conn.Close()
-	for data := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			return
+	ticker := time.NewTicker(wsPingInterval)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case data, ok := <-c.send:
+			if !ok {
+				return
+			}
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -159,6 +186,11 @@ func (c *Client) ReadPump(onMessage func([]byte)) {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
+	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	c.conn.SetPongHandler(func(string) error {
+		_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
 	for {
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
