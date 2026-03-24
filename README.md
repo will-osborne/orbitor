@@ -13,7 +13,7 @@ You kick off a task in Claude Code or GitHub Copilot, then sit there watching it
 
 ## Screenshots
 
-*Screenshots coming soon.*
+![TUI showing multiple sessions, tool calls, and test output](screenshots/tui-overview.png)
 
 ---
 
