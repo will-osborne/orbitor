@@ -24,7 +24,7 @@ Get up and running in under five minutes on the machine where you'll run AI sess
 **1. Install**
 
 ```bash
-brew tap OWNER/orbitor
+brew tap will-osborne/orbitor
 brew install orbitor
 ```
 
@@ -63,7 +63,7 @@ Press `n` to create a new session in the current directory, or use `orbitor new`
 ### Homebrew (recommended)
 
 ```bash
-brew tap OWNER/orbitor
+brew tap will-osborne/orbitor
 brew install orbitor
 ```
 
@@ -143,7 +143,7 @@ Tailscale provides secure peer-to-peer connectivity between the server and your 
 A colleague on a different machine can connect to your server without running their own:
 
 ```bash
-brew tap OWNER/orbitor && brew install orbitor
+brew tap will-osborne/orbitor && brew install orbitor
 orbitor setup    # enter the server machine's Tailscale IP when prompted
 orbitor          # opens TUI pointed at your server
 ```

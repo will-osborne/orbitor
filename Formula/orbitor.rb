@@ -31,6 +31,9 @@ class Orbitor < Formula
 
   def post_install
     (Pathname.new(ENV["HOME"]) / ".orbitor").mkpath
+    # Restart the background service after upgrade so the new binary is used.
+    # quiet_system avoids errors when the service isn't running yet.
+    quiet_system "brew", "services", "restart", "orbitor"
   end
 
   service do
