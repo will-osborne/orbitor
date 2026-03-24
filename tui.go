@@ -3191,7 +3191,9 @@ func (m *tuiModel) View() string {
 		Foreground(lipgloss.Color("255")).
 		Background(colSelBg).
 		Bold(true)
-	activeStyle := lipgloss.NewStyle().Foreground(colAccent)
+	activeStyle := lipgloss.NewStyle().
+		Foreground(colAccent).
+		Bold(true)
 
 	// Sessions panel is ~19% of terminal width (≈ 2/3 of previous 28%).
 	var leftW, rightW int
@@ -5959,13 +5961,17 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			if m.sessionUnread[s.ID] {
 				unreadBadge = " " + styleYellow.Render("◆")
 			}
-			topLine := prefix + s.ID + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
-			titleLine := styleText.Render(trimForLine("  "+titleText, max(10, listW)))
-			botLine := styleMuted.Render(trimForLine("  "+fullPath, max(10, listW)))
 			if isActive {
-				topLine = activeStyle.Render(prefix+s.ID) + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
+				topLine := activeStyle.Render(prefix+s.ID) + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
+				titleLine := activeStyle.Render(trimForLine("  "+titleText, max(10, listW)))
+				botLine := activeStyle.Render(trimForLine("  "+fullPath, max(10, listW)))
+				out = append(out, trimForLine(topLine, max(10, listW))+badges+subAgentBadge+unreadBadge, titleLine, botLine, sep)
+			} else {
+				topLine := prefix + s.ID + "  " + stateTag + "  " + styleCyan.Render(trimForLine(backendModel, max(8, listW/3)))
+				titleLine := styleText.Render(trimForLine("  "+titleText, max(10, listW)))
+				botLine := styleMuted.Render(trimForLine("  "+fullPath, max(10, listW)))
+				out = append(out, trimForLine(topLine, max(10, listW))+badges+subAgentBadge+unreadBadge, titleLine, botLine, sep)
 			}
-			out = append(out, trimForLine(topLine, max(10, listW))+badges+subAgentBadge+unreadBadge, titleLine, botLine, sep)
 		}
 
 		// Render sub-agent rows when expanded.
