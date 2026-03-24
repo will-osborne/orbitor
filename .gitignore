@@ -51,3 +51,4 @@ key.properties
 
 # Git worktrees (local only, managed by Claude Code)
 .worktrees/
+screenshots/
