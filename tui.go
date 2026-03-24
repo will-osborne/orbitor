@@ -2696,10 +2696,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// Discard raw SGR mouse escape sequences that leak through when the
-		// terminal sends scroll events Bubble Tea doesn't parse (e.g. scrolling
-		// past the bottom of the viewport). These look like [<65;109;35M.
-		if s := msg.String(); len(s) > 2 && strings.HasPrefix(s, "[<") {
+		// Discard raw escape sequences that leak through as KeyMsg runes.
+		// SGR mouse scroll events look like [<65;109;35M, but other CSI
+		// sequences (e.g. [CSI:hex] from the filter, or bare [ followed by
+		// digits) can also leak when scrolling past viewport bounds.
+		if s := msg.String(); len(s) > 1 && s[0] == '[' {
 			return m, nil
 		}
 		// Key debug mode: log raw key info and consume the event (except for
@@ -3108,6 +3109,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, clonePromptCmd(m.api, m.activeSessionID, raw)
+		}
+
+		// Guard: don't pass KeyRunes containing control/escape characters to
+		// the textarea. These can leak through from unparsed mouse scroll
+		// sequences or other terminal escape sequences bubbletea partially
+		// decoded.
+		if msg.Type == tea.KeyRunes {
+			for _, r := range msg.Runes {
+				if r < 0x20 || r == 0x1b || r == 0x7f {
+					return m, nil
+				}
+			}
 		}
 	}
 
