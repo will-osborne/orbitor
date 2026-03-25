@@ -234,6 +234,9 @@ final class ChatState {
                 }
                 allMessages.append(msg)
             }
+            // Derive isRunning from history: if the last prompt_sent has no
+            // subsequent run_complete/interrupted, the agent is still active.
+            isRunning = deriveRunningState(from: batch)
             // Show only the tail page
             trimToTail()
             isLoadingHistory = false
@@ -264,6 +267,22 @@ final class ChatState {
             visibleStart = total - pageSize
             messages = Array(allMessages[visibleStart...])
         }
+    }
+
+    /// Check whether the agent is mid-run by scanning history for the last
+    /// prompt_sent that wasn't followed by run_complete or interrupted.
+    private func deriveRunningState(from messages: [ChatMessage]) -> Bool {
+        for msg in messages.reversed() {
+            switch msg {
+            case .runComplete, .interrupted:
+                return false
+            case .promptSent:
+                return true
+            default:
+                continue
+            }
+        }
+        return false
     }
 
     /// Called once history loading is done (first non-history message arrives,
