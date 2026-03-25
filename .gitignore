@@ -1,6 +1,6 @@
 # Compiled binaries
 copilot-bridge
-orbitor
+/orbitor
 /dist/
 
 # Go build cache
