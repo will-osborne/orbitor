@@ -21,8 +21,12 @@ final class DictationState {
     private let holdThreshold: TimeInterval = 0.4 // hold 400ms to activate
     /// Called when dictation finishes — set by PromptInputView to append text.
     var onDictationComplete: ((String) -> Void)?
+    /// Called to insert a space when user does a quick tap (not a hold).
+    var onInsertSpace: (() -> Void)?
     /// Whether the prompt input is empty (only start dictation when empty).
     var promptIsEmpty = true
+    /// Whether we swallowed the initial space press and are waiting to see if it's a hold.
+    private var pendingSpace = false
 
     init() {
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
@@ -67,15 +71,20 @@ final class DictationState {
                 // Check if we've held long enough
                 if !spaceIsHeld, let downTime = spaceDownTime,
                    Date().timeIntervalSince(downTime) >= holdThreshold,
-                   promptIsEmpty, isAvailable {
+                   isAvailable {
                     spaceIsHeld = true
+                    pendingSpace = false
                     DispatchQueue.main.async { self.startRecording() }
                 }
-                return spaceIsHeld ? nil : event
+                return (spaceIsHeld || pendingSpace) ? nil : event
             }
-            // Initial press
+            // Initial press — swallow if prompt is empty and dictation could activate
             spaceDownTime = Date()
             spaceIsHeld = false
+            if promptIsEmpty && isAvailable {
+                pendingSpace = true
+                return nil
+            }
             return event
         }
 
@@ -83,11 +92,21 @@ final class DictationState {
             if isRecording || spaceIsHeld {
                 spaceIsHeld = false
                 spaceDownTime = nil
+                pendingSpace = false
                 DispatchQueue.main.async {
                     let result = self.stopRecording()
                     if !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         self.onDictationComplete?(result)
                     }
+                }
+                return nil
+            }
+            // Quick tap — insert the space we swallowed
+            if pendingSpace {
+                pendingSpace = false
+                spaceDownTime = nil
+                DispatchQueue.main.async {
+                    self.onInsertSpace?()
                 }
                 return nil
             }

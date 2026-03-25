@@ -189,6 +189,11 @@ struct ChatView: View {
                         }
                     }
                 }
+                .onChange(of: appState.chat.activeSessionID) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                }
                 } // ZStack
             }
 

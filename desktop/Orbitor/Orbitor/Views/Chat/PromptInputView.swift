@@ -124,14 +124,11 @@ struct PromptInputView: View {
         .onAppear {
             isFocused = true
             appState.dictation.promptIsEmpty = text.isEmpty
-            appState.dictation.onDictationComplete = { [weak appState] result in
-                // Remove any spaces that leaked into the text field during hold
-                if let appState {
-                    // Trim leading spaces that accumulated while holding
-                    let cleaned = text.replacingOccurrences(of: #"^\s+"#, with: "", options: .regularExpression)
-                    text = cleaned + result
-                    _ = appState // keep reference alive
-                }
+            appState.dictation.onDictationComplete = { result in
+                text += result
+            }
+            appState.dictation.onInsertSpace = {
+                text += " "
             }
             appState.dictation.installEventMonitor()
         }
@@ -140,6 +137,9 @@ struct PromptInputView: View {
         }
         .onChange(of: text) { _, newValue in
             appState.dictation.promptIsEmpty = newValue.isEmpty
+        }
+        .onChange(of: appState.chat.activeSessionID) { _, _ in
+            isFocused = true
         }
     }
 }

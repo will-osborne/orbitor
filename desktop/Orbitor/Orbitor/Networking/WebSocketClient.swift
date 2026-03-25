@@ -110,11 +110,9 @@ final class WebSocketClient: @unchecked Sendable {
 
         let now = Date()
 
-        if envelope.type == "history", let messages = envelope.messages {
-            let parsed = messages.compactMap { parseEnvelope($0, timestamp: now) }
-            if !parsed.isEmpty {
-                continuation?.yield(.historyBatch(id: UUID(), messages: parsed, timestamp: now))
-            }
+        if envelope.type == "history" {
+            let parsed = (envelope.messages ?? []).compactMap { parseEnvelope($0, timestamp: now) }
+            continuation?.yield(.historyBatch(id: UUID(), messages: parsed, timestamp: now))
             return
         }
 

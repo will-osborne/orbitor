@@ -17,6 +17,11 @@ struct SessionListView: View {
                         session.id == appState.sessionList.selectedSessionID
                             ? theme.selBg : Color.clear
                     )
+                    .contextMenu {
+                        Button("Delete Session", role: .destructive) {
+                            Task { await appState.sessionList.deleteSession(session.id) }
+                        }
+                    }
             }
         }
         .listStyle(.sidebar)

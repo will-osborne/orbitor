@@ -122,6 +122,22 @@ struct InspectorView: View {
                         }
                     }
 
+                    // Delete
+                    DetailSection(title: "Danger Zone") {
+                        Button(role: .destructive) {
+                            Task { await appState.sessionList.deleteSession(session.id) }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                Text("Delete Session")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(theme.red)
+                        }
+                        .buttonStyle(.plain)
+                        .hoverScale(1.05)
+                    }
+
                     Spacer()
                 }
                 .padding()
@@ -202,6 +218,15 @@ struct ModelPickerRow: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var selectedModel: String = ""
+    @State private var isUserChange = false
+
+    private func syncModel() {
+        let current = session.model ?? ""
+        let resolved = modelsForBackend(session.backend).contains(current) ? current : "(default)"
+        if selectedModel != resolved {
+            selectedModel = resolved
+        }
+    }
 
     var body: some View {
         HStack {
@@ -217,7 +242,7 @@ struct ModelPickerRow: View {
             .pickerStyle(.menu)
             .controlSize(.small)
             .onChange(of: selectedModel) { _, newValue in
-                guard !newValue.isEmpty else { return }
+                guard isUserChange, !newValue.isEmpty else { return }
                 let modelToSend = newValue == "(default)" ? defaultModelForBackend(session.backend) : newValue
                 Task {
                     try? await appState.api.updateSession(id: session.id, model: modelToSend)
@@ -226,11 +251,17 @@ struct ModelPickerRow: View {
             }
         }
         .onAppear {
-            let current = session.model ?? ""
-            if modelsForBackend(session.backend).contains(current) {
-                selectedModel = current
-            } else {
-                selectedModel = "(default)"
+            syncModel()
+            // Delay enabling user changes to avoid triggering on initial sync
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isUserChange = true
+            }
+        }
+        .onChange(of: session.model) { _, _ in
+            isUserChange = false
+            syncModel()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isUserChange = true
             }
         }
     }
