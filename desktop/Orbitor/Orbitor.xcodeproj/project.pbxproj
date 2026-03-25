@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		143763597DA538F7889F8A20 /* DictationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A144262FA85A3A3E914533C /* DictationState.swift */; };
 		A1B2C3D4E5F60001000A0001 /* OrbitorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0001 /* OrbitorApp.swift */; };
 		A1B2C3D4E5F60001000A0002 /* SessionInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0002 /* SessionInfo.swift */; };
 		A1B2C3D4E5F60001000A0003 /* WSMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0003 /* WSMessage.swift */; };
@@ -23,15 +24,17 @@
 		A1B2C3D4E5F60001000A000E /* InspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A000E /* InspectorView.swift */; };
 		A1B2C3D4E5F60001000A000F /* CodeBlockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A000F /* CodeBlockView.swift */; };
 		A1B2C3D4E5F60001000A0010 /* StatusBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0010 /* StatusBadge.swift */; };
+		A1B2C3D4E5F60001000A0015 /* HoverEffects.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */; };
 		A1B2C3D4E5F60001000A0011 /* NewSessionSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0011 /* NewSessionSheet.swift */; };
 		A1B2C3D4E5F60001000A0012 /* SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0012 /* SessionListView.swift */; };
 		A1B2C3D4E5F60001000A0013 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0013 /* Assets.xcassets */; };
+		A656BEB21F4D28778B492BC9 /* Speech.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 47063F531C80C12E9B85DACC /* Speech.framework */; };
 /* End PBXBuildFile section */
 
-/* Begin PBXCopyFilesBuildPhase section */
-/* End PBXCopyFilesBuildPhase section */
-
 /* Begin PBXFileReference section */
+		0A144262FA85A3A3E914533C /* DictationState.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DictationState.swift; sourceTree = "<group>"; };
+		47063F531C80C12E9B85DACC /* Speech.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = Speech.framework; sourceTree = SDKROOT; };
+		8CB53CDFF8408384C4B014FD /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0001 /* OrbitorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitorApp.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0002 /* SessionInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionInfo.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0003 /* WSMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WSMessage.swift; sourceTree = "<group>"; };
@@ -52,6 +55,7 @@
 		A1B2C3D4E5F60002000A0012 /* SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListView.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0013 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0014 /* Orbitor.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Orbitor.entitlements; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoverEffects.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60003000A0001 /* Orbitor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Orbitor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -60,6 +64,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A656BEB21F4D28778B492BC9 /* Speech.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -71,15 +76,8 @@
 			children = (
 				A1B2C3D4E5F60005000A0002 /* Orbitor */,
 				A1B2C3D4E5F60005000A0020 /* Products */,
+				DD95838328B9A99FDE4A5E19 /* Frameworks */,
 			);
-			sourceTree = "<group>";
-		};
-		A1B2C3D4E5F60005000A0020 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				A1B2C3D4E5F60003000A0001 /* Orbitor.app */,
-			);
-			name = Products;
 			sourceTree = "<group>";
 		};
 		A1B2C3D4E5F60005000A0002 /* Orbitor */ = {
@@ -93,6 +91,7 @@
 				A1B2C3D4E5F60005000A0007 /* Views */,
 				A1B2C3D4E5F60002000A0013 /* Assets.xcassets */,
 				A1B2C3D4E5F60002000A0014 /* Orbitor.entitlements */,
+				8CB53CDFF8408384C4B014FD /* Info.plist */,
 			);
 			path = Orbitor;
 			sourceTree = "<group>";
@@ -121,6 +120,7 @@
 				A1B2C3D4E5F60002000A0006 /* AppState.swift */,
 				A1B2C3D4E5F60002000A0007 /* ChatState.swift */,
 				A1B2C3D4E5F60002000A0008 /* SessionListState.swift */,
+				0A144262FA85A3A3E914533C /* DictationState.swift */,
 			);
 			path = State;
 			sourceTree = "<group>";
@@ -167,6 +167,7 @@
 			isa = PBXGroup;
 			children = (
 				A1B2C3D4E5F60002000A000F /* CodeBlockView.swift */,
+				A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */,
 				A1B2C3D4E5F60002000A0010 /* StatusBadge.swift */,
 			);
 			path = Shared;
@@ -179,6 +180,22 @@
 				A1B2C3D4E5F60002000A0012 /* SessionListView.swift */,
 			);
 			path = Sidebar;
+			sourceTree = "<group>";
+		};
+		A1B2C3D4E5F60005000A0020 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F60003000A0001 /* Orbitor.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DD95838328B9A99FDE4A5E19 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				47063F531C80C12E9B85DACC /* Speech.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -266,8 +283,10 @@
 				A1B2C3D4E5F60001000A000E /* InspectorView.swift in Sources */,
 				A1B2C3D4E5F60001000A000F /* CodeBlockView.swift in Sources */,
 				A1B2C3D4E5F60001000A0010 /* StatusBadge.swift in Sources */,
+				A1B2C3D4E5F60001000A0015 /* HoverEffects.swift in Sources */,
 				A1B2C3D4E5F60001000A0011 /* NewSessionSheet.swift in Sources */,
 				A1B2C3D4E5F60001000A0012 /* SessionListView.swift in Sources */,
+				143763597DA538F7889F8A20 /* DictationState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -402,6 +421,7 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Orbitor/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
@@ -426,6 +446,7 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Orbitor/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;

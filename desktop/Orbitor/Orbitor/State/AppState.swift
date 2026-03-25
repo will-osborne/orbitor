@@ -11,9 +11,16 @@ final class AppState {
         didSet { UserDefaults.standard.set(selectedThemeID, forKey: "themeID") }
     }
 
+    var showNewSession = false
+    var showForkSheet = false
+    var fontSize: CGFloat {
+        didSet { UserDefaults.standard.set(fontSize, forKey: "fontSize") }
+    }
+
     private(set) var api: APIClient
     let sessionList: SessionListState
     let chat: ChatState
+    let dictation = DictationState()
 
     var currentTheme: OrbitorTheme {
         OrbitorTheme.all.first { $0.id == selectedThemeID } ?? .dracula
@@ -26,6 +33,8 @@ final class AppState {
 
         self.serverURL = url
         self.selectedThemeID = themeID
+        let savedFontSize = UserDefaults.standard.double(forKey: "fontSize")
+        self.fontSize = savedFontSize > 0 ? savedFontSize : 13
 
         let baseURL = URL(string: url) ?? URL(string: "http://127.0.0.1:8080")!
         let client = APIClient(baseURL: baseURL)

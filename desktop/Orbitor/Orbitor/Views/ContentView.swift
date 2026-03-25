@@ -1,17 +1,17 @@
 import SwiftUI
+import Combine
 
 struct ContentView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var showNewSession = false
     @State private var inspectorPresented = true
 
     var body: some View {
-        @Bindable var sessionList = appState.sessionList
+        @Bindable var state = appState
 
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SessionListView(showNewSession: $showNewSession)
+            SessionListView(showNewSession: $state.showNewSession)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 360)
         } detail: {
             if appState.sessionList.selectedSessionID != nil {
@@ -25,12 +25,22 @@ struct ContentView: View {
                     }
                 }
             } else {
-                EmptyStateView(showNewSession: $showNewSession)
+                EmptyStateView(showNewSession: $state.showNewSession)
             }
         }
         .background(theme.panel)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                // Fork button
+                if appState.sessionList.selectedSessionID != nil {
+                    Button {
+                        appState.showForkSheet = true
+                    } label: {
+                        Image(systemName: "arrow.triangle.branch")
+                    }
+                    .help("Fork Session (⇧⌘N)")
+                }
+
                 Button {
                     inspectorPresented.toggle()
                 } label: {
@@ -50,13 +60,22 @@ struct ContentView: View {
                 .frame(width: 120)
             }
         }
-        .sheet(isPresented: $showNewSession) {
+        .sheet(isPresented: $state.showNewSession) {
             NewSessionSheet()
+        }
+        .sheet(isPresented: $state.showForkSheet) {
+            ForkSessionSheet()
         }
         .onChange(of: appState.sessionList.selectedSessionID) { _, newID in
             if let id = newID {
                 appState.chat.connectToSession(id)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            appState.chat.isAppFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            appState.chat.isAppFocused = false
         }
     }
 }
@@ -79,6 +98,7 @@ struct EmptyStateView: View {
             .keyboardShortcut("n")
             .buttonStyle(.borderedProminent)
             .tint(theme.accent)
+            .hoverGlow()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.panel)

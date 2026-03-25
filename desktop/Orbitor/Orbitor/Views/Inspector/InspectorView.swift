@@ -23,7 +23,7 @@ struct InspectorView: View {
                             StatusBadge(state: session.stateLabel)
                         }
                         DetailRow(label: "Backend", value: session.backend, theme: theme)
-                        DetailRow(label: "Model", value: session.model ?? "default", theme: theme)
+                        ModelPickerRow(session: session)
                     }
 
                     DetailSection(title: "State") {
@@ -191,6 +191,47 @@ struct DetailRow: View {
                 trailing
             }
             Spacer()
+        }
+    }
+}
+
+// MARK: - Model picker for existing sessions
+
+struct ModelPickerRow: View {
+    let session: SessionInfo
+    @Environment(AppState.self) private var appState
+    @Environment(\.theme) private var theme
+    @State private var selectedModel: String = ""
+
+    var body: some View {
+        HStack {
+            Text("Model")
+                .font(.caption)
+                .foregroundStyle(theme.muted)
+                .frame(width: 70, alignment: .trailing)
+            Picker("", selection: $selectedModel) {
+                ForEach(modelsForBackend(session.backend), id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+            .pickerStyle(.menu)
+            .controlSize(.small)
+            .onChange(of: selectedModel) { _, newValue in
+                guard !newValue.isEmpty else { return }
+                let modelToSend = newValue == "(default)" ? defaultModelForBackend(session.backend) : newValue
+                Task {
+                    try? await appState.api.updateSession(id: session.id, model: modelToSend)
+                    await appState.sessionList.refresh()
+                }
+            }
+        }
+        .onAppear {
+            let current = session.model ?? ""
+            if modelsForBackend(session.backend).contains(current) {
+                selectedModel = current
+            } else {
+                selectedModel = "(default)"
+            }
         }
     }
 }

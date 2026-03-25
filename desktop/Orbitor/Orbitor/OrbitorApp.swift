@@ -37,9 +37,15 @@ struct AppCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Session") {
-                appState.sessionList.selectedSessionID = nil // triggers sheet
+                appState.showNewSession = true
             }
             .keyboardShortcut("n")
+
+            Button("Fork Session") {
+                appState.showForkSheet = true
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift])
+            .disabled(appState.sessionList.selectedSessionID == nil)
         }
 
         CommandMenu("Session") {
@@ -68,6 +74,23 @@ struct AppCommands: Commands {
                 }
                 .keyboardShortcut(.delete, modifiers: [.command])
             }
+        }
+
+        CommandMenu("View") {
+            Button("Increase Font Size") {
+                appState.fontSize = min(appState.fontSize + 1, 28)
+            }
+            .keyboardShortcut("+", modifiers: .command)
+
+            Button("Decrease Font Size") {
+                appState.fontSize = max(appState.fontSize - 1, 9)
+            }
+            .keyboardShortcut("-", modifiers: .command)
+
+            Button("Reset Font Size") {
+                appState.fontSize = 13
+            }
+            .keyboardShortcut("0", modifiers: .command)
         }
 
         CommandMenu("Theme") {

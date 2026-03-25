@@ -4,6 +4,7 @@ struct CodeBlockView: View {
     let code: String
     var language: String = ""
     @Environment(\.theme) private var theme
+    @Environment(AppState.self) private var appState
     @State private var isCopied = false
 
     var body: some View {
@@ -40,7 +41,7 @@ struct CodeBlockView: View {
             // Code content
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.system(size: max(appState.fontSize - 1, 9), design: .monospaced))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .padding(.horizontal, 10)
@@ -59,6 +60,7 @@ struct CodeBlockView: View {
 struct MarkdownTextView: View {
     let text: String
     @Environment(\.theme) private var theme
+    @Environment(AppState.self) private var appState
 
     var body: some View {
         let segments = parseMarkdown(text)
@@ -66,14 +68,17 @@ struct MarkdownTextView: View {
             ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .text(let content):
-                    if let attributed = try? AttributedString(markdown: content) {
+                    if let attributed = try? AttributedString(
+                        markdown: content,
+                        options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+                    ) {
                         Text(attributed)
-                            .font(.body)
+                            .font(.system(size: appState.fontSize))
                             .foregroundStyle(theme.text)
                             .textSelection(.enabled)
                     } else {
                         Text(content)
-                            .font(.body)
+                            .font(.system(size: appState.fontSize))
                             .foregroundStyle(theme.text)
                             .textSelection(.enabled)
                     }

@@ -68,6 +68,17 @@ final class SessionListState {
     }
 
     @MainActor
+    func forkSession(sourceID: String, prompt: String) async {
+        do {
+            let session = try await api.forkSession(sourceID: sourceID, prompt: prompt)
+            sessions.insert(session, at: 0)
+            selectedSessionID = session.id
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    @MainActor
     func deleteSession(_ id: String) async {
         do {
             try await api.deleteSession(id: id)

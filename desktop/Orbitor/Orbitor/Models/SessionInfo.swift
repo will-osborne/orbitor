@@ -1,6 +1,6 @@
 import Foundation
 
-struct SessionInfo: Codable, Identifiable, Hashable {
+struct SessionInfo: Codable, Identifiable, Equatable {
     let id: String
     let workingDir: String
     var acpSessionId: String
@@ -20,9 +20,6 @@ struct SessionInfo: Codable, Identifiable, Hashable {
     var prUrl: String?
     let createdAt: Date
     var subAgents: [SubAgentInfo]?
-
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
-    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
 
     var displayTitle: String {
         title ?? lastMessage?.prefix(60).description ?? workingDir.components(separatedBy: "/").last ?? id
@@ -51,7 +48,7 @@ struct SessionInfo: Codable, Identifiable, Hashable {
     }
 }
 
-struct SubAgentInfo: Codable, Identifiable {
+struct SubAgentInfo: Codable, Identifiable, Equatable {
     let toolCallId: String
     let title: String
     let status: String

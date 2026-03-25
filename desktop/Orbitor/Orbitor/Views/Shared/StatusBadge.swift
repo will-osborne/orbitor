@@ -17,5 +17,6 @@ struct StatusBadge: View {
         .padding(.vertical, 2)
         .background(theme.stateColor(state).opacity(0.1))
         .clipShape(Capsule())
+        .hoverScale(1.08)
     }
 }

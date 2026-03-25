@@ -21,6 +21,8 @@ enum ChatMessage: Identifiable {
     case runComplete(id: UUID, stopReason: String, timestamp: Date)
     case interrupted(id: UUID, timestamp: Date)
     case error(id: UUID, message: String, timestamp: Date)
+    /// Bulk history load — all messages arrive at once to avoid per-message re-renders.
+    case historyBatch(id: UUID, messages: [ChatMessage], timestamp: Date)
 
     var id: UUID {
         switch self {
@@ -32,7 +34,8 @@ enum ChatMessage: Identifiable {
              .promptSent(let id, _, _),
              .runComplete(let id, _, _),
              .interrupted(let id, _),
-             .error(let id, _, _):
+             .error(let id, _, _),
+             .historyBatch(let id, _, _):
             return id
         }
     }
@@ -47,7 +50,8 @@ enum ChatMessage: Identifiable {
              .promptSent(_, _, let t),
              .runComplete(_, _, let t),
              .interrupted(_, let t),
-             .error(_, _, let t):
+             .error(_, _, let t),
+             .historyBatch(_, _, let t):
             return t
         }
     }

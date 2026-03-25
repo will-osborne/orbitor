@@ -35,6 +35,7 @@ final class WebSocketClient: @unchecked Sendable {
 
         let session = URLSession(configuration: .default)
         let wsTask = session.webSocketTask(with: url)
+        wsTask.maximumMessageSize = 64 * 1024 * 1024  // 64 MB for large chat histories
         self.task = wsTask
 
         let stream = AsyncStream<ChatMessage> { cont in
@@ -110,10 +111,9 @@ final class WebSocketClient: @unchecked Sendable {
         let now = Date()
 
         if envelope.type == "history", let messages = envelope.messages {
-            for msg in messages {
-                if let parsed = parseEnvelope(msg, timestamp: now) {
-                    continuation?.yield(parsed)
-                }
+            let parsed = messages.compactMap { parseEnvelope($0, timestamp: now) }
+            if !parsed.isEmpty {
+                continuation?.yield(.historyBatch(id: UUID(), messages: parsed, timestamp: now))
             }
             return
         }
