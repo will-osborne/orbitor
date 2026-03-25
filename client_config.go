@@ -107,8 +107,12 @@ func LoadMCPServers(backend, workingDir string) []any {
 		return []any{}
 	}
 
-	// Convert the name→config map into the ACP array format:
-	// [{ "name": "...", ...server_config }]
+	// Convert the name→config map into the ACP array format.
+	// ACP expects a different schema than the native config files:
+	//   - headers: array of [key, value] pairs (not an object)
+	//   - env:     array of [key, value] pairs (not an object)
+	//   - type "local" → "stdio"
+	//   - Extra fields (source, sourcePath, tools) are stripped.
 	var servers []any
 	for name, raw := range merged {
 		var obj map[string]any
@@ -116,6 +120,47 @@ func LoadMCPServers(backend, workingDir string) []any {
 			continue
 		}
 		obj["name"] = name
+
+		// Normalize type: "local" is an alias for "stdio" in some configs.
+		if t, ok := obj["type"].(string); ok && t == "local" {
+			obj["type"] = "stdio"
+		}
+
+		// Convert headers object → array of [key, value] pairs.
+		if h, ok := obj["headers"].(map[string]any); ok {
+			pairs := make([]any, 0, len(h))
+			for k, v := range h {
+				pairs = append(pairs, []any{k, v})
+			}
+			obj["headers"] = pairs
+		} else if obj["headers"] == nil {
+			obj["headers"] = []any{}
+		}
+
+		// Convert env object → array of [key, value] pairs.
+		if e, ok := obj["env"].(map[string]any); ok {
+			pairs := make([]any, 0, len(e))
+			for k, v := range e {
+				pairs = append(pairs, []any{k, v})
+			}
+			obj["env"] = pairs
+		}
+
+		// Ensure required fields for stdio servers.
+		if t, _ := obj["type"].(string); t == "stdio" {
+			if obj["args"] == nil {
+				obj["args"] = []any{}
+			}
+			if obj["env"] == nil {
+				obj["env"] = []any{}
+			}
+		}
+
+		// Strip fields that are not part of the ACP schema.
+		delete(obj, "source")
+		delete(obj, "sourcePath")
+		delete(obj, "tools")
+
 		servers = append(servers, obj)
 	}
 	if servers == nil {
