@@ -137,13 +137,13 @@ func LoadMCPServers(backend, workingDir string) []any {
 			obj["headers"] = []any{}
 		}
 
-		// Convert env object → array of [key, value] pairs.
+		// Convert env object → array of {name, value} objects.
 		if e, ok := obj["env"].(map[string]any); ok {
-			pairs := make([]any, 0, len(e))
+			entries := make([]any, 0, len(e))
 			for k, v := range e {
-				pairs = append(pairs, []any{k, v})
+				entries = append(entries, map[string]any{"name": k, "value": v})
 			}
-			obj["env"] = pairs
+			obj["env"] = entries
 		}
 
 		// Ensure required fields for stdio servers.
