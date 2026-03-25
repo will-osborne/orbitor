@@ -330,18 +330,19 @@ func applyTheme(th tuiTheme) {
 	colSelBg = th.SelBg
 	colPanel = th.Panel
 
-	styleGreen = lipgloss.NewStyle().Foreground(colGreen).Bold(true)
-	styleOrange = lipgloss.NewStyle().Foreground(colOrange).Bold(true)
-	styleYellow = lipgloss.NewStyle().Foreground(colYellow).Bold(true)
-	styleRed = lipgloss.NewStyle().Foreground(colRed).Bold(true)
-	styleCyan = lipgloss.NewStyle().Foreground(colCyan).Bold(true)
-	styleViolet = lipgloss.NewStyle().Foreground(colViolet).Bold(true)
-	styleGray = lipgloss.NewStyle().Foreground(colGray)
-	styleMuted = lipgloss.NewStyle().Foreground(colMuted)
-	styleText = lipgloss.NewStyle().Foreground(colText)
-	styleSep = lipgloss.NewStyle().Foreground(colSep)
-	styleLabel = lipgloss.NewStyle().Foreground(colMuted)
-	styleAccent = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	bg := lipgloss.NewStyle().Background(colPanel)
+	styleGreen = bg.Foreground(colGreen).Bold(true)
+	styleOrange = bg.Foreground(colOrange).Bold(true)
+	styleYellow = bg.Foreground(colYellow).Bold(true)
+	styleRed = bg.Foreground(colRed).Bold(true)
+	styleCyan = bg.Foreground(colCyan).Bold(true)
+	styleViolet = bg.Foreground(colViolet).Bold(true)
+	styleGray = bg.Foreground(colGray)
+	styleMuted = bg.Foreground(colMuted)
+	styleText = bg.Foreground(colText)
+	styleSep = bg.Foreground(colSep)
+	styleLabel = bg.Foreground(colMuted)
+	styleAccent = bg.Foreground(colAccent).Bold(true)
 }
 
 func themeIndexByName(name string) int {
@@ -1162,14 +1163,15 @@ func RunTUI(serverURL string, createNew bool, backend, model string, skip, plan 
 	in.KeyMap.LineStart = key.NewBinding(key.WithKeys("home", "ctrl+a"), key.WithHelp("home", "line start"))
 	in.KeyMap.LineEnd = key.NewBinding(key.WithKeys("end", "ctrl+e"), key.WithHelp("end", "line end"))
 	focusedStyle, blurredStyle := textarea.DefaultStyles()
-	focusedStyle.CursorLine = lipgloss.NewStyle()
-	blurredStyle.CursorLine = lipgloss.NewStyle()
-	focusedStyle.Prompt = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
-	blurredStyle.Prompt = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
-	focusedStyle.Text = lipgloss.NewStyle().Foreground(colText)
-	blurredStyle.Text = lipgloss.NewStyle().Foreground(colText)
-	focusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
-	blurredStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+	inputBg := lipgloss.NewStyle().Background(colPanel)
+	focusedStyle.CursorLine = inputBg
+	blurredStyle.CursorLine = inputBg
+	focusedStyle.Prompt = inputBg.Foreground(colAccent).Bold(true)
+	blurredStyle.Prompt = inputBg.Foreground(colAccent).Bold(true)
+	focusedStyle.Text = inputBg.Foreground(colText)
+	blurredStyle.Text = inputBg.Foreground(colText)
+	focusedStyle.Placeholder = inputBg.Foreground(colMuted)
+	blurredStyle.Placeholder = inputBg.Foreground(colMuted)
 	in.FocusedStyle = focusedStyle
 	in.BlurredStyle = blurredStyle
 	in.Focus()
@@ -3185,6 +3187,7 @@ func (m *tuiModel) View() string {
 		Background(colPanel).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(colBorder).
+		BorderBackground(colPanel).
 		Padding(0, 1)
 	// Selected row: dark bg, white text.
 	selectedStyle := lipgloss.NewStyle().
@@ -3192,6 +3195,7 @@ func (m *tuiModel) View() string {
 		Background(colSelBg).
 		Bold(true)
 	activeStyle := lipgloss.NewStyle().
+		Background(colPanel).
 		Foreground(colAccent).
 		Bold(true)
 
@@ -3327,6 +3331,7 @@ func (m *tuiModel) View() string {
 	)
 
 	m.viewport.Height = max(4, feedH-3)
+	m.viewport.Style = lipgloss.NewStyle().Background(colPanel)
 
 	feedHeader := styleMuted.Render(" feed")
 	feedHeader += styleMuted.Render("  theme:" + currentThemeName(m.themeIdx))
@@ -3394,7 +3399,20 @@ func (m *tuiModel) View() string {
 	parts := []string{topBar}
 	parts = append(parts, banners...)
 	parts = append(parts, mainRow, statusBar)
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	inner := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	// Wrap the entire view in the panel background so no terminal color
+	// bleeds through between panels or in gaps. We also inject the background
+	// ANSI code after every \033[0m reset so that nested style resets don't
+	// revert to the terminal's default background.
+	wrapped := lipgloss.NewStyle().
+		Background(colPanel).
+		Width(m.width).
+		Height(m.height).
+		Render(inner)
+	bgCode := fmt.Sprintf("\x1b[48;2;%d;%d;%dm",
+		hexByte(string(colPanel), 1), hexByte(string(colPanel), 3), hexByte(string(colPanel), 5))
+	return injectBgAfterResets(wrapped, bgCode)
 }
 
 // pendingPermissionSessions returns sessions with pending permission requests.
@@ -3893,11 +3911,13 @@ func (m *tuiModel) turnHeader(role string, roleStyle lipgloss.Style, ts string) 
 func (m *tuiModel) renderChatBubble(role, ts, text string, border lipgloss.Color, alignRight bool) string {
 	maxBubbleWidth := max(28, min(m.chatWidth()-6, m.chatWidth()*4/5))
 	header := lipgloss.NewStyle().
+		Background(colPanel).
 		Foreground(colMuted).
 		Bold(true).
 		Render(role) + styleMuted.Render("  "+ts)
 	body := m.renderRichTextBlock(text, maxBubbleWidth-4, false)
 	bubble := lipgloss.NewStyle().
+		Background(colPanel).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(border).
 		Padding(0, 1).
@@ -3912,6 +3932,7 @@ func (m *tuiModel) renderChatBubble(role, ts, text string, border lipgloss.Color
 func (m *tuiModel) renderToolChatBubble(role, ts, meta, content string, border lipgloss.Color, alignRight bool) string {
 	maxBubbleWidth := max(28, min(m.chatWidth()-6, m.chatWidth()*4/5))
 	header := lipgloss.NewStyle().
+		Background(colPanel).
 		Foreground(colMuted).
 		Bold(true).
 		Render(role) + styleMuted.Render("  "+ts)
@@ -3920,6 +3941,7 @@ func (m *tuiModel) renderToolChatBubble(role, ts, meta, content string, border l
 		body += "\n\n" + m.renderRichTextBlock(content, maxBubbleWidth-4, true)
 	}
 	bubble := lipgloss.NewStyle().
+		Background(colPanel).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(border).
 		Padding(0, 1).
@@ -4512,7 +4534,7 @@ func (m *tuiModel) applyInlineMarkdown(line string) string {
 		if len(sub) != 2 {
 			return match
 		}
-		return lipgloss.NewStyle().Bold(true).Render(sub[1])
+		return lipgloss.NewStyle().Background(colPanel).Bold(true).Render(sub[1])
 	})
 	line = inlineCodeRe.ReplaceAllStringFunc(line, func(match string) string {
 		sub := inlineCodeRe.FindStringSubmatch(match)
@@ -4742,6 +4764,17 @@ func (m *tuiModel) renderViewportContent() string {
 		}
 	}
 
+	// bgPad appends background-filled padding AFTER the line content so that
+	// inner ANSI resets don't leave the trailing space with the terminal's
+	// default background.
+	bgPad := func(line string, targetW int) string {
+		lw := lipgloss.Width(line)
+		if lw >= targetW {
+			return line
+		}
+		return line + bg.Render(strings.Repeat(" ", targetW-lw))
+	}
+
 	var out []string
 	for i, entry := range m.logs {
 		if hidden[i] {
@@ -4749,9 +4782,9 @@ func (m *tuiModel) renderViewportContent() string {
 		}
 		lines := strings.Split(entry, "\n")
 		for _, line := range lines {
-			out = append(out, bg.Render(padToWidth(line, w)))
+			out = append(out, bgPad(line, w))
 		}
-		out = append(out, bg.Render(padToWidth("", w)))
+		out = append(out, bg.Render(strings.Repeat(" ", w)))
 	}
 	return strings.Join(out, "\n")
 }
@@ -4802,6 +4835,33 @@ func padToWidth(s string, w int) string {
 }
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// injectBgAfterResets replaces every ANSI full-reset (\033[0m) with
+// reset + bgCode so that the panel background is re-established after any
+// inner style reset. This prevents terminal-default-background bleed-through.
+func injectBgAfterResets(s, bgCode string) string {
+	return strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+bgCode)
+}
+
+// hexByte parses a single hex byte from a "#RRGGBB" string at the given offset (1-based).
+func hexByte(hex string, offset int) int {
+	if len(hex) < offset+2 {
+		return 0
+	}
+	v := 0
+	for _, c := range hex[offset : offset+2] {
+		v *= 16
+		switch {
+		case c >= '0' && c <= '9':
+			v += int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v += int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v += int(c-'A') + 10
+		}
+	}
+	return v
+}
 
 func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
@@ -5936,7 +5996,7 @@ func (m *tuiModel) renderMissionControl(selectedStyle, activeStyle lipgloss.Styl
 			titleLine := trimForLine("  "+titleText, max(10, listW))
 			out = append(out, selectedStyle.Render(topLine)+subAgentBadge, selectedStyle.Render(titleLine), selectedStyle.Render(botLine), sep)
 		} else if isHover {
-			hoverStyle := lipgloss.NewStyle().Foreground(colText).Underline(true)
+			hoverStyle := lipgloss.NewStyle().Background(colPanel).Foreground(colText).Underline(true)
 			titleLine := trimForLine("  "+titleText, max(10, listW))
 			out = append(out, hoverStyle.Render(topLine)+subAgentBadge, hoverStyle.Render(titleLine), styleMuted.Render(botLine), sep)
 		} else {
