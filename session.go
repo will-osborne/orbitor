@@ -759,8 +759,12 @@ func (s *Session) finishACPSetup(workingDir string) {
 		}
 	}
 	if acpSessionID == "" {
+		mcpServers := LoadMCPServers(s.Backend, workingDir)
+		if len(mcpServers) > 0 {
+			log.Printf("session %s: loading %d MCP server(s) from native config", s.ID, len(mcpServers))
+		}
 		var err error
-		acpSessionID, err = s.acp.SessionNew(workingDir)
+		acpSessionID, err = s.acp.SessionNew(workingDir, mcpServers)
 		if err != nil {
 			log.Printf("session %s: session/new failed: %v", s.ID, err)
 			s.Status = "error"
@@ -1579,17 +1583,16 @@ func (s *Session) Interrupt() {
 	s.interruptMu.Lock()
 	cancel := s.interruptCancel
 	s.interruptMu.Unlock()
-	if cancel == nil {
-		return
+	// Cancel the in-flight context if a prompt is still blocking so
+	// SessionPromptContext unblocks immediately.
+	if cancel != nil {
+		cancel()
 	}
-	// Cancel the in-flight context first so SessionPromptContext unblocks
-	// immediately, then send the graceful ACP notification.
-	cancel()
 	if s.queue != nil {
 		s.queue.Clear()
 	}
-	// Send SIGINT to the agent process immediately so it stops regardless of
-	// whether the ACP notification is processed in time.
+	// Send SIGINT to the agent process so it stops even if the prompt call
+	// already returned and the agent is mid-response.
 	if s.process != nil && s.process.Process != nil {
 		_ = s.process.Process.Signal(syscall.SIGINT)
 	}

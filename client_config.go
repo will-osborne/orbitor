@@ -59,6 +59,71 @@ func ClientConfigPath() (string, error) {
 	return filepath.Join(home, ".orbitor", "config.json"), nil
 }
 
+// LoadMCPServers reads MCP server definitions from the backend's native config
+// file and returns them as a slice suitable for the ACP session/new mcpServers
+// parameter. Returns an empty slice (never nil) if no servers are configured.
+//
+// Claude Code:   ~/.claude.json  → { "mcpServers": { "name": { ... } } }
+// Copilot CLI:   ~/.copilot/mcp-config.json → { "mcpServers": { "name": { ... } } }
+//
+// Both also support a project-local .mcp.json in the working directory.
+func LoadMCPServers(backend, workingDir string) []any {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return []any{}
+	}
+
+	// Determine config file paths to read (global + project-local).
+	var paths []string
+	switch backend {
+	case "claude":
+		paths = append(paths, filepath.Join(home, ".claude.json"))
+	case "copilot":
+		paths = append(paths, filepath.Join(home, ".copilot", "mcp-config.json"))
+	}
+	if workingDir != "" {
+		paths = append(paths, filepath.Join(workingDir, ".mcp.json"))
+	}
+
+	// Merge servers from all config files (later files override earlier ones).
+	merged := map[string]json.RawMessage{}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg struct {
+			MCPServers map[string]json.RawMessage `json:"mcpServers"`
+		}
+		if json.Unmarshal(data, &cfg) != nil || cfg.MCPServers == nil {
+			continue
+		}
+		for name, server := range cfg.MCPServers {
+			merged[name] = server
+		}
+	}
+
+	if len(merged) == 0 {
+		return []any{}
+	}
+
+	// Convert the name→config map into the ACP array format:
+	// [{ "name": "...", ...server_config }]
+	var servers []any
+	for name, raw := range merged {
+		var obj map[string]any
+		if json.Unmarshal(raw, &obj) != nil {
+			continue
+		}
+		obj["name"] = name
+		servers = append(servers, obj)
+	}
+	if servers == nil {
+		return []any{}
+	}
+	return servers
+}
+
 // LoadClientConfig reads ~/.orbitor/config.json and merges it with built-in
 // defaults. Missing or unreadable config silently falls back to defaults.
 func LoadClientConfig() ClientConfig {

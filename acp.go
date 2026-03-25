@@ -229,9 +229,12 @@ func (c *ACPClient) Initialize() (*InitializeResult, error) {
 	return &result, nil
 }
 
-// SessionNew creates a new ACP session.
-func (c *ACPClient) SessionNew(cwd string) (string, error) {
-	resp, err := c.Call("session/new", SessionNewParams{CWD: cwd, MCPServers: []any{}})
+// SessionNew creates a new ACP session with optional MCP server configurations.
+func (c *ACPClient) SessionNew(cwd string, mcpServers []any) (string, error) {
+	if mcpServers == nil {
+		mcpServers = []any{}
+	}
+	resp, err := c.Call("session/new", SessionNewParams{CWD: cwd, MCPServers: mcpServers})
 	if err != nil {
 		return "", err
 	}
