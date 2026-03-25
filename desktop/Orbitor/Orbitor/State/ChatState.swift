@@ -1,5 +1,19 @@
+import AppKit
 import Foundation
 import UserNotifications
+
+/// Delegate that allows notifications to be displayed even when the app is frontmost.
+final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationDelegate()
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+}
 
 @Observable
 final class ChatState {
@@ -39,17 +53,30 @@ final class ChatState {
     }
 
     private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NotificationDelegate.shared
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error {
+                print("[Notifications] authorization error: \(error)")
+            } else if !granted {
+                print("[Notifications] user denied notification permission")
+            }
+        }
     }
 
     private func postNotification(title: String, body: String) {
-        guard !isAppFocused else { return }
+        // Skip if the app window is currently active
+        guard !NSApp.isActive else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                print("[Notifications] delivery error: \(error)")
+            }
+        }
     }
 
     func updateBaseURL(_ url: URL) {
