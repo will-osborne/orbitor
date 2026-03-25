@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -467,6 +468,16 @@ func (s *Session) startCopilot(workingDir string, port int) {
 			args = append(args, "--reasoning-effort", "high")
 		}
 	}
+	// Pass MCP server config from ~/.copilot/mcp-config.json via CLI flag.
+	// Copilot's ACP implementation doesn't support mcpServers in session/new,
+	// so we load any project-local .mcp.json and pass it as inline JSON.
+	if workingDir != "" {
+		mcpPath := filepath.Join(workingDir, ".mcp.json")
+		if data, err := os.ReadFile(mcpPath); err == nil {
+			args = append(args, "--additional-mcp-config", string(data))
+		}
+	}
+
 	// If we have a persisted session id, ask the agent to resume it.
 	// Prefer ResumeSession (the original conversation ID preserved across
 	// respawns) over ACPSession (which may have been replaced by a new
@@ -759,9 +770,15 @@ func (s *Session) finishACPSetup(workingDir string) {
 		}
 	}
 	if acpSessionID == "" {
-		mcpServers := LoadMCPServers(s.Backend, workingDir)
-		if len(mcpServers) > 0 {
-			log.Printf("session %s: loading %d MCP server(s) from native config", s.ID, len(mcpServers))
+		// Only pass MCP servers via ACP for backends that support it (Claude).
+		// Copilot reads ~/.copilot/mcp-config.json natively and gets project-
+		// local .mcp.json via --additional-mcp-config CLI flag.
+		var mcpServers []any
+		if s.Backend != "copilot" {
+			mcpServers = LoadMCPServers(s.Backend, workingDir)
+			if len(mcpServers) > 0 {
+				log.Printf("session %s: loading %d MCP server(s) from native config", s.ID, len(mcpServers))
+			}
 		}
 		var err error
 		acpSessionID, err = s.acp.SessionNew(workingDir, mcpServers)
