@@ -44,6 +44,9 @@ struct MessageView: View {
 
         case .historyBatch:
             EmptyView()
+
+        case .sessionStatus:
+            EmptyView()
         }
     }
 }

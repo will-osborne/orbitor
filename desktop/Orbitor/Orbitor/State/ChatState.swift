@@ -183,7 +183,8 @@ final class ChatState {
 
     @MainActor
     private func handleMessage(_ message: ChatMessage) {
-        isConnecting = false
+        // Don't clear isConnecting for status messages — they may set it to true.
+        if case .sessionStatus = message { } else { isConnecting = false }
 
         switch message {
         case .agentText(_, let text, _):
@@ -266,6 +267,13 @@ final class ChatState {
             // Show only the tail page
             trimToTail()
             isLoadingHistory = false
+
+        case .sessionStatus(_, let status, _):
+            if status == "respawning" {
+                isConnecting = true
+                isRunning = false
+                isLoadingHistory = true
+            }
 
         default:
             appendLive(message)

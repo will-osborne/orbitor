@@ -194,6 +194,10 @@ final class WebSocketClient: @unchecked Sendable {
             let msg = envelope.data?["message"]?.stringValue ?? "Unknown error"
             return .error(id: id, message: msg, timestamp: timestamp)
 
+        case "status":
+            let status = envelope.data?["status"]?.stringValue ?? ""
+            return .sessionStatus(id: id, status: status, timestamp: timestamp)
+
         default:
             return nil
         }

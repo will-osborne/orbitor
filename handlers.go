@@ -157,8 +157,8 @@ func (h *Handlers) DeleteSession(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) UpdateSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		SkipPermissions bool    `json:"skipPermissions"`
-		PlanMode        bool    `json:"planMode"`
+		SkipPermissions *bool   `json:"skipPermissions,omitempty"`
+		PlanMode        *bool   `json:"planMode,omitempty"`
 		Model           *string `json:"model,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

@@ -23,6 +23,8 @@ enum ChatMessage: Identifiable {
     case error(id: UUID, message: String, timestamp: Date)
     /// Bulk history load — all messages arrive at once to avoid per-message re-renders.
     case historyBatch(id: UUID, messages: [ChatMessage], timestamp: Date)
+    /// Session status change from the server (e.g. "respawning").
+    case sessionStatus(id: UUID, status: String, timestamp: Date)
 
     var id: UUID {
         switch self {
@@ -35,7 +37,8 @@ enum ChatMessage: Identifiable {
              .runComplete(let id, _, _),
              .interrupted(let id, _),
              .error(let id, _, _),
-             .historyBatch(let id, _, _):
+             .historyBatch(let id, _, _),
+             .sessionStatus(let id, _, _):
             return id
         }
     }
@@ -51,7 +54,8 @@ enum ChatMessage: Identifiable {
              .runComplete(_, _, let t),
              .interrupted(_, let t),
              .error(_, _, let t),
-             .historyBatch(_, _, let t):
+             .historyBatch(_, _, let t),
+             .sessionStatus(_, _, let t):
             return t
         }
     }

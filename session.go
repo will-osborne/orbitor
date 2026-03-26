@@ -1081,7 +1081,7 @@ func (sm *SessionManager) ReviveSession(id string) error {
 
 // UpdateSession updates mutable session properties and applies runtime changes.
 // For copilot, model changes require respawn so process args are updated.
-func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode bool, model *string) (*Session, error) {
+func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode *bool, model *string) (*Session, error) {
 	sm.mu.RLock()
 	s, ok := sm.sessions[id]
 	sm.mu.RUnlock()
@@ -1097,8 +1097,12 @@ func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode boo
 			s.Model = next
 		}
 	}
-	s.SkipPermissions = skipPermissions
-	s.PlanMode = planMode
+	if skipPermissions != nil {
+		s.SkipPermissions = *skipPermissions
+	}
+	if planMode != nil {
+		s.PlanMode = *planMode
+	}
 	if sm.store != nil {
 		_ = sm.store.UpsertSession(s)
 	}
@@ -1112,20 +1116,20 @@ func (sm *SessionManager) UpdateSession(id string, skipPermissions, planMode boo
 				_ = s.acp.SessionSetConfigOption(s.ACPSession, "model", s.Model)
 			}
 		}
-		if s.SkipPermissions {
-			_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "bypassPermissions")
-		} else if s.PlanMode {
-			_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "plan")
+		if skipPermissions != nil || planMode != nil {
+			if s.SkipPermissions {
+				_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "bypassPermissions")
+			} else if s.PlanMode {
+				_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "plan")
+			} else {
+				_ = s.acp.SessionSetConfigOption(s.ACPSession, "mode", "default")
+			}
 		}
 	}
 
-	// Kill the backend process. The respawn monitor goroutine (watching
-	// <-s.acp.Done()) will detect the death and restart the process with
-	// updated runtime config.
-	//
 	// Copilot model changes must respawn to ensure CLI startup flags match.
-	shouldRespawn := modelChanged && s.Backend == "copilot"
-	if shouldRespawn || s.process != nil && s.process.Process != nil || s.procID != 0 {
+	// All other changes are applied live via ACP session/configure.
+	if modelChanged && s.Backend == "copilot" {
 		s.hub.Broadcast("status", map[string]string{"status": "respawning"})
 		if s.process != nil && s.process.Process != nil {
 			_ = s.process.Process.Signal(syscall.SIGTERM)
