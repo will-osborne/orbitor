@@ -238,7 +238,6 @@ final class ChatState {
         case .runComplete:
             isRunning = false
             appendLive(message)
-            postNotification(title: "Agent Finished", body: "Session completed")
             // Send next queued prompt if any
             Task { @MainActor in
                 await drainQueue()

@@ -11,7 +11,7 @@ struct SessionListView: View {
 
         List(selection: $sessionList.selectedSessionID) {
             ForEach(appState.sessionList.sessions) { session in
-                SessionRowView(session: session)
+                SessionRowView(session: session, isUnread: appState.sessionList.unreadSessionIDs.contains(session.id))
                     .tag(session.id)
                     .listRowBackground(
                         session.id == appState.sessionList.selectedSessionID
@@ -72,6 +72,7 @@ struct SessionListView: View {
 
 struct SessionRowView: View {
     let session: SessionInfo
+    var isUnread: Bool = false
     @Environment(\.theme) private var theme
     @State private var isHovered = false
 
@@ -82,6 +83,12 @@ struct SessionRowView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
+
+                if isUnread {
+                    Circle()
+                        .fill(theme.accent)
+                        .frame(width: 8, height: 8)
+                }
 
                 Spacer()
 

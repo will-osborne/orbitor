@@ -69,6 +69,7 @@ struct ContentView: View {
         .onChange(of: appState.sessionList.selectedSessionID) { _, newID in
             if let id = newID {
                 appState.chat.connectToSession(id)
+                appState.sessionList.markRead(id)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in

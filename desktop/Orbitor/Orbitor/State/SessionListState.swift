@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import UserNotifications
 
 @Observable
 final class SessionListState {
@@ -6,12 +8,20 @@ final class SessionListState {
     var selectedSessionID: String?
     var isLoading = false
     var error: String?
+    /// Sessions that have completed a run since the user last viewed them.
+    var unreadSessionIDs: Set<String> = []
 
     private var api: APIClient
     private var pollingTask: Task<Void, Never>?
+    /// Previous isRunning state per session, used to detect run completions.
+    private var prevRunningStates: [String: Bool] = [:]
 
     init(api: APIClient) {
         self.api = api
+    }
+
+    func markRead(_ id: String) {
+        unreadSessionIDs.remove(id)
     }
 
     func updateAPI(_ newAPI: APIClient) {
@@ -41,14 +51,40 @@ final class SessionListState {
     func refresh() async {
         do {
             let fetched = try await api.listSessions()
-            // Preserve selection even if list order changes
-            sessions = fetched.sorted { ($0.createdAt) > ($1.createdAt) }
+            sessions = fetched.sorted { $0.createdAt > $1.createdAt }
             error = nil
             if selectedSessionID == nil, let first = sessions.first {
                 selectedSessionID = first.id
             }
+            detectCompletions(in: fetched)
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Detect sessions that transitioned from running → idle since the last poll
+    /// and mark them unread / fire a notification.
+    @MainActor
+    private func detectCompletions(in fetched: [SessionInfo]) {
+        for session in fetched {
+            let wasRunning = prevRunningStates[session.id] ?? false
+            prevRunningStates[session.id] = session.isRunning
+
+            guard wasRunning && !session.isRunning else { continue }
+            // Session just finished — mark unread if not currently selected.
+            if session.id != selectedSessionID {
+                unreadSessionIDs.insert(session.id)
+            }
+            // Fire system notification if app is not in focus.
+            guard !NSApp.isActive else { continue }
+            let content = UNMutableNotificationContent()
+            content.title = "Agent Finished"
+            content.body = session.displayTitle
+            content.sound = .default
+            let req = UNNotificationRequest(identifier: "run-\(session.id)-\(Date().timeIntervalSince1970)", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(req) { err in
+                if let err { print("[Notifications] \(err)") }
+            }
         }
     }
 
