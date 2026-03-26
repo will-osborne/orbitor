@@ -76,7 +76,9 @@ jobs:
 
       - name: Install cross-compiler and cmake (Linux ARM64)
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
 
       - name: Build whisper-cpp from source (Linux AMD64)
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
