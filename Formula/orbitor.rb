@@ -12,6 +12,11 @@ class Orbitor < Formula
       url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-darwin-amd64"
       sha256 "PLACEHOLDER_DARWIN_AMD64_SHA256"
     end
+
+    resource "desktop" do
+      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-desktop-macos.zip"
+      sha256 "PLACEHOLDER_DESKTOP_MACOS_SHA256"
+    end
   end
 
   on_linux do
@@ -27,6 +32,12 @@ class Orbitor < Formula
 
   def install
     bin.install Dir["orbitor-*"].first => "orbitor"
+
+    if OS.mac?
+      resource("desktop").stage do
+        prefix.install "Orbitor.app"
+      end
+    end
   end
 
   def post_install
@@ -34,6 +45,15 @@ class Orbitor < Formula
     # Restart the background service after upgrade so the new binary is used.
     # quiet_system avoids errors when the service isn't running yet.
     quiet_system "brew", "services", "restart", "orbitor"
+
+    if OS.mac?
+      # Symlink the desktop app into ~/Applications
+      user_apps = Pathname.new(ENV["HOME"]) / "Applications"
+      user_apps.mkpath
+      app_link = user_apps / "Orbitor.app"
+      app_link.unlink if app_link.exist? || app_link.symlink?
+      app_link.make_symlink(prefix / "Orbitor.app")
+    end
   end
 
   service do
@@ -50,12 +70,12 @@ class Orbitor < Formula
         orbitor setup
 
       To start the server as a background service:
-        orbitor service install
-      or via Homebrew services:
         brew services start orbitor
 
       Open the TUI:
         orbitor
+
+      The macOS desktop app has been symlinked to ~/Applications/Orbitor.app.
     EOS
   end
 

@@ -631,10 +631,12 @@ private struct RunCompleteCard: View {
 
                 if sessionID != nil {
                     Button {
+                        // Check before toggling: if we're about to expand and haven't loaded yet, fetch
+                        let willExpand = !expanded
                         withAnimation(.easeInOut(duration: 0.15)) {
                             expanded.toggle()
                         }
-                        if expanded && debriefText == nil {
+                        if willExpand && debriefText == nil {
                             loadDebrief()
                         }
                     } label: {
@@ -693,13 +695,20 @@ private struct RunCompleteCard: View {
                                 .font(.caption)
                                 .foregroundStyle(theme.muted)
                         }
-                    } else if let text = debriefText {
+                    } else if let text = debriefText, !text.isEmpty {
                         Divider().background(theme.border)
-                        Text(text)
+                        ScrollView {
+                            Text(text)
+                                .font(.caption)
+                                .foregroundStyle(theme.text)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 180)
+                    } else if !isLoadingDebrief {
+                        Text("No summary available.")
                             .font(.caption)
-                            .foregroundStyle(theme.text)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .foregroundStyle(theme.muted)
                     }
                 }
                 .padding(.horizontal, 12)

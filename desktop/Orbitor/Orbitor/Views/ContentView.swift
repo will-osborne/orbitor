@@ -14,18 +14,22 @@ struct ContentView: View {
             SessionListView(showNewSession: $state.showNewSession)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 360)
         } detail: {
-            if appState.sessionList.selectedSessionID != nil {
-                HStack(spacing: 0) {
-                    ChatView()
+            VStack(spacing: 0) {
+                if appState.sessionList.selectedSessionID != nil {
+                    HStack(spacing: 0) {
+                        ChatView()
 
-                    if inspectorPresented {
-                        Divider()
-                        InspectorView()
-                            .frame(width: 280)
+                        if inspectorPresented {
+                            Divider()
+                            InspectorView()
+                                .frame(width: 280)
+                        }
                     }
+                } else {
+                    EmptyStateView(showNewSession: $state.showNewSession)
                 }
-            } else {
-                EmptyStateView(showNewSession: $state.showNewSession)
+
+                StatusBar()
             }
         }
         .background(theme.panel)
@@ -73,9 +77,6 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.12), value: appState.showCommandPalette)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            StatusBar()
-        }
         .onChange(of: appState.sessionList.selectedSessionID) { _, newID in
             if let id = newID {
                 appState.chat.connectToSession(id)

@@ -274,6 +274,7 @@ jobs:
           SHA_DARWIN_AMD64=$(grep 'orbitor-darwin-amd64' dist/checksums.txt | awk '{print $1}')
           SHA_LINUX_ARM64=$(grep 'orbitor-linux-arm64'  dist/checksums.txt | awk '{print $1}')
           SHA_LINUX_AMD64=$(grep 'orbitor-linux-amd64'  dist/checksums.txt | awk '{print $1}')
+          SHA_DESKTOP_MACOS=$(grep 'orbitor-desktop-macos.zip' dist/checksums.txt | awk '{print $1}')
 
           # Strip leading 'v' from tag for the formula version field
           SEMVER="${VERSION#v}"
@@ -289,6 +290,7 @@ jobs:
             -e "s|PLACEHOLDER_DARWIN_AMD64_SHA256|${SHA_DARWIN_AMD64}|" \
             -e "s|PLACEHOLDER_LINUX_ARM64_SHA256|${SHA_LINUX_ARM64}|" \
             -e "s|PLACEHOLDER_LINUX_AMD64_SHA256|${SHA_LINUX_AMD64}|" \
+            -e "s|PLACEHOLDER_DESKTOP_MACOS_SHA256|${SHA_DESKTOP_MACOS}|" \
             Formula/orbitor.rb > /tmp/tap/Formula/orbitor.rb
 
           cd /tmp/tap
