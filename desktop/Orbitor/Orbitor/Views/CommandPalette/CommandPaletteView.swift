@@ -124,6 +124,9 @@ struct CommandPaletteView: View {
                         .focused($searchFocused)
                         .onSubmit { executeSelected() }
                         .onChange(of: query) { _, _ in selectedIndex = 0 }
+                        .onKeyPress(.upArrow) { selectedIndex = max(0, selectedIndex - 1); return .handled }
+                        .onKeyPress(.downArrow) { selectedIndex = min(filtered.count - 1, selectedIndex + 1); return .handled }
+                        .onKeyPress(.escape) { isPresented = false; return .handled }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 13)
@@ -169,10 +172,6 @@ struct CommandPaletteView: View {
             .frame(width: 540)
             .padding(.horizontal, 40)
         }
-        .onKeyPress(.escape) { isPresented = false; return .handled }
-        .onKeyPress(.upArrow) { selectedIndex = max(0, selectedIndex - 1); return .handled }
-        .onKeyPress(.downArrow) { selectedIndex = min(filtered.count - 1, selectedIndex + 1); return .handled }
-        .onKeyPress(.return) { executeSelected(); return .handled }
         .onAppear {
             searchFocused = true
             selectedIndex = 0
