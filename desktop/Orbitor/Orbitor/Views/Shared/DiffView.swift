@@ -111,7 +111,7 @@ struct FileDiffView: View {
             }
             .padding(.vertical, 4)
         }
-        .background(theme.bg)
+        .background(theme.panel)
     }
 }
 
