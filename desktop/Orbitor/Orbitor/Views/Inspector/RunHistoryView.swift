@@ -56,7 +56,7 @@ struct RunHistoryView: View {
                 }
             }
         }
-        .background(theme.bg)
+        .background(theme.panel)
         .frame(minWidth: 800, minHeight: 500)
         .task { await load() }
     }
