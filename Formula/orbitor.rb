@@ -14,7 +14,7 @@ class Orbitor < Formula
     end
 
     resource "desktop" do
-      url "https://github.com/will-osborne/orbitor/releases/download/v#{version}/orbitor-desktop-macos.zip"
+      url "https://github.com/will-osborne/orbitor/releases/download/v0.1.0/orbitor-desktop-macos.zip"
       sha256 "PLACEHOLDER_DESKTOP_MACOS_SHA256"
     end
   end

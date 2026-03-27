@@ -286,6 +286,7 @@ jobs:
 
           sed \
             -e "s|version \".*\"|version \"${SEMVER}\"|" \
+            -e "s|/releases/download/v[0-9][^/]*/orbitor-desktop|/releases/download/v${SEMVER}/orbitor-desktop|" \
             -e "s|PLACEHOLDER_DARWIN_ARM64_SHA256|${SHA_DARWIN_ARM64}|" \
             -e "s|PLACEHOLDER_DARWIN_AMD64_SHA256|${SHA_DARWIN_AMD64}|" \
             -e "s|PLACEHOLDER_LINUX_ARM64_SHA256|${SHA_LINUX_ARM64}|" \
