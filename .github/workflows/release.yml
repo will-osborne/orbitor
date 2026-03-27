@@ -225,7 +225,9 @@ jobs:
       - name: Package app
         run: |
           APP_PATH="build/Build/Products/Release/Orbitor.app"
-          ditto -c -k --keepParent "$APP_PATH" orbitor-desktop-macos.zip
+          mkdir -p /tmp/orbitor-desktop
+          cp -R "$APP_PATH" /tmp/orbitor-desktop/
+          ditto -c -k --keepParent /tmp/orbitor-desktop orbitor-desktop-macos.zip
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
