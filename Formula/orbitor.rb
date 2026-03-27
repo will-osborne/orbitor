@@ -47,12 +47,13 @@ class Orbitor < Formula
     quiet_system "brew", "services", "restart", "orbitor"
 
     if OS.mac?
-      # Install the desktop app into ~/Applications
+      # Install the desktop app into ~/Applications using ditto, which
+      # overwrites in-place without requiring delete (avoids EPERM on
+      # protected app bundles that have been run by the user).
       user_apps = Pathname.new(ENV["HOME"]) / "Applications"
       user_apps.mkpath
       app_dest = user_apps / "Orbitor.app"
-      system "rm", "-rf", app_dest.to_s
-      system "cp", "-R", (opt_prefix / "Orbitor.app").to_s, app_dest.to_s
+      system "ditto", (opt_prefix / "Orbitor.app").to_s, app_dest.to_s
     end
   end
 
