@@ -95,6 +95,36 @@ final class APIClient: Sendable {
         let (data, _) = try await session.data(from: components.url!)
         return try decoder.decode([BrowseEntry].self, from: data)
     }
+
+    // MARK: - LLM helpers
+
+    /// Rewrites a rough prompt into a more precise instruction.
+    func enhancePrompt(_ text: String) async throws -> String {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/enhance-prompt"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["text": text])
+        let (data, _) = try await session.data(for: request)
+        let resp = try JSONDecoder().decode([String: String].self, from: data)
+        return resp["enhanced"] ?? text
+    }
+
+    /// Returns a post-run debrief summary for a session.
+    func sessionDebrief(id: String) async throws -> String {
+        let url = baseURL.appendingPathComponent("api/sessions/\(id)/debrief")
+        let (data, _) = try await session.data(from: url)
+        let resp = try JSONDecoder().decode([String: String].self, from: data)
+        return resp["debrief"] ?? ""
+    }
+
+    /// Returns up to 3 follow-up prompt suggestions for a session.
+    func sessionSuggestions(id: String) async throws -> [String] {
+        let url = baseURL.appendingPathComponent("api/sessions/\(id)/suggestions")
+        let (data, _) = try await session.data(from: url)
+        struct Resp: Decodable { let suggestions: [String] }
+        let resp = try JSONDecoder().decode(Resp.self, from: data)
+        return resp.suggestions
+    }
 }
 
 struct BrowseEntry: Codable, Identifiable {

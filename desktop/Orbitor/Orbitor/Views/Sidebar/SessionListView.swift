@@ -75,6 +75,9 @@ struct SessionRowView: View {
     var isUnread: Bool = false
     @Environment(\.theme) private var theme
     @State private var isHovered = false
+    @State private var runStart: Date? = nil
+    @State private var elapsed: TimeInterval = 0
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -92,6 +95,13 @@ struct SessionRowView: View {
 
                 Spacer()
 
+                // Live run timer
+                if session.isRunning, elapsed > 0 {
+                    Text(formatElapsed(elapsed))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(theme.orange)
+                }
+
                 StatusBadge(state: session.stateLabel)
             }
 
@@ -108,6 +118,29 @@ struct SessionRowView: View {
                         .font(.caption2)
                         .lineLimit(1)
                 }
+
+                Spacer()
+
+                // PR badge
+                if let prUrl = session.prUrl, !prUrl.isEmpty {
+                    Label("PR", systemImage: "arrow.triangle.branch")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(theme.cyan)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(theme.cyan.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .onTapGesture {
+                            if let url = URL(string: prUrl) {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                }
+
+                // Last-activity (session age)
+                Text(relativeTime(session.createdAt))
+                    .font(.caption2)
+                    .foregroundStyle(theme.muted.opacity(0.7))
             }
             .foregroundStyle(theme.muted)
         }
@@ -116,5 +149,33 @@ struct SessionRowView: View {
         .brightness(isHovered ? 0.05 : 0)
         .animation(.easeOut(duration: 0.15), value: isHovered)
         .onHover { isHovered = $0 }
+        .onReceive(timer) { now in
+            guard session.isRunning else { elapsed = 0; return }
+            let start = runStart ?? now
+            elapsed = now.timeIntervalSince(start)
+        }
+        .onChange(of: session.isRunning) { _, running in
+            if running {
+                runStart = Date()
+                elapsed = 0
+            } else {
+                runStart = nil
+                elapsed = 0
+            }
+        }
+    }
+
+    private func formatElapsed(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60
+        let s = Int(t) % 60
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private func relativeTime(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 { return "just now" }
+        if seconds < 3600 { return "\(seconds / 60)m ago" }
+        if seconds < 86400 { return "\(seconds / 3600)h ago" }
+        return "\(seconds / 86400)d ago"
     }
 }

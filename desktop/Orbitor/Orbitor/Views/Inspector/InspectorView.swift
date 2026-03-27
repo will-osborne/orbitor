@@ -3,6 +3,7 @@ import SwiftUI
 struct InspectorView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
+    @State private var gitBranch: String? = nil
 
     var body: some View {
         if let session = appState.sessionList.selectedSession {
@@ -14,6 +15,11 @@ struct InspectorView: View {
                             .font(.headline)
                             .foregroundStyle(theme.text)
                         Spacer()
+                        if appState.chat.errorCount > 0 {
+                            Label("\(appState.chat.errorCount) error\(appState.chat.errorCount == 1 ? "" : "s")", systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(theme.red)
+                        }
                     }
 
                     // Session info grid
@@ -46,10 +52,23 @@ struct InspectorView: View {
                         if session.queueDepth > 0 {
                             DetailRow(label: "Queue", value: "\(session.queueDepth) pending", theme: theme)
                         }
+                        if let dur = appState.chat.lastRunDuration {
+                            DetailRow(label: "Last run", value: formatDuration(dur), theme: theme)
+                        }
                     }
 
                     DetailSection(title: "Project") {
                         DetailRow(label: "Dir", value: session.shortDir, theme: theme)
+                        if let branch = gitBranch {
+                            DetailRow(label: "Branch", theme: theme) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.caption2)
+                                    .foregroundStyle(theme.cyan)
+                                Text(branch)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(theme.cyan)
+                            }
+                        }
                         if let tool = session.currentTool, !tool.isEmpty {
                             DetailRow(label: "Tool", value: tool, theme: theme)
                         }
@@ -98,6 +117,29 @@ struct InspectorView: View {
                         }
                     }
 
+                    // Files touched this session
+                    if !appState.chat.filesTouched.isEmpty {
+                        DetailSection(title: "Files Changed (\(appState.chat.filesTouched.count))") {
+                            ForEach(appState.chat.filesTouched.prefix(10), id: \.self) { path in
+                                HStack(spacing: 4) {
+                                    Image(systemName: "pencil.circle.fill")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(theme.cyan)
+                                    Text(path)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(theme.text)
+                                        .lineLimit(1)
+                                        .truncationMode(.head)
+                                }
+                            }
+                            if appState.chat.filesTouched.count > 10 {
+                                Text("…and \(appState.chat.filesTouched.count - 10) more")
+                                    .font(.caption2)
+                                    .foregroundStyle(theme.muted)
+                            }
+                        }
+                    }
+
                     // Sub-agents
                     if let agents = session.subAgents, !agents.isEmpty {
                         DetailSection(title: "Sub-Agents (\(agents.count))") {
@@ -143,6 +185,8 @@ struct InspectorView: View {
                 .padding()
             }
             .background(theme.panel)
+            .onAppear { loadGitBranch(for: session) }
+            .onChange(of: session.id) { _, _ in loadGitBranch(for: session) }
         } else {
             VStack {
                 Text("No session")
@@ -151,6 +195,27 @@ struct InspectorView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(theme.panel)
         }
+    }
+
+    private func loadGitBranch(for session: SessionInfo) {
+        let headPath = session.workingDir + "/.git/HEAD"
+        Task {
+            let branch = await Task.detached(priority: .background) {
+                guard let content = try? String(contentsOfFile: headPath, encoding: .utf8) else { return nil as String? }
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.hasPrefix("ref: refs/heads/") {
+                    return String(trimmed.dropFirst("ref: refs/heads/".count))
+                }
+                return String(trimmed.prefix(8)) // detached HEAD
+            }.value
+            await MainActor.run { gitBranch = branch }
+        }
+    }
+
+    private func formatDuration(_ t: TimeInterval) -> String {
+        let total = Int(t)
+        if total < 60 { return "\(total)s" }
+        return "\(total / 60)m \(total % 60)s"
     }
 }
 

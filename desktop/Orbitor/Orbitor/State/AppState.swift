@@ -13,6 +13,7 @@ final class AppState {
 
     var showNewSession = false
     var showForkSheet = false
+    var showCommandPalette = false
     var fontSize: CGFloat {
         didSet { UserDefaults.standard.set(fontSize, forKey: "fontSize") }
     }

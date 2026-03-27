@@ -32,6 +32,23 @@ final class ChatState {
     /// Queued prompts waiting to be sent when the current run finishes.
     var queuedPrompts: [String] = []
 
+    /// True while a reconnect delay is counting down.
+    var isReconnecting = false
+    /// Number of reconnect attempts since last clean connect (for backoff).
+    private var reconnectAttempts = 0
+    /// Tracks whether at least one message has arrived on the current connection.
+    private var hasReceivedFirstMessage = false
+
+    // MARK: - Run analytics
+    /// When the current (or most recent) run started.
+    var runStartedAt: Date?
+    /// Duration of the most recently completed run.
+    var lastRunDuration: TimeInterval?
+    /// Unique file paths touched in this session (from tool call titles for write/edit ops).
+    var filesTouched: [String] = []
+    /// Number of error messages encountered in this session.
+    var errorCount: Int = 0
+
     private var baseURL: URL
     private var wsClient: WebSocketClient?
     private var streamTask: Task<Void, Never>?
@@ -96,20 +113,30 @@ final class ChatState {
     @MainActor
     func connectToSession(_ sessionID: String) {
         guard sessionID != activeSessionID else { return }
-
         streamTask?.cancel()
         wsClient?.disconnect()
+        reconnectAttempts = 0
+        setupConnection(sessionID: sessionID)
+    }
 
+    @MainActor
+    private func setupConnection(sessionID: String) {
         activeSessionID = sessionID
         allMessages = []
         messages = []
         visibleStart = 0
         isRunning = false
         isConnecting = true
+        isReconnecting = false
         pendingPermission = nil
         toolCallCache = [:]
         queuedPrompts = []
         isLoadingHistory = true
+        hasReceivedFirstMessage = false
+        runStartedAt = nil
+        lastRunDuration = nil
+        filesTouched = []
+        errorCount = 0
 
         let client = WebSocketClient(baseURL: baseURL)
         wsClient = client
@@ -120,7 +147,27 @@ final class ChatState {
                 guard !Task.isCancelled else { break }
                 await self?.handleMessage(message)
             }
+            // Stream ended — schedule a reconnect if still on this session and not cancelled
+            guard !Task.isCancelled, let self else { return }
+            await self.handleStreamEnded(forSession: sessionID)
         }
+    }
+
+    /// Called when the WebSocket stream ends unexpectedly. Schedules a reconnect with
+    /// exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s.
+    @MainActor
+    private func handleStreamEnded(forSession sessionID: String) async {
+        guard activeSessionID == sessionID else { return }
+        reconnectAttempts += 1
+        let delay = min(pow(2.0, Double(reconnectAttempts - 1)), 30.0)
+        isReconnecting = true
+        isConnecting = false
+        isLoadingHistory = false
+        try? await Task.sleep(for: .seconds(delay))
+        guard activeSessionID == sessionID else { return }
+        streamTask?.cancel()
+        wsClient?.disconnect()
+        setupConnection(sessionID: sessionID)
     }
 
     @MainActor
@@ -183,6 +230,11 @@ final class ChatState {
 
     @MainActor
     private func handleMessage(_ message: ChatMessage) {
+        // Reset reconnect backoff on first successful message
+        if !hasReceivedFirstMessage {
+            hasReceivedFirstMessage = true
+            reconnectAttempts = 0
+        }
         // Don't clear isConnecting for status messages — they may set it to true.
         if case .sessionStatus = message { } else { isConnecting = false }
 
@@ -219,6 +271,13 @@ final class ChatState {
             } else {
                 toolCallCache[call.toolCallId] = allMessages.count
                 appendLive(message)
+                // Track file-touching operations
+                let fileKinds: Set<String> = ["write", "edit", "create", "patch"]
+                if fileKinds.contains(call.kind.lowercased()), !call.title.isEmpty {
+                    if !filesTouched.contains(call.title) {
+                        filesTouched.append(call.title)
+                    }
+                }
             }
             isLoadingHistory = false
 
@@ -234,9 +293,13 @@ final class ChatState {
         case .promptSent:
             isRunning = true
             isLoadingHistory = false
+            runStartedAt = Date()
             appendLive(message)
 
         case .runComplete:
+            if let start = runStartedAt {
+                lastRunDuration = Date().timeIntervalSince(start)
+            }
             isRunning = false
             appendLive(message)
             // Send next queued prompt if any
@@ -245,6 +308,9 @@ final class ChatState {
             }
 
         case .interrupted:
+            if let start = runStartedAt {
+                lastRunDuration = Date().timeIntervalSince(start)
+            }
             isRunning = false
             appendLive(message)
             // Send next queued prompt if any
@@ -274,6 +340,10 @@ final class ChatState {
                 isRunning = false
                 isLoadingHistory = true
             }
+
+        case .error:
+            errorCount += 1
+            appendLive(message)
 
         default:
             appendLive(message)

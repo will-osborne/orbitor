@@ -418,6 +418,154 @@ func llmThreads() int {
 	return n
 }
 
+// EnhancePrompt rewrites a rough prompt into a clearer, more detailed coding
+// instruction. Returns the original text unchanged on any error.
+func (s *Summarizer) EnhancePrompt(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return text
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return text
+	}
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	prompt := "You are helping a developer write a clear coding instruction for an AI coding assistant.\n" +
+		"Rewrite the following rough note into a precise, actionable instruction. " +
+		"Keep the same intent but add helpful specificity. " +
+		"Respond with only the improved instruction text, no preamble.\n\nInput: " + text
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":       model,
+		"messages":    []msg{{Role: "user", Content: prompt}},
+		"temperature": 0.3,
+		"max_tokens":  300,
+	})
+	resp, err := s.callHTTP.Post(apiBase+"/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return text
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Choices) == 0 {
+		return text
+	}
+	enhanced := strings.TrimSpace(result.Choices[0].Message.Content)
+	if enhanced == "" {
+		return text
+	}
+	return enhanced
+}
+
+// Debrief generates a structured post-run summary. Returns empty string on error.
+func (s *Summarizer) Debrief(messages []WSMessage) string {
+	ctx := buildSummaryContext(messages)
+	if ctx == "" {
+		return ""
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return ""
+	}
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	prompt := "You are summarizing a completed AI coding session. " +
+		"Given the conversation below, write a brief debrief with three short sections:\n" +
+		"1. What was asked (one sentence)\n" +
+		"2. What was done (1-3 bullet points starting with •)\n" +
+		"3. Open questions or next steps (one sentence, or 'None' if complete)\n" +
+		"Be concise. No markdown headers, just plain text.\n\nConversation:\n" + ctx
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":       model,
+		"messages":    []msg{{Role: "user", Content: prompt}},
+		"temperature": 0.2,
+		"max_tokens":  250,
+	})
+	resp, err := s.callHTTP.Post(apiBase+"/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(result.Choices[0].Message.Content)
+}
+
+// Suggestions generates up to 3 natural follow-up prompts. Returns nil on error.
+func (s *Summarizer) Suggestions(messages []WSMessage) []string {
+	ctx := buildSummaryContext(messages)
+	if ctx == "" {
+		return nil
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return nil
+	}
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	prompt := "Based on this AI coding session, suggest exactly 3 short follow-up prompts the developer might send next. " +
+		"Respond with a JSON array of 3 strings, each under 10 words. " +
+		"Respond ONLY with the JSON array, e.g. [\"Add unit tests\",\"Fix lint errors\",\"Update docs\"].\n\nConversation:\n" + ctx
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":       model,
+		"messages":    []msg{{Role: "user", Content: prompt}},
+		"temperature": 0.4,
+		"max_tokens":  120,
+	})
+	resp, err := s.callHTTP.Post(apiBase+"/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Choices) == 0 {
+		return nil
+	}
+	content := strings.TrimSpace(result.Choices[0].Message.Content)
+	var suggestions []string
+	if err := json.Unmarshal([]byte(content), &suggestions); err == nil {
+		return clampSuggestions(suggestions)
+	}
+	var wrapped struct{ Suggestions []string `json:"suggestions"` }
+	if err := json.Unmarshal([]byte(content), &wrapped); err == nil && len(wrapped.Suggestions) > 0 {
+		return clampSuggestions(wrapped.Suggestions)
+	}
+	if i := strings.Index(content, "["); i != -1 {
+		if j := strings.LastIndex(content, "]"); j > i {
+			if err := json.Unmarshal([]byte(content[i:j+1]), &suggestions); err == nil {
+				return clampSuggestions(suggestions)
+			}
+		}
+	}
+	return nil
+}
+
+func clampSuggestions(s []string) []string {
+	if len(s) > 3 {
+		return s[:3]
+	}
+	return s
+}
+
 // buildSummaryContext extracts user prompts and agent responses from message
 // history into a compact text string suitable for the LLM prompt.
 func buildSummaryContext(messages []WSMessage) string {

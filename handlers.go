@@ -569,6 +569,72 @@ func (h *Handlers) MissionSummary(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"title": title, "summary": summary})
 }
 
+// EnhancePrompt rewrites a rough prompt into a more precise instruction using
+// the local LLM summarizer. POST /api/enhance-prompt {"text": "..."}.
+func (h *Handlers) EnhancePrompt(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		http.Error(w, `{"error":"text required"}`, http.StatusBadRequest)
+		return
+	}
+	enhanced := h.sm.summarizer.EnhancePrompt(req.Text)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"enhanced": enhanced})
+}
+
+// SessionDebrief returns a post-run summary of a session's conversation.
+// GET /api/sessions/{id}/debrief
+func (h *Handlers) SessionDebrief(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	session := h.sm.Get(id)
+	if session == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	var msgs []WSMessage
+	if session.store != nil {
+		msgs, _ = session.store.LoadMessages(session.ID)
+	}
+	debrief := h.sm.summarizer.Debrief(msgs)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"debrief": debrief})
+}
+
+// SessionSuggestions returns up to 3 follow-up prompt suggestions for a session.
+// GET /api/sessions/{id}/suggestions
+func (h *Handlers) SessionSuggestions(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	session := h.sm.Get(id)
+	if session == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	var msgs []WSMessage
+	if session.store != nil {
+		msgs, _ = session.store.LoadMessages(session.ID)
+	}
+	suggestions := h.sm.summarizer.Suggestions(msgs)
+	if suggestions == nil {
+		suggestions = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"suggestions": suggestions})
+}
+
 // EventsWebSocket is a global WebSocket endpoint that broadcasts cross-session
 // events (permission requests) so the mobile app can show notifications
 // regardless of which session is currently open.

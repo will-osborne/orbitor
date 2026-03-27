@@ -224,10 +224,17 @@ struct ToolCallView: View {
             // Content (expandable)
             if isExpanded, let content = call.content, !content.isEmpty {
                 Divider().padding(.horizontal, 10)
-                CodeBlockView(code: content, language: call.kind)
-                    .padding(.horizontal, 6)
-                    .padding(.bottom, 6)
-                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                if looksLikeDiff(content) {
+                    DiffView(diff: content)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 6)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                } else {
+                    CodeBlockView(code: content, language: call.kind)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 6)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                }
             }
         }
         .background(theme.selBg.opacity(0.3))

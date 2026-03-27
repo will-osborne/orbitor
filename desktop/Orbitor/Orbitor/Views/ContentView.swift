@@ -66,6 +66,16 @@ struct ContentView: View {
         .sheet(isPresented: $state.showForkSheet) {
             ForkSessionSheet()
         }
+        .overlay {
+            if appState.showCommandPalette {
+                CommandPaletteView(isPresented: $state.showCommandPalette)
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: appState.showCommandPalette)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            StatusBar()
+        }
         .onChange(of: appState.sessionList.selectedSessionID) { _, newID in
             if let id = newID {
                 appState.chat.connectToSession(id)
@@ -77,6 +87,89 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             appState.chat.isAppFocused = false
+        }
+    }
+}
+
+// MARK: - Status Bar
+
+private struct StatusBar: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.theme) private var theme
+
+    private var runningSessions: Int {
+        appState.sessionList.sessions.filter { $0.isRunning }.count
+    }
+
+    private var serverLabel: String {
+        switch appState.connectionStatus {
+        case .connected: return "Connected"
+        case .connecting: return "Connecting…"
+        case .disconnected: return "Disconnected"
+        case .error(let msg): return "Error: \(msg)"
+        }
+    }
+
+    private var serverColor: Color {
+        switch appState.connectionStatus {
+        case .connected: return theme.green
+        case .connecting: return theme.yellow
+        case .disconnected, .error: return theme.red
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Server status
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(serverColor)
+                    .frame(width: 6, height: 6)
+                Text(serverLabel)
+                    .font(.system(size: 10))
+                    .foregroundStyle(theme.muted)
+            }
+
+            Divider().frame(height: 12)
+
+            // Session count
+            HStack(spacing: 4) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 9))
+                    .foregroundStyle(theme.muted)
+                Text("\(appState.sessionList.sessions.count) session\(appState.sessionList.sessions.count == 1 ? "" : "s")")
+                    .font(.system(size: 10))
+                    .foregroundStyle(theme.muted)
+            }
+
+            // Running count (shown when any are running)
+            if runningSessions > 0 {
+                Divider().frame(height: 12)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(theme.orange)
+                        .frame(width: 6, height: 6)
+                    Text("\(runningSessions) running")
+                        .font(.system(size: 10))
+                        .foregroundStyle(theme.orange)
+                }
+            }
+
+            Spacer()
+
+            // Server URL (right-aligned)
+            Text(appState.serverURL)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(theme.muted.opacity(0.5))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 200)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(theme.panel)
+        .overlay(alignment: .top) {
+            Divider().background(theme.sep)
         }
     }
 }

@@ -29,6 +29,8 @@
 		A1B2C3D4E5F60001000A0012 /* SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0012 /* SessionListView.swift */; };
 		A1B2C3D4E5F60001000A0013 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0013 /* Assets.xcassets */; };
 		A656BEB21F4D28778B492BC9 /* Speech.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 47063F531C80C12E9B85DACC /* Speech.framework */; };
+		A1B2C3D4E5F60001000A0016 /* DiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0016 /* DiffView.swift */; };
+		A1B2C3D4E5F60001000A0017 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0017 /* CommandPaletteView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -56,6 +58,8 @@
 		A1B2C3D4E5F60002000A0013 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0014 /* Orbitor.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Orbitor.entitlements; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoverEffects.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A0016 /* DiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiffView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A0017 /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60003000A0001 /* Orbitor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Orbitor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -138,6 +142,7 @@
 			children = (
 				A1B2C3D4E5F60002000A000A /* ContentView.swift */,
 				A1B2C3D4E5F60005000A0008 /* Chat */,
+				A1B2C3D4E5F60005000A000C /* CommandPalette */,
 				A1B2C3D4E5F60005000A0009 /* Inspector */,
 				A1B2C3D4E5F60005000A000A /* Shared */,
 				A1B2C3D4E5F60005000A000B /* Sidebar */,
@@ -167,10 +172,19 @@
 			isa = PBXGroup;
 			children = (
 				A1B2C3D4E5F60002000A000F /* CodeBlockView.swift */,
+				A1B2C3D4E5F60002000A0016 /* DiffView.swift */,
 				A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */,
 				A1B2C3D4E5F60002000A0010 /* StatusBadge.swift */,
 			);
 			path = Shared;
+			sourceTree = "<group>";
+		};
+		A1B2C3D4E5F60005000A000C /* CommandPalette */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F60002000A0017 /* CommandPaletteView.swift */,
+			);
+			path = CommandPalette;
 			sourceTree = "<group>";
 		};
 		A1B2C3D4E5F60005000A000B /* Sidebar */ = {
@@ -287,6 +301,8 @@
 				A1B2C3D4E5F60001000A0011 /* NewSessionSheet.swift in Sources */,
 				A1B2C3D4E5F60001000A0012 /* SessionListView.swift in Sources */,
 				143763597DA538F7889F8A20 /* DictationState.swift in Sources */,
+				A1B2C3D4E5F60001000A0016 /* DiffView.swift in Sources */,
+				A1B2C3D4E5F60001000A0017 /* CommandPaletteView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

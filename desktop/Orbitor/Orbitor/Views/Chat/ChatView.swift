@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Turn grouping
 
@@ -94,8 +95,11 @@ struct ChatView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var promptText = ""
+    @State private var pendingAttachments: [PromptAttachment] = []
     @State private var scrollToBottom = true
     @State private var suppressNextScroll = false
+    @State private var isAtBottom = true
+    @State private var showRunCard = false
 
     var body: some View {
         let displayItems = buildDisplayItems(from: appState.chat.messages)
@@ -108,7 +112,7 @@ struct ChatView: View {
 
             // Message list
             ScrollViewReader { proxy in
-                ZStack {
+                ZStack(alignment: .bottomTrailing) {
                 // Connecting overlay
                 if appState.chat.isConnecting && appState.chat.messages.isEmpty {
                     VStack(spacing: 16) {
@@ -174,10 +178,16 @@ struct ChatView: View {
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
+                            .onAppear { isAtBottom = true }
+                            .onDisappear { isAtBottom = false }
                     }
                     .padding()
                 }
                 .background(theme.panel)
+                .onDrop(of: [UTType.fileURL, UTType.image, UTType.png, UTType.jpeg], isTargeted: nil) { providers in
+                    handleDrop(providers)
+                    return true
+                }
                 .onChange(of: appState.chat.messages.count) {
                     if suppressNextScroll {
                         suppressNextScroll = false
@@ -194,15 +204,43 @@ struct ChatView: View {
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }
+
+                // Jump-to-bottom floating button
+                if !isAtBottom {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(theme.accent)
+                            .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(12)
+                    .transition(.scale.combined(with: .opacity))
+                }
                 } // ZStack
             }
 
             Divider().background(theme.sep)
 
+            // Post-run card (shown after a run completes)
+            if showRunCard && !appState.chat.isRunning {
+                RunCompleteCard(
+                    duration: appState.chat.lastRunDuration,
+                    filesTouched: appState.chat.filesTouched,
+                    sessionID: appState.chat.activeSessionID,
+                    onDismiss: { showRunCard = false }
+                )
+            }
+
             // Working indicator
-            if appState.chat.isRunning || appState.chat.isConnecting || appState.chat.isLoadingHistory {
+            if appState.chat.isRunning || appState.chat.isConnecting || appState.chat.isLoadingHistory || appState.chat.isReconnecting {
                 WorkingIndicator(
                     isConnecting: appState.chat.isConnecting || appState.chat.isLoadingHistory,
+                    isReconnecting: appState.chat.isReconnecting,
                     queuedPrompts: appState.chat.queuedPrompts,
                     onRemoveQueued: { index in
                         appState.chat.removeQueuedPrompt(at: index)
@@ -211,22 +249,87 @@ struct ChatView: View {
             }
 
             // Input area
-            PromptInputView(text: $promptText, onSubmit: {
-                Task {
-                    let text = promptText
-                    promptText = ""
-                    await appState.chat.sendPrompt(text)
+            PromptInputView(
+                text: $promptText,
+                attachments: $pendingAttachments,
+                onSubmit: { fullText in
+                    showRunCard = false
+                    Task { await appState.chat.sendPrompt(fullText) }
+                },
+                onForkSubmit: { fullText in
+                    guard let sourceID = appState.sessionList.selectedSessionID else { return }
+                    showRunCard = false
+                    Task { await appState.sessionList.forkSession(sourceID: sourceID, prompt: fullText) }
                 }
-            }, onForkSubmit: {
-                guard let sourceID = appState.sessionList.selectedSessionID else { return }
-                let text = promptText
-                promptText = ""
-                Task {
-                    await appState.sessionList.forkSession(sourceID: sourceID, prompt: text)
-                }
-            })
+            )
         }
         .background(theme.panel)
+        .onChange(of: appState.chat.isRunning) { _, running in
+            if !running && appState.chat.lastRunDuration != nil {
+                showRunCard = true
+            }
+        }
+    }
+
+    // MARK: - Drop handling
+
+    private func handleDrop(_ providers: [NSItemProvider]) {
+        // Use a temporary PromptInputView-style helper via a local closure
+        let imageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff", "tif"]
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    guard let data = item as? Data,
+                          let urlStr = String(data: data, encoding: .utf8),
+                          let url = URL(string: urlStr) else { return }
+                    let ext = url.pathExtension.lowercased()
+                    if imageExts.contains(ext) {
+                        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                            .appendingPathComponent("orbitor_\(UUID().uuidString).\(ext)")
+                        try? FileManager.default.copyItem(at: url, to: tempURL)
+                        let thumb = NSImage(contentsOf: url)
+                        DispatchQueue.main.async {
+                            pendingAttachments.append(PromptAttachment(
+                                name: url.lastPathComponent,
+                                content: tempURL.path,
+                                isImage: true,
+                                thumbnail: thumb
+                            ))
+                        }
+                    } else {
+                        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                              let size = attrs[.size] as? Int, size < 500_000,
+                              let content = try? String(contentsOf: url, encoding: .utf8) else { return }
+                        DispatchQueue.main.async {
+                            pendingAttachments.append(PromptAttachment(
+                                name: url.lastPathComponent,
+                                content: content,
+                                isImage: false,
+                                thumbnail: nil
+                            ))
+                        }
+                    }
+                }
+            } else {
+                // Direct image drop (e.g. from browser or image viewer)
+                let typeID = UTType.png.identifier
+                provider.loadDataRepresentation(forTypeIdentifier: typeID) { data, _ in
+                    guard let data, let image = NSImage(data: data) else { return }
+                    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                        .appendingPathComponent("orbitor_drop_\(UUID().uuidString).png")
+                    try? data.write(to: tempURL)
+                    DispatchQueue.main.async {
+                        pendingAttachments.append(PromptAttachment(
+                            name: "dropped_image.png",
+                            content: tempURL.path,
+                            isImage: true,
+                            thumbnail: image
+                        ))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -369,6 +472,7 @@ private struct WorkingStatusLabel: View {
 
 struct WorkingIndicator: View {
     var isConnecting: Bool
+    var isReconnecting: Bool = false
     var queuedPrompts: [String]
     var onRemoveQueued: (Int) -> Void
     @Environment(\.theme) private var theme
@@ -376,7 +480,9 @@ struct WorkingIndicator: View {
     @State private var showQueue = false
 
     private var label: String {
-        if isConnecting {
+        if isReconnecting {
+            return "Reconnecting…"
+        } else if isConnecting {
             return "Connecting…"
         } else if !queuedPrompts.isEmpty {
             return "Working… (\(queuedPrompts.count) queued)"
@@ -485,5 +591,140 @@ struct QueuedPromptRow: View {
                     .padding(.horizontal, 12)
             }
         }
+    }
+}
+
+// MARK: - Run Complete Card
+
+private struct RunCompleteCard: View {
+    let duration: TimeInterval?
+    let filesTouched: [String]
+    let sessionID: String?
+    let onDismiss: () -> Void
+    @Environment(AppState.self) private var appState
+    @Environment(\.theme) private var theme
+    @State private var debriefText: String? = nil
+    @State private var isLoadingDebrief = false
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Divider().background(theme.border)
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(theme.green)
+                    .font(.callout)
+
+                if let dur = duration {
+                    Text("Run complete · \(formatDuration(dur))")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.text)
+                }
+
+                if !filesTouched.isEmpty {
+                    Text("· \(filesTouched.count) file\(filesTouched.count == 1 ? "" : "s") changed")
+                        .font(.caption)
+                        .foregroundStyle(theme.muted)
+                }
+
+                Spacer()
+
+                if sessionID != nil {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expanded.toggle()
+                        }
+                        if expanded && debriefText == nil {
+                            loadDebrief()
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "sparkles")
+                                .font(.caption2)
+                            Text("Debrief")
+                                .font(.caption)
+                        }
+                        .foregroundStyle(theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                        .foregroundStyle(theme.muted)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    if !filesTouched.isEmpty {
+                        Text("Files changed:")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(theme.muted)
+                        ForEach(filesTouched.prefix(8), id: \.self) { path in
+                            HStack(spacing: 4) {
+                                Image(systemName: "pencil.circle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(theme.cyan)
+                                Text(path)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(theme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        if filesTouched.count > 8 {
+                            Text("…and \(filesTouched.count - 8) more")
+                                .font(.caption2)
+                                .foregroundStyle(theme.muted)
+                        }
+                    }
+
+                    if isLoadingDebrief {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("Generating summary…")
+                                .font(.caption)
+                                .foregroundStyle(theme.muted)
+                        }
+                    } else if let text = debriefText {
+                        Divider().background(theme.border)
+                        Text(text)
+                            .font(.caption)
+                            .foregroundStyle(theme.text)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+        }
+        .background(theme.green.opacity(0.05))
+        .animation(.easeInOut(duration: 0.15), value: expanded)
+    }
+
+    private func loadDebrief() {
+        guard let id = sessionID else { return }
+        isLoadingDebrief = true
+        Task {
+            let text = try? await appState.api.sessionDebrief(id: id)
+            await MainActor.run {
+                debriefText = text
+                isLoadingDebrief = false
+            }
+        }
+    }
+
+    private func formatDuration(_ t: TimeInterval) -> String {
+        let total = Int(t)
+        if total < 60 { return "\(total)s" }
+        return "\(total / 60)m \(total % 60)s"
     }
 }

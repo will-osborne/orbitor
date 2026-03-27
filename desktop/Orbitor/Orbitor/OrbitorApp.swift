@@ -48,6 +48,13 @@ struct AppCommands: Commands {
             .disabled(appState.sessionList.selectedSessionID == nil)
         }
 
+        CommandGroup(after: .newItem) {
+            Button("Command Palette") {
+                appState.showCommandPalette = true
+            }
+            .keyboardShortcut("k", modifiers: .command)
+        }
+
         CommandMenu("Session") {
             Button("Interrupt") {
                 Task { await appState.chat.interrupt() }
