@@ -698,10 +698,7 @@ private struct RunCompleteCard: View {
                     } else if let text = debriefText, !text.isEmpty {
                         Divider().background(theme.border)
                         ScrollView {
-                            Text(text)
-                                .font(.caption)
-                                .foregroundStyle(theme.text)
-                                .textSelection(.enabled)
+                            MarkdownTextView(text: text)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .frame(maxHeight: 180)
