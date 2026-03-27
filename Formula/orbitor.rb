@@ -47,12 +47,12 @@ class Orbitor < Formula
     quiet_system "brew", "services", "restart", "orbitor"
 
     if OS.mac?
-      # Symlink the desktop app into ~/Applications
+      # Install the desktop app into ~/Applications
       user_apps = Pathname.new(ENV["HOME"]) / "Applications"
       user_apps.mkpath
-      app_link = user_apps / "Orbitor.app"
-      app_link.unlink if app_link.exist? || app_link.symlink?
-      app_link.make_symlink(prefix / "Orbitor.app")
+      app_dest = user_apps / "Orbitor.app"
+      system "rm", "-rf", app_dest.to_s
+      system "cp", "-R", (opt_prefix / "Orbitor.app").to_s, app_dest.to_s
     end
   end
 
@@ -75,7 +75,7 @@ class Orbitor < Formula
       Open the TUI:
         orbitor
 
-      The macOS desktop app has been symlinked to ~/Applications/Orbitor.app.
+      The macOS desktop app has been installed to ~/Applications/Orbitor.app.
     EOS
   end
 
