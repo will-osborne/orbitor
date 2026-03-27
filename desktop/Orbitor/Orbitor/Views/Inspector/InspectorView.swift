@@ -4,6 +4,7 @@ struct InspectorView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var gitBranch: String? = nil
+    @State private var showHistory = false
 
     var body: some View {
         if let session = appState.sessionList.selectedSession {
@@ -20,6 +21,15 @@ struct InspectorView: View {
                                 .font(.caption)
                                 .foregroundStyle(theme.red)
                         }
+                        Button {
+                            showHistory = true
+                        } label: {
+                            Image(systemName: "clock.arrow.trianglehead.counterclockwise.rotate.90")
+                                .font(.caption)
+                                .foregroundStyle(theme.muted)
+                        }
+                        .buttonStyle(.plain)
+                        .help("File History")
                     }
 
                     // Session info grid
@@ -187,6 +197,11 @@ struct InspectorView: View {
             .background(theme.panel)
             .onAppear { loadGitBranch(for: session) }
             .onChange(of: session.id) { _, _ in loadGitBranch(for: session) }
+            .sheet(isPresented: $showHistory) {
+                RunHistoryView(sessionID: session.id)
+                    .environment(appState)
+                    .environment(\.theme, theme)
+            }
         } else {
             VStack {
                 Text("No session")

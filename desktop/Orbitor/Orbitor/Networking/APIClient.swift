@@ -125,6 +125,14 @@ final class APIClient: Sendable {
         let resp = try JSONDecoder().decode(Resp.self, from: data)
         return resp.suggestions
     }
+
+    /// Returns the per-run file change history for a session.
+    func sessionRunHistory(id: String) async throws -> [RunRecord] {
+        let url = baseURL.appendingPathComponent("api/sessions/\(id)/run-history")
+        let (data, _) = try await session.data(from: url)
+        struct Resp: Decodable { let runs: [RunRecord] }
+        return try decoder.decode(Resp.self, from: data).runs
+    }
 }
 
 struct BrowseEntry: Codable, Identifiable {

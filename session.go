@@ -94,6 +94,7 @@ type Session struct {
 	eventHub   *Hub        // global event hub for cross-session notifications
 	summarizer *Summarizer // optional LLM summarizer (nil = disabled)
 	fcm        *FCMSender  // optional FCM push sender (nil = disabled)
+	history    *RunHistory // per-session file change history
 }
 
 func (s *Session) persistSession() {
@@ -415,6 +416,7 @@ func (sm *SessionManager) Create(workingDir, backend, model string, skipPermissi
 		eventHub:        sm.EventHub,
 		summarizer:      sm.summarizer,
 		fcm:             sm.fcm,
+		history:         newRunHistory(),
 	}
 
 	go s.hub.Run()
@@ -856,6 +858,9 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.currentPrompt = item.Text
 		s.isRunning = true
 		s.summaryMu.Unlock()
+		if !isContinuation {
+			s.history.StartRun(item.Text)
+		}
 		s.persistSession()
 		var promptID int64
 		if !isContinuation {
@@ -899,6 +904,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 		s.isRunning = false
 		prURL := s.prURL
 		s.summaryMu.Unlock()
+		s.history.CompleteRun()
 		s.persistSession()
 		completePayload := map[string]string{"stopReason": result.StopReason, "prUrl": prURL}
 		// Route run_complete through the coalescer so it is strictly ordered
@@ -1433,10 +1439,22 @@ func (s *Session) handleAgentRequest(method string, id *json.RawMessage, params 
 		}
 		_ = s.acp.Respond(id, result)
 	case "fs/write_text_file":
+		var wp FSWriteParams
+		before := ""
+		if json.Unmarshal(params, &wp) == nil && wp.Path != "" {
+			if data, err := os.ReadFile(wp.Path); err == nil {
+				before = string(data)
+			}
+		}
 		result, err := handleFSWrite(params)
 		if err != nil {
 			_ = s.acp.RespondError(id, -32603, err.Error())
 			return
+		}
+		if wp.Path != "" {
+			if after, err := os.ReadFile(wp.Path); err == nil {
+				s.history.RecordFileChange(wp.Path, s.WorkingDir, before, string(after))
+			}
 		}
 		_ = s.acp.Respond(id, result)
 	case "terminal/create":

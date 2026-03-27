@@ -271,6 +271,7 @@ func runServerMode() {
 	mux.HandleFunc("POST /api/enhance-prompt", h.EnhancePrompt)
 	mux.HandleFunc("GET /api/sessions/{id}/debrief", h.SessionDebrief)
 	mux.HandleFunc("GET /api/sessions/{id}/suggestions", h.SessionSuggestions)
+	mux.HandleFunc("GET /api/sessions/{id}/run-history", h.SessionRunHistory)
 	mux.HandleFunc("GET /api/whatsapp/status", h.WhatsAppStatus)
 	mux.HandleFunc("POST /api/whatsapp/pair", h.WhatsAppPair)
 	mux.HandleFunc("GET /api/whatsapp/qr", h.WhatsAppQR)

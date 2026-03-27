@@ -635,6 +635,22 @@ func (h *Handlers) SessionSuggestions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"suggestions": suggestions})
 }
 
+// SessionRunHistory returns the per-run file change history for a session.
+func (h *Handlers) SessionRunHistory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s := h.sm.Get(id)
+	if s == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	records := s.history.Records()
+	if records == nil {
+		records = []RunRecord{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"runs": records})
+}
+
 // EventsWebSocket is a global WebSocket endpoint that broadcasts cross-session
 // events (permission requests) so the mobile app can show notifications
 // regardless of which session is currently open.
