@@ -66,19 +66,6 @@ final class ChatState {
 
     init(baseURL: URL) {
         self.baseURL = baseURL
-        requestNotificationPermission()
-    }
-
-    private func requestNotificationPermission() {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = NotificationDelegate.shared
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            if let error {
-                print("[Notifications] authorization error: \(error)")
-            } else if !granted {
-                print("[Notifications] user denied notification permission")
-            }
-        }
     }
 
     private func postNotification(title: String, body: String) {

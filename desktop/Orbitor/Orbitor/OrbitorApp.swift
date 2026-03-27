@@ -1,7 +1,23 @@
 import SwiftUI
+import UserNotifications
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NotificationDelegate.shared
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error {
+                print("[Notifications] authorization error: \(error)")
+            } else if !granted {
+                print("[Notifications] permission denied")
+            }
+        }
+    }
+}
 
 @main
 struct OrbitorApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var appState = AppState()
 
     var body: some Scene {
