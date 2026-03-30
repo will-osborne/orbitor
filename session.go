@@ -253,6 +253,7 @@ func NewSessionManager(store *Store, summarizer *Summarizer) *SessionManager {
 					allocPort:       sm.AllocPort,
 					eventHub:        eventHub,
 					summarizer:      summarizer,
+					history:         newRunHistory(),
 				}
 
 				// Seed hub history from DB before starting Run to avoid race conditions.

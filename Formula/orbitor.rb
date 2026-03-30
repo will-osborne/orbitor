@@ -47,17 +47,23 @@ class Orbitor < Formula
     quiet_system "brew", "services", "restart", "orbitor"
 
     if OS.mac?
-      # Install the desktop app into ~/Applications.
-      # macOS protects app bundles that have been run by the user, so we
-      # must restore write permissions before removing the old bundle.
       user_apps = Pathname.new(ENV["HOME"]) / "Applications"
       user_apps.mkpath
       app_dest = user_apps / "Orbitor.app"
+      app_src = opt_prefix / "Orbitor.app"
       if app_dest.exist?
-        system "chmod", "-R", "u+w", app_dest.to_s
-        system "rm", "-rf", app_dest.to_s
+        # macOS 13+ sets com.apple.provenance on app bundles; remove it so
+        # the bundle can be deleted. On macOS 15+ (Darwin 24+), ~/Applications
+        # is TCC-protected and brew's subprocess may lack permission — fall back
+        # to a manual-install instruction in that case.
+        quiet_system "xattr", "-d", "com.apple.provenance", app_dest.to_s
+        quiet_system "rm", "-rf", app_dest.to_s
       end
-      system "ditto", (opt_prefix / "Orbitor.app").to_s, app_dest.to_s
+      unless quiet_system("ditto", app_src.to_s, app_dest.to_s)
+        opoo "Could not update #{app_dest.basename} automatically (macOS permission restriction)."
+        opoo "Run this from your terminal to update it:"
+        opoo "  ditto #{app_src} #{app_dest}"
+      end
     end
   end
 
