@@ -1371,6 +1371,25 @@ func (s *Session) handleSessionUpdate(params json.RawMessage) {
 			}
 			s.summaryMu.Unlock()
 		}
+		// Track file changes from Edit/Write tool completions.
+		// Claude Code writes files internally and sends the original file content
+		// in _meta.claudeCode.toolResponse.originalFile on completion.
+		if base.SessionUpdate == "tool_call_update" {
+			var meta toolCallMeta
+			if json.Unmarshal(p.Update, &meta) == nil &&
+				meta.Meta != nil && meta.Meta.ClaudeCode != nil &&
+				meta.Meta.ClaudeCode.ToolResponse != nil {
+				tr := meta.Meta.ClaudeCode.ToolResponse
+				if tr.FilePath != "" {
+					after := ""
+					if data, err := os.ReadFile(tr.FilePath); err == nil {
+						after = string(data)
+					}
+					s.history.RecordFileChange(tr.FilePath, s.WorkingDir, tr.OriginalFile, after)
+				}
+			}
+		}
+
 		toolPayload := WSToolCall{
 			ToolCallID: tc.ToolCallID,
 			Title:      tc.Title,

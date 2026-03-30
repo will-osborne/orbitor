@@ -75,8 +75,10 @@ final class SessionListState {
             if session.id != selectedSessionID {
                 unreadSessionIDs.insert(session.id)
             }
-            // Fire system notification if app is not in focus.
-            guard !NSApp.isActive else { continue }
+            // Skip notification only when the user is actively watching this
+            // exact session. The NotificationDelegate shows banners even when
+            // the app is focused, so other sessions still notify.
+            if session.id == selectedSessionID && NSApp.isActive { continue }
             let content = UNMutableNotificationContent()
             content.title = "Agent Finished"
             content.body = session.displayTitle

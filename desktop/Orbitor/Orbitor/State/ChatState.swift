@@ -69,8 +69,6 @@ final class ChatState {
     }
 
     private func postNotification(title: String, body: String) {
-        // Skip if the app window is currently active
-        guard !NSApp.isActive else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body

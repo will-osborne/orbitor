@@ -147,6 +147,20 @@ type ToolCallResultUpdate struct {
 	Result        json.RawMessage `json:"result,omitempty"`
 }
 
+// toolCallMeta extracts the _meta.claudeCode fields embedded in tool_call_update
+// events. Claude Code embeds the original file content in toolResponse when a
+// file-writing tool (Edit, Write) completes.
+type toolCallMeta struct {
+	Meta *struct {
+		ClaudeCode *struct {
+			ToolResponse *struct {
+				FilePath     string `json:"filePath"`
+				OriginalFile string `json:"originalFile"`
+			} `json:"toolResponse,omitempty"`
+		} `json:"claudeCode,omitempty"`
+	} `json:"_meta,omitempty"`
+}
+
 type PermissionRequestParams struct {
 	SessionID string             `json:"sessionId"`
 	ToolCall  PermissionToolCall `json:"toolCall"`
