@@ -4,7 +4,7 @@ struct InspectorView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var gitBranch: String? = nil
-    @State private var showHistory = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         if let session = appState.sessionList.selectedSession {
@@ -21,15 +21,6 @@ struct InspectorView: View {
                                 .font(.caption)
                                 .foregroundStyle(theme.red)
                         }
-                        Button {
-                            showHistory = true
-                        } label: {
-                            Image(systemName: "clock.arrow.trianglehead.counterclockwise.rotate.90")
-                                .font(.caption)
-                                .foregroundStyle(theme.muted)
-                        }
-                        .buttonStyle(.plain)
-                        .help("File History")
                     }
 
                     // Session info grid
@@ -127,26 +118,78 @@ struct InspectorView: View {
                         }
                     }
 
-                    // Files touched this session
-                    if !appState.chat.filesTouched.isEmpty {
-                        DetailSection(title: "Files Changed (\(appState.chat.filesTouched.count))") {
-                            ForEach(appState.chat.filesTouched.prefix(10), id: \.self) { path in
-                                HStack(spacing: 4) {
-                                    Image(systemName: "pencil.circle.fill")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(theme.cyan)
-                                    Text(path)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(theme.text)
-                                        .lineLimit(1)
-                                        .truncationMode(.head)
+                    // Files changed — prominent section with diff access
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.system(size: 12))
+                                .foregroundStyle(theme.accent)
+                            Text("FILES CHANGED")
+                                .font(.caption2.bold())
+                                .foregroundStyle(theme.muted)
+                            Spacer()
+                            if !appState.chat.filesTouched.isEmpty {
+                                Text("\(appState.chat.filesTouched.count)")
+                                    .font(.caption2.bold().monospacedDigit())
+                                    .foregroundStyle(theme.panel)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(theme.accent, in: Capsule())
+                            }
+                        }
+
+                        if appState.chat.filesTouched.isEmpty {
+                            Text("No files changed yet")
+                                .font(.caption)
+                                .foregroundStyle(theme.muted.opacity(0.7))
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 8)
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(appState.chat.filesTouched.prefix(15), id: \.self) { path in
+                                    HStack(spacing: 6) {
+                                        Image(systemName: fileIcon(for: path))
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(fileColor(for: path))
+                                            .frame(width: 14)
+                                        Text(shortenPath(path))
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(theme.text)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                    }
+                                    .padding(.vertical, 3)
+                                    .padding(.horizontal, 6)
+                                }
+                                if appState.chat.filesTouched.count > 15 {
+                                    Text("+ \(appState.chat.filesTouched.count - 15) more")
+                                        .font(.caption2)
+                                        .foregroundStyle(theme.muted)
+                                        .padding(.vertical, 3)
+                                        .padding(.horizontal, 6)
                                 }
                             }
-                            if appState.chat.filesTouched.count > 10 {
-                                Text("…and \(appState.chat.filesTouched.count - 10) more")
-                                    .font(.caption2)
-                                    .foregroundStyle(theme.muted)
+                            .background(theme.panel.opacity(0.5))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                            // Prominent button to open full diff viewer
+                            Button {
+                                openWindow(id: "file-history", value: session.id)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                        .font(.system(size: 11, weight: .medium))
+                                    Text("Open Diff Viewer")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 7)
+                                .foregroundStyle(theme.panel)
+                                .background(theme.accent, in: RoundedRectangle(cornerRadius: 6))
                             }
+                            .buttonStyle(.plain)
+                            .help("Open side-by-side diffs in a separate window")
                         }
                     }
 
@@ -197,11 +240,6 @@ struct InspectorView: View {
             .background(theme.panel)
             .onAppear { loadGitBranch(for: session) }
             .onChange(of: session.id) { _, _ in loadGitBranch(for: session) }
-            .sheet(isPresented: $showHistory) {
-                RunHistoryView(sessionID: session.id)
-                    .environment(appState)
-                    .environment(\.theme, theme)
-            }
         } else {
             VStack {
                 Text("No session")
@@ -231,6 +269,41 @@ struct InspectorView: View {
         let total = Int(t)
         if total < 60 { return "\(total)s" }
         return "\(total / 60)m \(total % 60)s"
+    }
+
+    private func fileIcon(for path: String) -> String {
+        let ext = (path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "swift":                         return "swift"
+        case "go":                            return "chevron.left.forwardslash.chevron.right"
+        case "ts", "tsx", "js", "jsx":        return "j.square"
+        case "py":                            return "p.square"
+        case "json", "yaml", "yml", "toml":   return "doc.text"
+        case "md":                            return "doc.richtext"
+        case "css", "scss":                   return "paintbrush"
+        case "html":                          return "globe"
+        case "sql":                           return "cylinder"
+        case "sh", "bash", "zsh", "fish":     return "terminal"
+        default:                              return "doc"
+        }
+    }
+
+    private func fileColor(for path: String) -> Color {
+        let ext = (path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "swift":                        return theme.orange
+        case "go":                           return theme.cyan
+        case "ts", "tsx", "js", "jsx":       return theme.yellow
+        case "py":                           return theme.green
+        case "json", "yaml", "yml", "toml":  return theme.muted
+        default:                             return theme.cyan
+        }
+    }
+
+    private func shortenPath(_ path: String) -> String {
+        let components = path.components(separatedBy: "/")
+        if components.count <= 3 { return path }
+        return components.suffix(3).joined(separator: "/")
     }
 }
 

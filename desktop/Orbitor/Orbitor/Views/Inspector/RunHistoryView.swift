@@ -4,8 +4,6 @@ struct RunHistoryView: View {
     let sessionID: String
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
-    @Environment(\.dismiss) private var dismiss
-
     @State private var runs: [RunRecord] = []
     @State private var isLoading = false
     @State private var selectedRunID: String?
@@ -28,13 +26,6 @@ struct RunHistoryView: View {
                 if isLoading {
                     ProgressView().controlSize(.small)
                 }
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(theme.muted)
-                }
-                .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -185,7 +176,7 @@ struct RunHistoryView: View {
 
                 Divider().background(theme.sep)
 
-                FileDiffView(before: file.before, after: file.after)
+                SideBySideDiffView(before: file.before, after: file.after)
             } else {
                 VStack {
                     Text("Select a file to view diff")

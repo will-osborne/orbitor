@@ -37,6 +37,16 @@ struct OrbitorApp: App {
             AppCommands(appState: appState)
         }
 
+        WindowGroup("File History", id: "file-history", for: String.self) { $sessionID in
+            if let sessionID {
+                RunHistoryView(sessionID: sessionID)
+                    .environment(appState)
+                    .environment(\.theme, appState.currentTheme)
+            }
+        }
+        .defaultSize(width: 1100, height: 700)
+        .windowStyle(.titleBar)
+
         Settings {
             SettingsView()
                 .environment(appState)

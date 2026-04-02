@@ -930,9 +930,12 @@ func (s *Session) finishACPSetup(workingDir string) {
 			s.flushAgentText()
 			s.hub.Broadcast("run_complete", completePayload)
 		}
-		if s.eventHub != nil && !isContinuation {
+		if s.eventHub != nil {
 			sessionName := filepath.Base(s.WorkingDir)
 			title := "Agent finished"
+			if isContinuation {
+				title = "Background tasks completed"
+			}
 			body := sessionName + " — " + result.StopReason
 			notificationID := int64(0)
 			if s.store != nil {
@@ -972,7 +975,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 			}
 			go s.fcm.Send(title, body, fcmData)
 		}
-		if s.store != nil && !isContinuation {
+		if s.store != nil {
 			_ = s.store.SaveMessageJSON(s.ID, "run_complete", completePayload)
 			if promptID != 0 {
 				_ = s.store.UpdatePromptStatus(promptID, "done")
