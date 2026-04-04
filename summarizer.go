@@ -610,3 +610,317 @@ func truncateStr(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// callLLMRaw sends a prompt to the LLM and returns the raw text response.
+// Returns empty string on any error.
+func (s *Summarizer) callLLMRaw(apiBase, model, prompt string, maxTokens int, temperature float64) string {
+	type chatMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":       model,
+		"messages":    []chatMessage{{Role: "user", Content: prompt}},
+		"temperature": temperature,
+		"max_tokens":  maxTokens,
+	})
+	resp, err := s.callHTTP.Post(apiBase+"/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(result.Choices[0].Message.Content)
+}
+
+// callLLMJSON sends a prompt to the LLM requesting JSON output and returns the
+// raw content. The caller is responsible for unmarshalling.
+func (s *Summarizer) callLLMJSON(apiBase, model, prompt string, maxTokens int) string {
+	type chatMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":           model,
+		"messages":        []chatMessage{{Role: "user", Content: prompt}},
+		"temperature":     0.1,
+		"max_tokens":      maxTokens,
+		"response_format": map[string]string{"type": "json_object"},
+	})
+	resp, err := s.callHTTP.Post(apiBase+"/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(result.Choices[0].Message.Content)
+}
+
+// extractJSON tries to extract a JSON substring from text that may contain
+// markdown fences or other wrapping.
+func extractJSON(content string) string {
+	// Direct parse
+	if strings.HasPrefix(strings.TrimSpace(content), "{") || strings.HasPrefix(strings.TrimSpace(content), "[") {
+		return strings.TrimSpace(content)
+	}
+	// Strip markdown fences
+	if i := strings.Index(content, "```"); i != -1 {
+		if j := strings.Index(content[i+3:], "```"); j != -1 {
+			inner := content[i+3 : i+3+j]
+			if k := strings.Index(inner, "\n"); k != -1 {
+				inner = inner[k+1:]
+			}
+			return strings.TrimSpace(inner)
+		}
+	}
+	// Find first { or [
+	for _, open := range []string{"{", "["} {
+		close := "}"
+		if open == "[" {
+			close = "]"
+		}
+		s := strings.Index(content, open)
+		e := strings.LastIndex(content, close)
+		if s != -1 && e > s {
+			return content[s : e+1]
+		}
+	}
+	return content
+}
+
+// DiffSummary generates plain-English descriptions for a set of file changes.
+// Returns a map of relativePath → one-sentence description.
+func (s *Summarizer) DiffSummary(files []FileChange) map[string]string {
+	if len(files) == 0 {
+		return nil
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return nil
+	}
+
+	result := make(map[string]string)
+	// Process in batches of 5 to fit token budget
+	for i := 0; i < len(files); i += 5 {
+		end := i + 5
+		if end > len(files) {
+			end = len(files)
+		}
+		batch := files[i:end]
+
+		var sb strings.Builder
+		for _, f := range batch {
+			sb.WriteString(fmt.Sprintf("File: %s\n", f.RelativePath))
+			if f.Before != "" {
+				sb.WriteString("Before (truncated):\n" + truncateStr(f.Before, 200) + "\n")
+			}
+			sb.WriteString("After (truncated):\n" + truncateStr(f.After, 200) + "\n\n")
+		}
+
+		prompt := "For each file below, write a one-sentence description of what changed. " +
+			"Respond with a JSON object where keys are file paths and values are descriptions.\n" +
+			"Respond ONLY with the JSON object.\n\n" + sb.String()
+
+		content := s.callLLMJSON(apiBase, model, prompt, 300)
+		if content == "" {
+			continue
+		}
+		extracted := extractJSON(content)
+		var parsed map[string]string
+		if json.Unmarshal([]byte(extracted), &parsed) == nil {
+			for k, v := range parsed {
+				result[k] = v
+			}
+		}
+	}
+	return result
+}
+
+// SemanticSearch ranks sessions by relevance to a natural language query.
+// Returns session IDs ordered by relevance.
+func (s *Summarizer) SemanticSearch(query string, sessions []WSSessionInfo) []string {
+	if strings.TrimSpace(query) == "" || len(sessions) == 0 {
+		return nil
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return nil
+	}
+
+	// Build compact session list (limit to 12 for token budget)
+	maxN := 12
+	if len(sessions) < maxN {
+		maxN = len(sessions)
+	}
+	var sb strings.Builder
+	for i := 0; i < maxN; i++ {
+		sess := sessions[i]
+		title := sess.Title
+		if title == "" {
+			title = sess.ID[:8]
+		}
+		sb.WriteString(fmt.Sprintf("- %s: title=%q summary=%q dir=%s status=%s\n",
+			sess.ID, title, truncateStr(sess.Summary, 60), filepath.Base(sess.WorkingDir), sess.Status))
+	}
+
+	prompt := "Given this search query: " + query + "\n\n" +
+		"And these sessions:\n" + sb.String() + "\n" +
+		"Return a JSON array of session IDs that match the query, ranked by relevance (most relevant first). " +
+		"Only include sessions that are actually relevant. " +
+		"Respond ONLY with the JSON array of ID strings."
+
+	content := s.callLLMJSON(apiBase, model, prompt, 150)
+	if content == "" {
+		return nil
+	}
+	extracted := extractJSON(content)
+	var ids []string
+	if json.Unmarshal([]byte(extracted), &ids) == nil {
+		return ids
+	}
+	return nil
+}
+
+// GroupSuggestion represents a suggested grouping of sessions.
+type GroupSuggestion struct {
+	Name       string   `json:"name"`
+	SessionIDs []string `json:"sessionIds"`
+}
+
+// GroupSuggestions suggests logical groupings for the given sessions.
+func (s *Summarizer) GroupSuggestions(sessions []WSSessionInfo) []GroupSuggestion {
+	if len(sessions) < 2 {
+		return nil
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return nil
+	}
+
+	maxN := 12
+	if len(sessions) < maxN {
+		maxN = len(sessions)
+	}
+	var sb strings.Builder
+	for i := 0; i < maxN; i++ {
+		sess := sessions[i]
+		title := sess.Title
+		if title == "" {
+			title = sess.ID[:8]
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %q dir=%s\n", sess.ID, title, filepath.Base(sess.WorkingDir)))
+	}
+
+	prompt := "Given these AI coding sessions:\n" + sb.String() + "\n" +
+		"Suggest 1-3 logical groups based on related work, shared directories, or similar tasks. " +
+		"Respond with a JSON array of objects with \"name\" (short group name) and \"sessionIds\" (array of IDs). " +
+		"Only group sessions that genuinely belong together. " +
+		"Respond ONLY with the JSON array."
+
+	content := s.callLLMJSON(apiBase, model, prompt, 250)
+	if content == "" {
+		return nil
+	}
+	extracted := extractJSON(content)
+	var groups []GroupSuggestion
+	if json.Unmarshal([]byte(extracted), &groups) == nil {
+		return groups
+	}
+	return nil
+}
+
+// RoutePrompt suggests which existing sessions a prompt should be sent to.
+// Returns up to 3 session IDs ranked by relevance.
+func (s *Summarizer) RoutePrompt(text string, sessions []WSSessionInfo) []string {
+	if strings.TrimSpace(text) == "" || len(sessions) == 0 {
+		return nil
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return nil
+	}
+
+	maxN := 12
+	if len(sessions) < maxN {
+		maxN = len(sessions)
+	}
+	var sb strings.Builder
+	for i := 0; i < maxN; i++ {
+		sess := sessions[i]
+		title := sess.Title
+		if title == "" {
+			title = sess.ID[:8]
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %q dir=%s status=%s\n",
+			sess.ID, title, filepath.Base(sess.WorkingDir), sess.Status))
+	}
+
+	prompt := "A developer wants to send this prompt:\n\"" + truncateStr(text, 200) + "\"\n\n" +
+		"These sessions exist:\n" + sb.String() + "\n" +
+		"Which session(s) would be the best target? " +
+		"Return a JSON array of up to 3 session IDs, most relevant first. " +
+		"Respond ONLY with the JSON array."
+
+	content := s.callLLMJSON(apiBase, model, prompt, 100)
+	if content == "" {
+		return nil
+	}
+	extracted := extractJSON(content)
+	var ids []string
+	if json.Unmarshal([]byte(extracted), &ids) == nil {
+		if len(ids) > 3 {
+			ids = ids[:3]
+		}
+		return ids
+	}
+	return nil
+}
+
+// ExplainConflict generates a plain-English explanation of why two or more
+// sessions are conflicting on a file.
+func (s *Summarizer) ExplainConflict(file string, contexts []ConflictSessionContext) string {
+	if len(contexts) < 2 {
+		return ""
+	}
+	apiBase, model, err := s.ensureServer()
+	if err != nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, ctx := range contexts {
+		sb.WriteString(fmt.Sprintf("Session %q (title: %q): %s\n",
+			ctx.SessionID, ctx.Title, truncateStr(ctx.Summary, 100)))
+	}
+
+	prompt := fmt.Sprintf("File \"%s\" is being modified by multiple AI sessions:\n%s\n"+
+		"In one sentence, explain why this is a conflict and what each session is trying to do to this file. "+
+		"Respond with only the explanation.", file, sb.String())
+
+	return s.callLLMRaw(apiBase, model, prompt, 150, 0.2)
+}
+
+// ConflictSessionContext provides context about a session involved in a file conflict.
+type ConflictSessionContext struct {
+	SessionID string
+	Title     string
+	Summary   string
+}

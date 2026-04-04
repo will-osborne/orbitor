@@ -126,6 +126,64 @@ final class APIClient: Sendable {
         return resp.suggestions
     }
 
+    /// Returns plain-English descriptions of file changes from the most recent run.
+    func diffSummaries(id: String) async throws -> [String: String] {
+        let url = baseURL.appendingPathComponent("api/sessions/\(id)/diff-summaries")
+        let (data, _) = try await session.data(from: url)
+        struct Resp: Decodable { let summaries: [String: String] }
+        return try JSONDecoder().decode(Resp.self, from: data).summaries
+    }
+
+    /// Ranks sessions by relevance to a natural language query. Returns ordered session IDs.
+    func smartSearch(query: String) async throws -> [String] {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/smart-search"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["query": query])
+        let (data, _) = try await session.data(for: request)
+        struct Resp: Decodable { let sessionIds: [String] }
+        return try JSONDecoder().decode(Resp.self, from: data).sessionIds
+    }
+
+    /// Returns a cross-session digest (title + summary).
+    func missionSummary() async throws -> (title: String, summary: String) {
+        let url = baseURL.appendingPathComponent("api/mission-summary")
+        let (data, _) = try await session.data(from: url)
+        let resp = try JSONDecoder().decode([String: String].self, from: data)
+        return (resp["title"] ?? "", resp["summary"] ?? "")
+    }
+
+    /// Returns AI-suggested session groupings.
+    func groupSuggestions() async throws -> [GroupSuggestion] {
+        let url = baseURL.appendingPathComponent("api/group-suggestions")
+        let (data, _) = try await session.data(from: url)
+        struct Resp: Decodable { let groups: [GroupSuggestion] }
+        return try JSONDecoder().decode(Resp.self, from: data).groups
+    }
+
+    /// Suggests which session a prompt should be sent to. Returns up to 3 session IDs.
+    func routePrompt(_ text: String) async throws -> [String] {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/route-prompt"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["text": text])
+        let (data, _) = try await session.data(for: request)
+        struct Resp: Decodable { let sessionIds: [String] }
+        return try JSONDecoder().decode(Resp.self, from: data).sessionIds
+    }
+
+    /// Explains why multiple sessions conflict on a file.
+    func conflictContext(file: String, sessionIds: [String]) async throws -> String {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/conflict-context"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Req: Encodable { let file: String; let sessionIds: [String] }
+        request.httpBody = try JSONEncoder().encode(Req(file: file, sessionIds: sessionIds))
+        let (data, _) = try await session.data(for: request)
+        let resp = try JSONDecoder().decode([String: String].self, from: data)
+        return resp["explanation"] ?? ""
+    }
+
     /// Returns the per-run file change history for a session.
     func sessionRunHistory(id: String) async throws -> [RunRecord] {
         let url = baseURL.appendingPathComponent("api/sessions/\(id)/run-history")

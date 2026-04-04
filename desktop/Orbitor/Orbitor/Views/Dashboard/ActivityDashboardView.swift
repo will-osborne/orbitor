@@ -4,6 +4,11 @@ struct ActivityDashboardView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @State private var digestTitle = ""
+    @State private var digestSummary = ""
+    @State private var isLoadingDigest = false
+    @State private var suggestedGroups: [GroupSuggestion] = []
+    @State private var isLoadingGroups = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 320), spacing: 16)
@@ -56,15 +61,93 @@ struct ActivityDashboardView: View {
                 Spacer()
             } else {
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(appState.sessionList.sessions) { session in
-                            SessionCard(
-                                session: session,
-                                isUnread: appState.sessionList.unreadSessionIDs.contains(session.id)
+                    VStack(spacing: 16) {
+                        // AI cross-session digest
+                        if !digestTitle.isEmpty || !digestSummary.isEmpty || isLoadingDigest {
+                            HStack(spacing: 10) {
+                                if isLoadingDigest {
+                                    ProgressView().controlSize(.small).tint(theme.violet)
+                                } else {
+                                    Image(systemName: "sparkles")
+                                        .font(.callout)
+                                        .foregroundStyle(theme.violet)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    if !digestTitle.isEmpty {
+                                        Text(digestTitle)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(theme.text)
+                                    }
+                                    if !digestSummary.isEmpty {
+                                        Text(digestSummary)
+                                            .font(.caption)
+                                            .foregroundStyle(theme.muted)
+                                    }
+                                }
+                                Spacer()
+                            }
+                            .padding(12)
+                            .background(theme.violet.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(theme.violet.opacity(0.2), lineWidth: 1)
                             )
-                            .onTapGesture {
-                                appState.sessionList.selectedSessionID = session.id
-                                dismiss()
+                        }
+
+                        // AI-suggested groups
+                        if !suggestedGroups.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "sparkles")
+                                        .font(.caption2)
+                                        .foregroundStyle(theme.violet)
+                                    Text("Suggested Groups")
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(theme.muted)
+                                }
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(suggestedGroups) { group in
+                                            Button {
+                                                appState.sessionGroups[group.name] = Set(group.sessionIds)
+                                            } label: {
+                                                HStack(spacing: 4) {
+                                                    Text(group.name)
+                                                        .font(.caption)
+                                                        .foregroundStyle(theme.text)
+                                                    Text("\(group.sessionIds.count)")
+                                                        .font(.caption2.monospacedDigit())
+                                                        .foregroundStyle(theme.muted)
+                                                }
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 5)
+                                                .background(theme.violet.opacity(0.12))
+                                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 6)
+                                                        .strokeBorder(theme.violet.opacity(0.3), lineWidth: 1)
+                                                )
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Session grid
+                        LazyVGrid(columns: columns, spacing: 16) {
+                            ForEach(appState.sessionList.sessions) { session in
+                                SessionCard(
+                                    session: session,
+                                    isUnread: appState.sessionList.unreadSessionIDs.contains(session.id)
+                                )
+                                .onTapGesture {
+                                    appState.sessionList.selectedSessionID = session.id
+                                    dismiss()
+                                }
                             }
                         }
                     }
@@ -73,6 +156,35 @@ struct ActivityDashboardView: View {
             }
         }
         .frame(minWidth: 700, minHeight: 500)
+        .onAppear {
+            loadDigest()
+            loadGroupSuggestions()
+        }
+    }
+
+    private func loadDigest() {
+        guard appState.sessionList.sessions.count >= 2 else { return }
+        isLoadingDigest = true
+        Task {
+            let result = try? await appState.api.missionSummary()
+            await MainActor.run {
+                digestTitle = result?.title ?? ""
+                digestSummary = result?.summary ?? ""
+                isLoadingDigest = false
+            }
+        }
+    }
+
+    private func loadGroupSuggestions() {
+        guard appState.sessionList.sessions.count >= 2 else { return }
+        isLoadingGroups = true
+        Task {
+            let groups = try? await appState.api.groupSuggestions()
+            await MainActor.run {
+                suggestedGroups = groups ?? []
+                isLoadingGroups = false
+            }
+        }
     }
 }
 

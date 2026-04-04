@@ -589,6 +589,7 @@ func (h *Handlers) EnhancePrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 // SessionDebrief returns a post-run summary of a session's conversation.
+// If a proactive debrief was cached after the last run, return it instantly.
 // GET /api/sessions/{id}/debrief
 func (h *Handlers) SessionDebrief(w http.ResponseWriter, r *http.Request) {
 	if h.sm == nil || h.sm.summarizer == nil {
@@ -601,6 +602,16 @@ func (h *Handlers) SessionDebrief(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
 	}
+	// Check for pre-cached debrief first (proactive debrief feature)
+	session.summaryMu.RLock()
+	cached := session.cachedDebrief
+	session.summaryMu.RUnlock()
+	if cached != "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"debrief": cached})
+		return
+	}
+	// Fallback: generate on demand
 	var msgs []WSMessage
 	if session.store != nil {
 		msgs, _ = session.store.LoadMessages(session.ID)
@@ -633,6 +644,132 @@ func (h *Handlers) SessionSuggestions(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"suggestions": suggestions})
+}
+
+// SessionDiffSummaries returns plain-English descriptions of file changes
+// from the most recent run. GET /api/sessions/{id}/diff-summaries
+func (h *Handlers) SessionDiffSummaries(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	session := h.sm.Get(id)
+	if session == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	records := session.history.Records()
+	if len(records) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"summaries": map[string]string{}})
+		return
+	}
+	// Use the most recent run's files
+	lastRun := records[len(records)-1]
+	summaries := h.sm.summarizer.DiffSummary(lastRun.Files)
+	if summaries == nil {
+		summaries = map[string]string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"summaries": summaries})
+}
+
+// SmartSearch ranks sessions by relevance to a natural language query.
+// POST /api/smart-search {"query": "..."}
+func (h *Handlers) SmartSearch(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Query string `json:"query"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		http.Error(w, `{"error":"query required"}`, http.StatusBadRequest)
+		return
+	}
+	sessions := h.sm.List()
+	ids := h.sm.summarizer.SemanticSearch(req.Query, sessions)
+	if ids == nil {
+		ids = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"sessionIds": ids})
+}
+
+// GroupSuggestions returns AI-suggested session groupings.
+// GET /api/group-suggestions
+func (h *Handlers) GroupSuggestions(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	sessions := h.sm.List()
+	groups := h.sm.summarizer.GroupSuggestions(sessions)
+	if groups == nil {
+		groups = []GroupSuggestion{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"groups": groups})
+}
+
+// RoutePrompt suggests which existing session a prompt should be sent to.
+// POST /api/route-prompt {"text": "..."}
+func (h *Handlers) RoutePrompt(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		http.Error(w, `{"error":"text required"}`, http.StatusBadRequest)
+		return
+	}
+	sessions := h.sm.List()
+	ids := h.sm.summarizer.RoutePrompt(req.Text, sessions)
+	if ids == nil {
+		ids = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"sessionIds": ids})
+}
+
+// ConflictContext explains why multiple sessions are conflicting on a file.
+// POST /api/conflict-context {"file": "path", "sessionIds": ["a","b"]}
+func (h *Handlers) ConflictContext(w http.ResponseWriter, r *http.Request) {
+	if h.sm == nil || h.sm.summarizer == nil {
+		http.Error(w, `{"error":"summarizer not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		File       string   `json:"file"`
+		SessionIDs []string `json:"sessionIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.File == "" || len(req.SessionIDs) < 2 {
+		http.Error(w, `{"error":"file and at least 2 sessionIds required"}`, http.StatusBadRequest)
+		return
+	}
+	var contexts []ConflictSessionContext
+	for _, id := range req.SessionIDs {
+		sess := h.sm.Get(id)
+		if sess == nil {
+			continue
+		}
+		sess.summaryMu.RLock()
+		ctx := ConflictSessionContext{
+			SessionID: id,
+			Title:     sess.title,
+			Summary:   sess.summary,
+		}
+		sess.summaryMu.RUnlock()
+		contexts = append(contexts, ctx)
+	}
+	explanation := h.sm.summarizer.ExplainConflict(req.File, contexts)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"explanation": explanation})
 }
 
 // SessionRunHistory returns the per-run file change history for a session.

@@ -714,6 +714,12 @@ private struct RunCompleteCard: View {
         }
         .background(theme.green.opacity(0.05))
         .animation(.easeInOut(duration: 0.15), value: expanded)
+        .onAppear {
+            // Proactive debrief: auto-load so it's ready when user clicks
+            if sessionID != nil && debriefText == nil && !isLoadingDebrief {
+                loadDebrief()
+            }
+        }
     }
 
     private func loadDebrief() {

@@ -86,8 +86,9 @@ final class SessionListState {
             // the app is focused, so other sessions still notify.
             if session.id == selectedSessionID && NSApp.isActive { continue }
             let content = UNMutableNotificationContent()
-            content.title = "Agent Finished"
-            content.body = session.displayTitle
+            // Auto-triage: use LLM-generated title/summary when available
+            content.title = session.title ?? "Agent Finished"
+            content.body = session.summary ?? session.displayTitle
             content.sound = .default
             let req = UNNotificationRequest(identifier: "run-\(session.id)-\(Date().timeIntervalSince1970)", content: content, trigger: nil)
             UNUserNotificationCenter.current().add(req) { err in

@@ -4,6 +4,8 @@ struct InspectorView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.theme) private var theme
     @State private var gitBranch: String? = nil
+    @State private var diffSummaries: [String: String] = [:]
+    @State private var conflictExplanations: [String: String] = [:]
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -147,17 +149,27 @@ struct InspectorView: View {
                         } else {
                             VStack(spacing: 0) {
                                 ForEach(appState.chat.filesTouched.prefix(15), id: \.self) { path in
-                                    HStack(spacing: 6) {
-                                        Image(systemName: fileIcon(for: path))
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(fileColor(for: path))
-                                            .frame(width: 14)
-                                        Text(shortenPath(path))
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .foregroundStyle(theme.text)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Spacer()
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: fileIcon(for: path))
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(fileColor(for: path))
+                                                .frame(width: 14)
+                                            Text(shortenPath(path))
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(theme.text)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Spacer()
+                                        }
+                                        // AI diff summary
+                                        if let summary = diffSummaries[path] ?? diffSummaries[shortenPath(path)] {
+                                            Text(summary)
+                                                .font(.system(size: 9))
+                                                .foregroundStyle(theme.violet.opacity(0.8))
+                                                .lineLimit(2)
+                                                .padding(.leading, 20)
+                                        }
                                     }
                                     .padding(.vertical, 3)
                                     .padding(.horizontal, 6)
@@ -204,18 +216,41 @@ struct InspectorView: View {
                         DetailSection(title: "File Conflicts (\(conflicts.count))") {
                             ForEach(Array(conflicts.keys.sorted().prefix(5)), id: \.self) { file in
                                 let others = conflicts[file]?.filter { $0 != session.id } ?? []
-                                HStack(spacing: 4) {
-                                    Image(systemName: "arrow.triangle.merge")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(theme.red)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(shortenPath(file))
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .foregroundStyle(theme.text)
-                                            .lineLimit(1)
-                                        Text("also in: \(others.joined(separator: ", "))")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.triangle.merge")
                                             .font(.system(size: 9))
-                                            .foregroundStyle(theme.red.opacity(0.7))
+                                            .foregroundStyle(theme.red)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(shortenPath(file))
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(theme.text)
+                                                .lineLimit(1)
+                                            Text("also in: \(others.joined(separator: ", "))")
+                                                .font(.system(size: 9))
+                                                .foregroundStyle(theme.red.opacity(0.7))
+                                        }
+                                        Spacer()
+                                        // AI conflict explanation button
+                                        Button {
+                                            loadConflictContext(file: file, sessionId: session.id, others: others)
+                                        } label: {
+                                            HStack(spacing: 2) {
+                                                Image(systemName: "sparkles")
+                                                    .font(.system(size: 8))
+                                                Text("Why?")
+                                                    .font(.system(size: 9))
+                                            }
+                                            .foregroundStyle(theme.violet)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    if let explanation = conflictExplanations[file] {
+                                        Text(explanation)
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(theme.violet.opacity(0.8))
+                                            .padding(.leading, 13)
+                                            .padding(.top, 2)
                                     }
                                 }
                             }
@@ -257,8 +292,19 @@ struct InspectorView: View {
                 .padding()
             }
             .background(theme.panel)
-            .onAppear { loadGitBranch(for: session) }
-            .onChange(of: session.id) { _, _ in loadGitBranch(for: session) }
+            .onAppear {
+                loadGitBranch(for: session)
+                loadDiffSummaries(for: session)
+            }
+            .onChange(of: session.id) { _, _ in
+                loadGitBranch(for: session)
+                diffSummaries = [:]
+                conflictExplanations = [:]
+                loadDiffSummaries(for: session)
+            }
+            .onChange(of: appState.chat.filesTouched) { _, _ in
+                loadDiffSummaries(for: session)
+            }
         } else {
             VStack {
                 Text("No session")
@@ -281,6 +327,28 @@ struct InspectorView: View {
                 return String(trimmed.prefix(8)) // detached HEAD
             }.value
             await MainActor.run { gitBranch = branch }
+        }
+    }
+
+    private func loadDiffSummaries(for session: SessionInfo) {
+        guard !appState.chat.filesTouched.isEmpty else { return }
+        Task {
+            let summaries = try? await appState.api.diffSummaries(id: session.id)
+            await MainActor.run {
+                if let summaries { diffSummaries = summaries }
+            }
+        }
+    }
+
+    private func loadConflictContext(file: String, sessionId: String, others: [String]) {
+        let allIds = [sessionId] + others
+        Task {
+            let explanation = try? await appState.api.conflictContext(file: file, sessionIds: allIds)
+            await MainActor.run {
+                if let explanation, !explanation.isEmpty {
+                    conflictExplanations[file] = explanation
+                }
+            }
         }
     }
 

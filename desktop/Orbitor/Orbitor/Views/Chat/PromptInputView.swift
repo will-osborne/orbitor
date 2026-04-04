@@ -27,11 +27,56 @@ struct PromptInputView: View {
     @State private var historyIndex = -1
     @State private var suggestions: [String] = []
     @State private var isEnhancing = false
+    @State private var routedSessionIDs: [String] = []
+    @State private var routeTask: Task<Void, Never>? = nil
 
     private var estimatedTokens: Int { max(1, text.count / 4) }
 
     var body: some View {
         VStack(spacing: 0) {
+            // Prompt routing suggestion (shown when AI suggests a different session)
+            if let targetID = routedSessionIDs.first,
+               targetID != appState.sessionList.selectedSessionID,
+               let targetSession = appState.sessionList.sessions.first(where: { $0.id == targetID }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.caption2)
+                        .foregroundStyle(theme.violet)
+                    Text("This might belong in:")
+                        .font(.caption)
+                        .foregroundStyle(theme.muted)
+                    Text(targetSession.displayTitle)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        appState.sessionList.selectedSessionID = targetID
+                        routedSessionIDs = []
+                    } label: {
+                        Text("Switch")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(theme.violet)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(theme.violet.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        routedSessionIDs = []
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9))
+                            .foregroundStyle(theme.muted)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(theme.violet.opacity(0.06))
+            }
+
             // Suggestion chips (shown when input is empty and suggestions are loaded)
             if text.isEmpty && !suggestions.isEmpty {
                 SuggestionChipsView(suggestions: suggestions, theme: theme) { chip in
@@ -236,7 +281,13 @@ struct PromptInputView: View {
         }
         .onChange(of: text) { _, newValue in
             appState.dictation.promptIsEmpty = newValue.isEmpty
-            if newValue.isEmpty { historyIndex = -1 }
+            if newValue.isEmpty {
+                historyIndex = -1
+                routedSessionIDs = []
+                routeTask?.cancel()
+            } else {
+                triggerRoutePrompt(newValue)
+            }
         }
         .onChange(of: appState.chat.activeSessionID) { _, _ in
             isFocused = true
@@ -289,6 +340,25 @@ struct PromptInputView: View {
                 if let e = enhanced, !e.isEmpty { text = e }
                 isEnhancing = false
             }
+        }
+    }
+
+    // MARK: - Prompt routing
+
+    private func triggerRoutePrompt(_ value: String) {
+        routeTask?.cancel()
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 10, appState.sessionList.sessions.count >= 2 else {
+            routedSessionIDs = []
+            return
+        }
+        routeTask = Task {
+            // Debounce 500ms
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            let ids = try? await appState.api.routePrompt(trimmed)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { routedSessionIDs = ids ?? [] }
         }
     }
 

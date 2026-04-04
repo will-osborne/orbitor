@@ -57,14 +57,15 @@ type Session struct {
 	interruptMu     sync.Mutex
 	interruptCancel context.CancelFunc // set while a prompt is in flight
 
-	summaryMu     sync.RWMutex
-	lastMessage   string // last agent text snippet
-	currentTool   string // current tool being used
-	currentPrompt string // text of the prompt currently being processed
-	isRunning     bool   // true while a prompt is being processed
-	title         string // LLM-generated session title (set after run completes)
-	summary       string // LLM-generated one-sentence summary
-	prURL         string // first GitHub PR URL detected in agent output
+	summaryMu      sync.RWMutex
+	lastMessage    string // last agent text snippet
+	currentTool    string // current tool being used
+	currentPrompt  string // text of the prompt currently being processed
+	isRunning      bool   // true while a prompt is being processed
+	title          string // LLM-generated session title (set after run completes)
+	summary        string // LLM-generated one-sentence summary
+	prURL          string // first GitHub PR URL detected in agent output
+	cachedDebrief  string // pre-generated debrief (populated async after run_complete)
 
 	// toolCallCache remembers kind/title from the initial tool_call event so
 	// that subsequent tool_call_update deltas (which often omit those fields)
@@ -932,11 +933,22 @@ func (s *Session) finishACPSetup(workingDir string) {
 		}
 		if s.eventHub != nil {
 			sessionName := filepath.Base(s.WorkingDir)
+			// Use LLM-generated title/summary from a previous run if available
+			s.summaryMu.RLock()
+			existingTitle := s.title
+			existingSummary := s.summary
+			s.summaryMu.RUnlock()
 			title := "Agent finished"
 			if isContinuation {
 				title = "Background tasks completed"
 			}
+			if existingTitle != "" {
+				title = existingTitle
+			}
 			body := sessionName + " — " + result.StopReason
+			if existingSummary != "" {
+				body = existingSummary
+			}
 			notificationID := int64(0)
 			if s.store != nil {
 				metaMap := map[string]any{
@@ -981,7 +993,7 @@ func (s *Session) finishACPSetup(workingDir string) {
 				_ = s.store.UpdatePromptStatus(promptID, "done")
 			}
 		}
-		// Asynchronously generate a title and summary via local LLM.
+		// Asynchronously generate a title, summary, and debrief via local LLM.
 		if s.summarizer != nil && s.store != nil {
 			go func() {
 				msgs, err := s.store.LoadMessages(s.ID)
@@ -989,14 +1001,29 @@ func (s *Session) finishACPSetup(workingDir string) {
 					return
 				}
 				t, sum := s.summarizer.Summarize(msgs)
-				if t == "" && sum == "" {
-					return
+				if t != "" || sum != "" {
+					s.summaryMu.Lock()
+					s.title = t
+					s.summary = sum
+					s.summaryMu.Unlock()
+					_ = s.store.UpdateSessionSummary(s.ID, t, sum)
+
+					// Re-broadcast with enriched notification text
+					if s.eventHub != nil {
+						s.eventHub.Broadcast("session_summary", map[string]any{
+							"sessionId": s.ID,
+							"title":     t,
+							"summary":   sum,
+						})
+					}
 				}
-				s.summaryMu.Lock()
-				s.title = t
-				s.summary = sum
-				s.summaryMu.Unlock()
-				_ = s.store.UpdateSessionSummary(s.ID, t, sum)
+				// Pre-cache debrief so it's instant when the user clicks it
+				debrief := s.summarizer.Debrief(msgs)
+				if debrief != "" {
+					s.summaryMu.Lock()
+					s.cachedDebrief = debrief
+					s.summaryMu.Unlock()
+				}
 			}()
 		}
 	})

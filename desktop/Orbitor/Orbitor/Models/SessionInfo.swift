@@ -64,3 +64,10 @@ struct CreateSessionRequest: Codable {
     let skipPermissions: Bool
     let planMode: Bool
 }
+
+struct GroupSuggestion: Codable, Identifiable {
+    let name: String
+    let sessionIds: [String]
+
+    var id: String { name }
+}

@@ -6,6 +6,9 @@ struct CommandPaletteView: View {
     @Environment(\.theme) private var theme
     @State private var query = ""
     @State private var selectedIndex = 0
+    @State private var smartSearchIDs: [String] = []
+    @State private var isSmartSearching = false
+    @State private var smartSearchTask: Task<Void, Never>? = nil
     @FocusState private var searchFocused: Bool
 
     struct PaletteItem: Identifiable {
@@ -152,16 +155,67 @@ struct CommandPaletteView: View {
         let q = query.lowercased()
         let tokens = q.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
 
-        return all.filter { item in
+        var results = all.filter { item in
             let haystack = "\(item.title) \(item.subtitle ?? "")".lowercased()
-            // All tokens must match (fuzzy multi-word search)
             return tokens.allSatisfy { haystack.contains($0) }
         }.sorted { a, b in
-            // Exact title prefix match ranks higher
             let aPrefix = a.title.lowercased().hasPrefix(tokens.first ?? "")
             let bPrefix = b.title.lowercased().hasPrefix(tokens.first ?? "")
             if aPrefix != bPrefix { return aPrefix }
             return false
+        }
+
+        // If smart search returned results, boost those sessions to the top
+        if !smartSearchIDs.isEmpty {
+            let boostedIDs = Set(smartSearchIDs)
+            let (boosted, rest) = results.reduce(into: ([PaletteItem](), [PaletteItem]())) { acc, item in
+                // Check if this item's action targets one of the smart search IDs
+                // by matching session titles in the smart search results
+                let sessions = appState.sessionList.sessions
+                let isSmartMatch = sessions.contains { sess in
+                    boostedIDs.contains(sess.id) && item.title == sess.displayTitle
+                }
+                if isSmartMatch {
+                    acc.0.append(item)
+                } else {
+                    acc.1.append(item)
+                }
+            }
+            // Sort boosted items by smart search rank
+            let ranked = boosted.sorted { a, b in
+                let aIdx = smartSearchIDs.firstIndex(where: { id in
+                    appState.sessionList.sessions.first { $0.id == id }?.displayTitle == a.title
+                }) ?? Int.max
+                let bIdx = smartSearchIDs.firstIndex(where: { id in
+                    appState.sessionList.sessions.first { $0.id == id }?.displayTitle == b.title
+                }) ?? Int.max
+                return aIdx < bIdx
+            }
+            results = ranked + rest
+        }
+
+        return results
+    }
+
+    private func triggerSmartSearch() {
+        smartSearchTask?.cancel()
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard q.count >= 3 else {
+            smartSearchIDs = []
+            isSmartSearching = false
+            return
+        }
+        isSmartSearching = true
+        smartSearchTask = Task {
+            // Debounce 300ms
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            let ids = try? await appState.api.smartSearch(query: q)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                smartSearchIDs = ids ?? []
+                isSmartSearching = false
+            }
         }
     }
 
@@ -176,15 +230,22 @@ struct CommandPaletteView: View {
             VStack(spacing: 0) {
                 // Search bar
                 HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(theme.muted)
+                    if isSmartSearching {
+                        ProgressView().controlSize(.mini).tint(theme.violet)
+                    } else {
+                        Image(systemName: smartSearchIDs.isEmpty ? "magnifyingglass" : "sparkles")
+                            .foregroundStyle(smartSearchIDs.isEmpty ? theme.muted : theme.violet)
+                    }
                     TextField("Search commands, sessions…", text: $query)
                         .textFieldStyle(.plain)
                         .font(.system(size: 15))
                         .foregroundStyle(theme.text)
                         .focused($searchFocused)
                         .onSubmit { executeSelected() }
-                        .onChange(of: query) { _, _ in selectedIndex = 0 }
+                        .onChange(of: query) { _, _ in
+                            selectedIndex = 0
+                            triggerSmartSearch()
+                        }
                         .onKeyPress(.upArrow) { selectedIndex = max(0, selectedIndex - 1); return .handled }
                         .onKeyPress(.downArrow) { selectedIndex = min(filtered.count - 1, selectedIndex + 1); return .handled }
                         .onKeyPress(.escape) { isPresented = false; return .handled }
