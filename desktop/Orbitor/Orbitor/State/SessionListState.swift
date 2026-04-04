@@ -10,6 +10,12 @@ final class SessionListState {
     var error: String?
     /// Sessions that have completed a run since the user last viewed them.
     var unreadSessionIDs: Set<String> = []
+    /// File paths touched per session (currentTool extractions + filesTouched from chat).
+    var filesBySession: [String: Set<String>] = [:]
+    /// Session IDs that have file conflicts with another session.
+    var conflictingSessionIDs: Set<String> = []
+    /// Map of conflicting file → set of session IDs touching it.
+    var fileConflicts: [String: Set<String>] = [:]
 
     private var api: APIClient
     private var pollingTask: Task<Void, Never>?
@@ -129,6 +135,68 @@ final class SessionListState {
         }
     }
 
+    // MARK: - Attention sorting
+
+    /// Sessions sorted by attention priority: permission > error > unread > running > idle.
+    var sessionsByAttention: [SessionInfo] {
+        sessions.sorted { a, b in
+            attentionScore(a) > attentionScore(b)
+        }
+    }
+
+    /// Higher score = needs more attention.
+    func attentionScore(_ session: SessionInfo) -> Int {
+        var score = 0
+        if session.pendingPermission { score += 100 }
+        if session.stateLabel == "error" { score += 80 }
+        if unreadSessionIDs.contains(session.id) { score += 60 }
+        if conflictingSessionIDs.contains(session.id) { score += 50 }
+        if session.isRunning { score += 30 }
+        if session.queueDepth > 0 { score += 10 }
+        return score
+    }
+
+    /// Attention kind for display — returns the highest-priority attention type.
+    func attentionKind(for session: SessionInfo) -> AttentionKind? {
+        if session.pendingPermission { return .permission }
+        if session.stateLabel == "error" { return .error }
+        if conflictingSessionIDs.contains(session.id) { return .conflict }
+        if unreadSessionIDs.contains(session.id) { return .unread }
+        return nil
+    }
+
+    // MARK: - File conflict detection
+
+    /// Update file tracking for a session.
+    func updateFiles(for sessionID: String, files: Set<String>) {
+        filesBySession[sessionID] = files
+        recomputeConflicts()
+    }
+
+    private func recomputeConflicts() {
+        var newConflicts: [String: Set<String>] = [:]
+        var newConflicting: Set<String> = []
+
+        // Build reverse map: file → sessions
+        var fileToSessions: [String: Set<String>] = [:]
+        for (sessionID, files) in filesBySession {
+            for file in files {
+                fileToSessions[file, default: []].insert(sessionID)
+            }
+        }
+
+        // Find files touched by multiple sessions
+        for (file, sessionIDs) in fileToSessions where sessionIDs.count > 1 {
+            newConflicts[file] = sessionIDs
+            newConflicting.formUnion(sessionIDs)
+        }
+
+        fileConflicts = newConflicts
+        conflictingSessionIDs = newConflicting
+    }
+
+    // MARK: - Navigation
+
     func selectNext() {
         guard let current = selectedSessionID,
               let idx = sessions.firstIndex(where: { $0.id == current }),
@@ -141,5 +209,18 @@ final class SessionListState {
               let idx = sessions.firstIndex(where: { $0.id == current }),
               idx > 0 else { return }
         selectedSessionID = sessions[idx - 1].id
+    }
+}
+
+enum AttentionKind {
+    case permission, error, conflict, unread
+
+    var icon: String {
+        switch self {
+        case .permission: return "exclamationmark.shield.fill"
+        case .error: return "exclamationmark.triangle.fill"
+        case .conflict: return "arrow.triangle.merge"
+        case .unread: return "circle.fill"
+        }
     }
 }

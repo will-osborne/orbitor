@@ -193,17 +193,36 @@ struct InspectorView: View {
                         }
                     }
 
-                    // Sub-agents
+                    // Sub-agents with drill-down
                     if let agents = session.subAgents, !agents.isEmpty {
-                        DetailSection(title: "Sub-Agents (\(agents.count))") {
-                            ForEach(agents) { agent in
-                                HStack(spacing: 6) {
-                                    StatusBadge(state: agent.status)
-                                    Text(agent.title)
-                                        .font(.caption)
-                                        .foregroundStyle(theme.text)
-                                        .lineLimit(1)
+                        SubAgentSection(agents: agents)
+                    }
+
+                    // File conflicts
+                    if appState.sessionList.conflictingSessionIDs.contains(session.id) {
+                        let conflicts = appState.sessionList.fileConflicts.filter { $0.value.contains(session.id) }
+                        DetailSection(title: "File Conflicts (\(conflicts.count))") {
+                            ForEach(Array(conflicts.keys.sorted().prefix(5)), id: \.self) { file in
+                                let others = conflicts[file]?.filter { $0 != session.id } ?? []
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.triangle.merge")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(theme.red)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(shortenPath(file))
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(theme.text)
+                                            .lineLimit(1)
+                                        Text("also in: \(others.joined(separator: ", "))")
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(theme.red.opacity(0.7))
+                                    }
                                 }
+                            }
+                            if conflicts.count > 5 {
+                                Text("+ \(conflicts.count - 5) more")
+                                    .font(.caption2)
+                                    .foregroundStyle(theme.muted)
                             }
                         }
                     }
@@ -361,6 +380,110 @@ struct DetailRow: View {
             }
             Spacer()
         }
+    }
+}
+
+// MARK: - Sub-Agent drill-down
+
+struct SubAgentSection: View {
+    let agents: [SubAgentInfo]
+    @Environment(\.theme) private var theme
+    @State private var expandedAgentID: String? = nil
+
+    private var running: [SubAgentInfo] { agents.filter { $0.status == "running" } }
+    private var completed: [SubAgentInfo] { agents.filter { $0.status == "completed" } }
+    private var failed: [SubAgentInfo] { agents.filter { $0.status == "failed" } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(theme.violet)
+                Text("SUB-AGENTS")
+                    .font(.caption2.bold())
+                    .foregroundStyle(theme.muted)
+                Spacer()
+
+                // Status summary
+                if !running.isEmpty {
+                    HStack(spacing: 2) {
+                        Circle().fill(theme.orange).frame(width: 6, height: 6)
+                        Text("\(running.count)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(theme.orange)
+                    }
+                }
+                if !completed.isEmpty {
+                    HStack(spacing: 2) {
+                        Circle().fill(theme.green).frame(width: 6, height: 6)
+                        Text("\(completed.count)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(theme.green)
+                    }
+                }
+                if !failed.isEmpty {
+                    HStack(spacing: 2) {
+                        Circle().fill(theme.red).frame(width: 6, height: 6)
+                        Text("\(failed.count)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(theme.red)
+                    }
+                }
+            }
+
+            ForEach(agents) { agent in
+                VStack(alignment: .leading, spacing: 4) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedAgentID = expandedAgentID == agent.id ? nil : agent.id
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: expandedAgentID == agent.id ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8))
+                                .foregroundStyle(theme.muted)
+                                .frame(width: 10)
+
+                            StatusBadge(state: agent.status)
+
+                            Text(agent.title)
+                                .font(.caption)
+                                .foregroundStyle(theme.text)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            Text(agentDuration(agent))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(theme.muted)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    if expandedAgentID == agent.id {
+                        VStack(alignment: .leading, spacing: 3) {
+                            DetailRow(label: "ID", value: String(agent.toolCallId.prefix(12)), theme: theme, mono: true)
+                            DetailRow(label: "Status", theme: theme) {
+                                StatusBadge(state: agent.status)
+                            }
+                            DetailRow(label: "Started", value: agent.startedAt.formatted(date: .omitted, time: .shortened), theme: theme)
+                            DetailRow(label: "Duration", value: agentDuration(agent), theme: theme, mono: true)
+                        }
+                        .padding(.leading, 16)
+                        .padding(.vertical, 4)
+                        .background(theme.panel.opacity(0.5))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+            }
+        }
+    }
+
+    private func agentDuration(_ agent: SubAgentInfo) -> String {
+        let elapsed = Int(Date().timeIntervalSince(agent.startedAt))
+        if elapsed < 60 { return "\(elapsed)s" }
+        return "\(elapsed / 60)m \(elapsed % 60)s"
     }
 }
 

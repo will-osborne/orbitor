@@ -14,7 +14,17 @@ struct CommandPaletteView: View {
         let title: String
         let subtitle: String?
         let shortcut: String?
+        let statusColor: Color?
         let action: () -> Void
+
+        init(icon: String, title: String, subtitle: String?, shortcut: String?, statusColor: Color? = nil, action: @escaping () -> Void) {
+            self.icon = icon
+            self.title = title
+            self.subtitle = subtitle
+            self.shortcut = shortcut
+            self.statusColor = statusColor
+            self.action = action
+        }
     }
 
     private func makeItems() -> [PaletteItem] {
@@ -63,14 +73,56 @@ struct CommandPaletteView: View {
             })
         }
 
-        // --- Sessions ---
-        for session in appState.sessionList.sessions {
+        // --- Views ---
+        items.append(PaletteItem(icon: "square.grid.2x2", title: "Activity Dashboard", subtitle: "Overview of all sessions", shortcut: nil) {
+            appState.showActivityDashboard = true
+            isPresented = false
+        })
+        items.append(PaletteItem(icon: "list.bullet.rectangle", title: "Activity Feed", subtitle: "Cross-session event timeline", shortcut: nil) {
+            appState.showActivityFeed = true
+            isPresented = false
+        })
+
+        // --- Sessions (enhanced with status) ---
+        // Show sessions needing attention first
+        let sortedSessions = appState.sessionList.sessionsByAttention
+        for session in sortedSessions {
             let isCurrent = session.id == appState.sessionList.selectedSessionID
+            let statusIcon: String
+            let color: Color
+            if session.pendingPermission {
+                statusIcon = "exclamationmark.shield.fill"
+                color = theme.yellow
+            } else if session.stateLabel == "error" {
+                statusIcon = "exclamationmark.triangle.fill"
+                color = theme.red
+            } else if session.isRunning {
+                statusIcon = "circle.fill"
+                color = theme.orange
+            } else {
+                statusIcon = isCurrent ? "terminal.fill" : "terminal"
+                color = theme.green
+            }
+
+            var subtitle = session.stateLabel
+            if session.isRunning, let tool = session.currentTool, !tool.isEmpty {
+                subtitle += " · \(tool)"
+            }
+            subtitle += "  \(session.shortDir)"
+            if let model = session.model, !model.isEmpty {
+                subtitle += " · \(model)"
+            }
+            if let agents = session.subAgents, !agents.isEmpty {
+                let running = agents.filter { $0.status == "running" }.count
+                subtitle += " · \(running)/\(agents.count) agents"
+            }
+
             items.append(PaletteItem(
-                icon: isCurrent ? "terminal.fill" : "terminal",
+                icon: statusIcon,
                 title: session.displayTitle,
-                subtitle: "\(session.stateLabel)  \(session.shortDir)",
-                shortcut: nil
+                subtitle: subtitle,
+                shortcut: nil,
+                statusColor: color
             ) {
                 appState.sessionList.selectedSessionID = session.id
                 isPresented = false
@@ -98,9 +150,18 @@ struct CommandPaletteView: View {
         let all = makeItems()
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else { return all }
         let q = query.lowercased()
-        return all.filter {
-            $0.title.lowercased().contains(q) ||
-            ($0.subtitle?.lowercased().contains(q) ?? false)
+        let tokens = q.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+
+        return all.filter { item in
+            let haystack = "\(item.title) \(item.subtitle ?? "")".lowercased()
+            // All tokens must match (fuzzy multi-word search)
+            return tokens.allSatisfy { haystack.contains($0) }
+        }.sorted { a, b in
+            // Exact title prefix match ranks higher
+            let aPrefix = a.title.lowercased().hasPrefix(tokens.first ?? "")
+            let bPrefix = b.title.lowercased().hasPrefix(tokens.first ?? "")
+            if aPrefix != bPrefix { return aPrefix }
+            return false
         }
     }
 
@@ -195,13 +256,20 @@ private struct PaletteRow: View {
         HStack(spacing: 10) {
             Image(systemName: item.icon)
                 .font(.system(size: 14))
-                .foregroundStyle(isSelected ? theme.accent : theme.muted)
+                .foregroundStyle(item.statusColor ?? (isSelected ? theme.accent : theme.muted))
                 .frame(width: 22, alignment: .center)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(item.title)
-                    .font(.system(size: 13))
-                    .foregroundStyle(theme.text)
+                HStack(spacing: 6) {
+                    Text(item.title)
+                        .font(.system(size: 13))
+                        .foregroundStyle(theme.text)
+                    if let color = item.statusColor {
+                        Circle()
+                            .fill(color)
+                            .frame(width: 6, height: 6)
+                    }
+                }
                 if let sub = item.subtitle {
                     Text(sub)
                         .font(.caption)

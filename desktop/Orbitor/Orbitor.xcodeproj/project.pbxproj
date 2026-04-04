@@ -34,6 +34,10 @@
 		A1B2C3D4E5F60001000A0018 /* RunRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0018 /* RunRecord.swift */; };
 		A1B2C3D4E5F60001000A0019 /* RunHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A0019 /* RunHistoryView.swift */; };
 		A1B2C3D4E5F60001000A001A /* SideBySideDiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A001A /* SideBySideDiffView.swift */; };
+		A1B2C3D4E5F60001000A001B /* ActivityDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A001B /* ActivityDashboardView.swift */; };
+		A1B2C3D4E5F60001000A001C /* ActivityFeedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A001C /* ActivityFeedView.swift */; };
+		A1B2C3D4E5F60001000A001D /* SplitSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A001D /* SplitSessionView.swift */; };
+		A1B2C3D4E5F60001000A001E /* SessionTabBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60002000A001E /* SessionTabBar.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -66,6 +70,10 @@
 		A1B2C3D4E5F60002000A0018 /* RunRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunRecord.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A0019 /* RunHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunHistoryView.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60002000A001A /* SideBySideDiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SideBySideDiffView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A001B /* ActivityDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityDashboardView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A001C /* ActivityFeedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityFeedView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A001D /* SplitSessionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitSessionView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60002000A001E /* SessionTabBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTabBar.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60003000A0001 /* Orbitor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Orbitor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -150,11 +158,22 @@
 				A1B2C3D4E5F60002000A000A /* ContentView.swift */,
 				A1B2C3D4E5F60005000A0008 /* Chat */,
 				A1B2C3D4E5F60005000A000C /* CommandPalette */,
+				A1B2C3D4E5F60005000A000D /* Dashboard */,
 				A1B2C3D4E5F60005000A0009 /* Inspector */,
 				A1B2C3D4E5F60005000A000A /* Shared */,
 				A1B2C3D4E5F60005000A000B /* Sidebar */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		A1B2C3D4E5F60005000A000D /* Dashboard */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F60002000A001B /* ActivityDashboardView.swift */,
+				A1B2C3D4E5F60002000A001C /* ActivityFeedView.swift */,
+				A1B2C3D4E5F60002000A001D /* SplitSessionView.swift */,
+			);
+			path = Dashboard;
 			sourceTree = "<group>";
 		};
 		A1B2C3D4E5F60005000A0008 /* Chat */ = {
@@ -182,6 +201,7 @@
 				A1B2C3D4E5F60002000A000F /* CodeBlockView.swift */,
 				A1B2C3D4E5F60002000A0016 /* DiffView.swift */,
 				A1B2C3D4E5F60002000A0015 /* HoverEffects.swift */,
+				A1B2C3D4E5F60002000A001E /* SessionTabBar.swift */,
 				A1B2C3D4E5F60002000A001A /* SideBySideDiffView.swift */,
 				A1B2C3D4E5F60002000A0010 /* StatusBadge.swift */,
 			);
@@ -315,6 +335,10 @@
 				A1B2C3D4E5F60001000A0018 /* RunRecord.swift in Sources */,
 				A1B2C3D4E5F60001000A0019 /* RunHistoryView.swift in Sources */,
 				A1B2C3D4E5F60001000A001A /* SideBySideDiffView.swift in Sources */,
+				A1B2C3D4E5F60001000A001B /* ActivityDashboardView.swift in Sources */,
+				A1B2C3D4E5F60001000A001C /* ActivityFeedView.swift in Sources */,
+				A1B2C3D4E5F60001000A001D /* SplitSessionView.swift in Sources */,
+				A1B2C3D4E5F60001000A001E /* SessionTabBar.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -47,10 +47,42 @@ struct OrbitorApp: App {
         .defaultSize(width: 1100, height: 700)
         .windowStyle(.titleBar)
 
+        // Split session view — two sessions side by side
+        WindowGroup("Split View", id: "split-view") {
+            SplitSessionLauncher()
+                .environment(appState)
+                .environment(\.theme, appState.currentTheme)
+        }
+        .defaultSize(width: 1400, height: 800)
+        .windowStyle(.titleBar)
+
         Settings {
             SettingsView()
                 .environment(appState)
                 .environment(\.theme, appState.currentTheme)
+        }
+    }
+}
+
+/// Reads the split session IDs from AppState and launches the SplitSessionView.
+private struct SplitSessionLauncher: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        if let left = appState.splitLeftSessionID,
+           let right = appState.splitRightSessionID {
+            SplitSessionView(leftSessionID: left, rightSessionID: right)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "rectangle.split.2x1")
+                    .font(.system(size: 36))
+                    .foregroundStyle(theme.muted)
+                Text("Select two sessions to compare")
+                    .foregroundStyle(theme.muted)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.panel)
         }
     }
 }
@@ -101,6 +133,21 @@ struct AppCommands: Commands {
 
             Divider()
 
+            // Pin/unpin current session
+            if let id = appState.sessionList.selectedSessionID {
+                if appState.pinnedSessionIDs.contains(id) {
+                    Button("Unpin Session") {
+                        appState.pinnedSessionIDs.remove(id)
+                    }
+                } else {
+                    Button("Pin Session") {
+                        appState.pinnedSessionIDs.insert(id)
+                    }
+                }
+            }
+
+            Divider()
+
             if let id = appState.sessionList.selectedSessionID {
                 Button("Delete Session") {
                     Task { await appState.sessionList.deleteSession(id) }
@@ -110,6 +157,18 @@ struct AppCommands: Commands {
         }
 
         CommandMenu("View") {
+            Button("Activity Dashboard") {
+                appState.showActivityDashboard = true
+            }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+
+            Button("Activity Feed") {
+                appState.showActivityFeed = true
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+
+            Divider()
+
             Button("Increase Font Size") {
                 appState.fontSize = min(appState.fontSize + 1, 28)
             }

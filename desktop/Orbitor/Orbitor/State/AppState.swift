@@ -14,9 +14,33 @@ final class AppState {
     var showNewSession = false
     var showForkSheet = false
     var showCommandPalette = false
+    var showActivityDashboard = false
+    var showActivityFeed = false
     var fontSize: CGFloat {
         didSet { UserDefaults.standard.set(fontSize, forKey: "fontSize") }
     }
+
+    /// Session IDs pinned to the tab bar for quick switching.
+    var pinnedSessionIDs: Set<String> {
+        didSet {
+            UserDefaults.standard.set(Array(pinnedSessionIDs), forKey: "pinnedSessionIDs")
+        }
+    }
+
+    /// Session grouping: group name → set of session IDs.
+    var sessionGroups: [String: Set<String>] {
+        didSet {
+            let encoded = sessionGroups.mapValues { Array($0) }
+            if let data = try? JSONEncoder().encode(encoded) {
+                UserDefaults.standard.set(data, forKey: "sessionGroups")
+            }
+        }
+    }
+
+    /// Left session ID for split-pane view.
+    var splitLeftSessionID: String?
+    /// Right session ID for split-pane view.
+    var splitRightSessionID: String?
 
     private(set) var api: APIClient
     let sessionList: SessionListState
@@ -36,6 +60,18 @@ final class AppState {
         self.selectedThemeID = themeID
         let savedFontSize = UserDefaults.standard.double(forKey: "fontSize")
         self.fontSize = savedFontSize > 0 ? savedFontSize : 13
+
+        // Restore pinned sessions
+        let savedPinned = UserDefaults.standard.stringArray(forKey: "pinnedSessionIDs") ?? []
+        self.pinnedSessionIDs = Set(savedPinned)
+
+        // Restore session groups
+        if let groupData = UserDefaults.standard.data(forKey: "sessionGroups"),
+           let decoded = try? JSONDecoder().decode([String: [String]].self, from: groupData) {
+            self.sessionGroups = decoded.mapValues { Set($0) }
+        } else {
+            self.sessionGroups = [:]
+        }
 
         let baseURL = URL(string: url) ?? URL(string: "http://127.0.0.1:8080")!
         let client = APIClient(baseURL: baseURL)
